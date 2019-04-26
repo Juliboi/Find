@@ -1,0 +1,128 @@
+//File import
+@import "../node_modules/bootstrap/scss/bootstrap";
+
+//Variables
+$colors: (
+  grey: #B8B8B8,
+  grey-light: #C8C8C8,
+  grey-dark: #A8A7A7,
+  background: #EBE7E7,
+  blue-navy: #5976A1
+);
+
+//Class Variables
+.fill-viewport {
+  min-height: 100vh;
+}
+
+@include media-breakpoint-up(lg) {
+  .basis-lg-50 {
+    flex-basis: 50%;
+  }
+}
+
+.viewport-80 {
+  height: 80vh;
+
+  @include media-breakpoint-up(md) {
+    height: 40vh;
+  }
+}
+
+//Functions
+@function color($color-name) {   /*color = code function name, $color-name = return function name*/
+  @return map-get($colors, $color-name); /*$colors = map name, $color-name return funtion name*/
+}
+
+#about-lg {
+background-color: color(background);
+
+  .container-fluid {
+    @include media-breakpoint-up(lg) {
+    padding: 25px 50px 50px 50px;
+    }
+
+    h2 {
+      font-family: Garamond;
+      font-weight: bold;
+      color: black;
+      font-size: 40px;
+      padding: 20px 0px;
+
+      @include media-breakpoint-up(lg) {
+        font-size: 60px;
+      }
+    }
+
+    .card {
+      margin-bottom: 30px;
+    }
+
+
+      .card-img-top {
+        height: 100px;
+        object-fit: cover;
+        object-position: 0% 35%;
+
+        @include media-breakpoint-up(lg) {
+          height: 400px;
+        }
+      }
+
+      .card-body {
+        height: 60px;
+        text-align: center;
+
+        p {
+          font-size: 20px;
+          display: none;
+        }
+
+        @include media-breakpoint-up(lg) {
+          height: 160px;
+
+          p {
+            display: block;
+          }
+        }
+      }
+
+      .no-border {
+        background: white;
+      }
+
+  }
+}
+.my-card{
+  height: 562px;
+  display: flex;
+  flex-direction: column;
+
+  .image {
+    background: url("/img/left-about.jpg") 0% 35%/cover;
+    z-index: 0;
+    flex: 3;
+  }
+
+  .img2 {
+    background: url("/img/middle-about.jpg") 0% 35%/cover;
+  }
+
+  .img3 {
+    background: url("/img/right-about.jpg") 0% 35%/cover;
+  }
+
+  .card-body {
+    flex: 1;
+    transition: flex 0.3s ease-in;
+    overflow: hidden;
+  }
+}
+
+.openCard {
+  flex: 5 !important;
+}
+
+.closeImg {
+
+}

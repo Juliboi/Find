@@ -1,0 +1,92 @@
+//File import
+@import "../node_modules/bootstrap/scss/bootstrap";
+
+//Variables
+$colors: (
+  grey: #B8B8B8,
+  grey-light: #C8C8C8,
+  grey-dark: #A8A7A7,
+  background: #EBE7E7,
+  blue-navy: #5976A1
+);
+
+//Class Variables
+.fill-viewport {
+  min-height: 100vh;
+}
+
+@include media-breakpoint-up(lg) {
+  .basis-lg-50 {
+    flex-basis: 50%;
+  }
+}
+
+.viewport-80 {
+  height: 80vh;
+
+  @include media-breakpoint-up(md) {
+    height: 40vh;
+  }
+}
+
+//Functions
+@function color($color-name) {   /*color = code function name, $color-name = return function name*/
+  @return map-get($colors, $color-name); /*$colors = map name, $color-name return funtion name*/
+}
+
+
+//STYLESHEET ▼
+
+//background img
+#form .row {
+  background: linear-gradient(180deg, rgba(0,0,0,0.5) 0%, rgba(152,152,152,0.5) 100%), url("../img/map-table.jpg") center/ cover;
+  padding: 60px 0;
+
+    @include media-breakpoint-up(lg) {
+      padding: 80px 0;
+    }
+
+
+  //text
+  div h2 {
+  font-family: Garamond;
+  font-size: 40px;
+  color: white;
+  font-weight: bold;
+
+    @include media-breakpoint-up(lg) {
+      font-size: 60px;
+      line-height: 65px;
+    }
+  }
+
+  div h3 {
+  font-family: Georgia;
+  font-size: 20px;
+  color: color(grey-light);
+
+    @include media-breakpoint-up(lg) {
+      font-size: 25px;
+      margin-bottom: 50px;
+    }
+  }
+
+  //form
+  form {
+
+    input {
+      height: 60px;
+      line-height: 60px;
+      font-size: 20px;
+      text-align: center;
+
+      @include media-breakpoint-up(lg) {
+        height: 120px;
+        width: 100%;
+        font-size: 30px;
+        border-radius: 15px;
+        border: 1px solid color(grey-dark);
+      }
+    }
+  }
+}

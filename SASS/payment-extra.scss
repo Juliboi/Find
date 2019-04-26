@@ -1,0 +1,52 @@
+//File import
+@import "../node_modules/bootstrap/scss/bootstrap";
+
+//Variables
+$colors: (
+  grey: #B8B8B8,
+  grey-light: #C8C8C8,
+  grey-dark: #A8A7A7,
+  background: #EBE7E7,
+  blue-navy: #5976A1
+);
+
+//Class Variables
+.fill-viewport {
+  min-height: 100vh;
+}
+
+@include media-breakpoint-up(lg) {
+  .basis-lg-50 {
+    flex-basis: 50%;
+  }
+}
+
+//Functions
+@function color($color-name) {   /*color = code function name, $color-name = return function name*/
+  @return map-get($colors, $color-name); /*$colors = map name, $color-name return funtion name*/
+}
+
+//STYLESHEET
+
+#payment-extra {
+  background-color: #8DACD9;
+
+  img {
+    width: 100px;
+  }
+
+  p {
+    font-family: Georgia;
+    color: white;
+    font-size: 22px;
+    font-weight: bold;
+  }
+
+  .icon1 {
+    margin-right: 45px;
+  }
+
+  .icon3 {
+    margin-left: 65px;
+  }
+}

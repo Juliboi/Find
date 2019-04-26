@@ -1,0 +1,184 @@
+//File import
+@import "../node_modules/bootstrap/scss/bootstrap";
+
+//Variables
+$colors: (
+  grey: #B8B8B8,
+  grey-light: #C8C8C8,
+  grey-dark: #A8A7A7,
+  background: #EBE7E7,
+  blue-navy: #5976A1
+);
+
+//Class Variables
+.fill-viewport {
+  min-height: 100vh;
+}
+
+@include media-breakpoint-up(lg) {
+  .basis-lg-50 {
+    flex-basis: 50%;
+  }
+}
+
+.viewport-80 {
+  height: 80vh;
+
+  @include media-breakpoint-up(md) {
+    height: 40vh;
+  }
+}
+
+//Functions
+@function color($color-name) {   /*color = code function name, $color-name = return function name*/
+  @return map-get($colors, $color-name); /*$colors = map name, $color-name return funtion name*/
+}
+
+//STYLESHEET ▼
+html {
+  scroll-behavior: smooth;
+}
+
+//Navigation
+nav {
+  background-color: #000000;
+  min-height: 60px;
+
+    @include media-breakpoint-up(lg) {
+      height: 80px;
+  }
+
+  .navbar-brand {
+    color: white;
+    font-family: "Times-New-Roman";
+    font-weight: bold;
+    font-size: 30px;
+
+    @include media-breakpoint-up(lg) {
+    font-size: 45px;
+    margin: 0 80px 0 20px;
+    }
+  }
+
+  .navbar1 li {
+    @include media-breakpoint-up(lg) {
+      margin-right: 15px;
+    }
+  }
+
+  .navbar-nav li a {
+    font-family: Garamond;
+    font-weight: bold;
+    font-size: 25px;
+    color: white;
+  }
+
+  .navbar-nav li a:hover {
+    color: #cdcdcd;
+  }
+
+  .navbar2 li {
+    margin-right: 5px;
+  }
+
+  .navbar2 li a {
+    font-size: 18px;
+  }
+
+
+  .flagbox {
+    margin: 6px 20px 0 5px;
+    width: 30px;
+    height: 20px;
+  }
+
+  .eng {
+    font-family: Garamond;
+    color: white;
+    font-size: 19px;
+    font-weight: bold;
+    text-decoration: none !important;
+
+    @include media-breakpoint-up(lg) {
+      margin-left: 20px;
+    }
+  }
+
+  .navbar-toggler-icon {
+  background-image: url("data:image/svg+xml;charset=utf8,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath stroke='WHITE' stroke-width='2' stroke-linecap='round' stroke-miterlimit='10' d='M4 8h24M4 16h24M4 24h24'/%3E%3C/svg%3E");
+  }
+}
+
+//Frontpage image and text
+
+#frontpage {
+  background: url("../img/frontpage.jpg") center/ cover;
+
+  @include media-breakpoint-up(lg) {
+  background-size: 2500px;
+  background-repeat: no-repeat;
+  background-position:55% 70%;
+  }
+
+    div .imgbox {
+       margin-top: 30%;
+
+         @include media-breakpoint-up(md) {
+          margin: 30% 0 40% 0;
+        }
+
+         @include media-breakpoint-up(lg) {
+          margin: 0 0 0 30px;
+        }
+
+      h1 {
+        font-family: Garamond;
+        line-height: 55px;
+
+          @include media-breakpoint-up(md) {
+            font-size: 80px;
+            line-height: 80px;
+            margin-bottom: 20px;
+          }
+
+          @include media-breakpoint-up(lg) {
+            font-family: Garamond;
+            font-weight: bold;
+            font-size: 110px;
+            line-height: 110px;
+          }
+      }
+
+      p {
+        font-family: Georgia;
+        font-size: 25px;
+        line-height: 25px;
+        margin-bottom: 28px;
+
+      }
+
+      button {
+        background-color: white;
+        width: 180px;
+        height: 55px;
+        font-family: "Times-New-Roman";
+        font-size: 25px;
+        font-weight: bold;
+        border: 1px solid grey;
+
+        @include media-breakpoint-up(lg) {
+          width: 200px;
+          height: 60px;
+        }
+      }
+
+      button:hover {
+        background-color: #f1f1f1;
+      }
+    }
+
+    .btn:focus,.btn:active {
+     outline: none !important;
+     box-shadow: none;
+    }
+}

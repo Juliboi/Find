@@ -1,0 +1,97 @@
+//File import
+@import "../node_modules/bootstrap/scss/bootstrap";
+
+//Variables
+$colors: (
+  grey: #B8B8B8,
+  grey-light: #C8C8C8,
+  grey-dark: #A8A7A7,
+  background: #EBE7E7,
+  blue-navy: #5976A1
+);
+
+//Class Variables
+.fill-viewport {
+  min-height: 100vh;
+}
+
+@include media-breakpoint-up(lg) {
+  .basis-lg-50 {
+    flex-basis: 50%;
+  }
+}
+
+//Functions
+@function color($color-name) {   /*color = code function name, $color-name = return function name*/
+  @return map-get($colors, $color-name); /*$colors = map name, $color-name return funtion name*/
+}
+
+//STYLESHEET ▼
+
+#instagram {
+  background-color: color(background);
+
+  .row {
+    @include media-breakpoint-up(lg) {
+      padding: 0 120px;
+
+      .col-12.col-lg-4 {
+        padding: 0 20px;
+      }
+    }
+
+
+
+    h2 {
+      font-family: Garamond;
+      font-weight: bold;
+      color: black;
+      font-size: 40px;
+
+      @include media-breakpoint-up(lg) {
+        font-size: 60px;
+      }
+    }
+
+    div h3 {
+    font-family: Georgia;
+    font-size: 20px;
+    color: color(grey);
+
+      @include media-breakpoint-up(lg) {
+        font-size: 25px;
+      }
+    }
+
+    a {
+      text-decoration: none !important;
+    }
+
+    img {
+      width: 320px;
+      height: 320px;
+      object-fit: cover;
+      margin: 20px 0;
+
+      @include media-breakpoint-up(md) {
+        width: 400px;
+        height: 400px;
+      }
+    }
+
+    button {
+      width: 150px;
+      height: 60px;
+      background-color: black;
+      margin-top: 30px;
+      font-family: Garamond;
+      font-size: 23px;
+      font-weight: bold;
+    }
+
+    .btn:focus,.btn:active {
+     outline: none !important;
+     box-shadow: none;
+    }
+  }
+}
