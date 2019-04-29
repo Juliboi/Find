@@ -8013,9 +8013,13 @@ html {
 
 nav {
   background-color: #000000;
-  min-height: 60px; }
+  min-height: 60px;
+  -webkit-transition: background 0.2s ease-in;
+  -o-transition: background 0.2s ease-in;
+  transition: background 0.2s ease-in; }
   @media (min-width: 992px) {
     nav {
+      background-color: transparent;
       height: 80px; } }
   nav .navbar-brand {
     color: white;
@@ -8024,18 +8028,29 @@ nav {
     font-size: 30px; }
     @media (min-width: 992px) {
       nav .navbar-brand {
+        color: black;
         font-size: 45px;
         margin: 0 80px 0 20px; } }
+  nav .navbar-brand:focus, nav .navbar-brand:active {
+    text-decoration: none;
+    color: white; }
+  @media (min-width: 992px) {
+    nav .navbar-brand:hover {
+      color: inherit; } }
   @media (min-width: 992px) {
     nav .navbar1 li {
       margin-right: 15px; } }
+  @media (min-width: 992px) {
+    nav a {
+      color: black !important; } }
   nav .navbar-nav li a {
     font-family: Garamond;
     font-weight: bold;
     font-size: 25px;
-    color: white; }
-  nav .navbar-nav li a:hover {
-    color: #cdcdcd; }
+    color: white;
+    -webkit-transition: color 0.2s ease-in;
+    -o-transition: color 0.2s ease-in;
+    transition: color 0.2s ease-in; }
   nav .navbar2 li {
     margin-right: 5px; }
   nav .navbar2 li a {
@@ -8055,6 +8070,16 @@ nav {
         margin-left: 20px; } }
   nav .navbar-toggler-icon {
     background-image: url("data:image/svg+xml;charset=utf8,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath stroke='WHITE' stroke-width='2' stroke-linecap='round' stroke-miterlimit='10' d='M4 8h24M4 16h24M4 24h24'/%3E%3C/svg%3E"); }
+
+.changeText {
+  color: white !important;
+  pointer-events: auto !important; }
+
+.changeBackground {
+  background: black !important; }
+
+li a:hover {
+  color: #cdcdcd !important; }
 
 #frontpage {
   background: url("../img/frontpage.jpg") center/cover; }
@@ -8097,13 +8122,15 @@ nav {
       font-family: "Times-New-Roman";
       font-size: 25px;
       font-weight: bold;
-      border: 1px solid grey; }
+      border: 1px solid #2e2e2e; }
       @media (min-width: 992px) {
         #frontpage div .imgbox button {
           width: 200px;
           height: 60px; } }
-    #frontpage div .imgbox button:hover {
-      background-color: #f1f1f1; }
+    @media (min-width: 992px) {
+      #frontpage div .imgbox button:hover {
+        background-color: black;
+        color: white; } }
   #frontpage .btn:focus, #frontpage .btn:active {
     outline: none !important;
     -webkit-box-shadow: none;

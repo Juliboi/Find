@@ -8024,15 +8024,20 @@ a.text-dark:hover, a.text-dark:focus {
         font-size: 60px; } }
   #about-lg .container-fluid .card {
     margin-bottom: 30px; }
-  #about-lg .container-fluid .card-img-top {
+  #about-lg .container-fluid .image {
+    background: url("/img/left-about.jpg") 0% 35%/cover;
     height: 100px;
     -o-object-fit: cover;
     object-fit: cover;
     -o-object-position: 0% 35%;
     object-position: 0% 35%; }
     @media (min-width: 992px) {
-      #about-lg .container-fluid .card-img-top {
+      #about-lg .container-fluid .image {
         height: 400px; } }
+  #about-lg .container-fluid .img2 {
+    background: url("/img/middle-about.jpg") 0% 35%/cover; }
+  #about-lg .container-fluid .img3 {
+    background: url("/img/right-about.jpg") 0% 35%/cover; }
   #about-lg .container-fluid .card-body {
     height: 60px;
     text-align: center; }
@@ -8047,37 +8052,33 @@ a.text-dark:hover, a.text-dark:focus {
   #about-lg .container-fluid .no-border {
     background: white; }
 
-.my-card {
-  height: 562px;
-  display: -webkit-box;
-  display: -ms-flexbox;
-  display: flex;
-  -webkit-box-orient: vertical;
-  -webkit-box-direction: normal;
-  -ms-flex-direction: column;
-  flex-direction: column; }
-  .my-card .image {
-    background: url("/img/left-about.jpg") 0% 35%/cover;
-    z-index: 0;
-    -webkit-box-flex: 3;
-    -ms-flex: 3;
-    flex: 3; }
-  .my-card .img2 {
-    background: url("/img/middle-about.jpg") 0% 35%/cover; }
-  .my-card .img3 {
-    background: url("/img/right-about.jpg") 0% 35%/cover; }
-  .my-card .card-body {
-    -webkit-box-flex: 1;
-    -ms-flex: 1;
-    flex: 1;
-    -webkit-transition: -webkit-box-flex 0.3s ease-in;
-    transition: -webkit-box-flex 0.3s ease-in;
-    -o-transition: flex 0.3s ease-in;
-    transition: flex 0.3s ease-in;
-    transition: flex 0.3s ease-in, -webkit-box-flex 0.3s ease-in, -ms-flex 0.3s ease-in;
-    overflow: hidden; }
+@media (min-width: 992px) {
+  .my-card {
+    height: 562px;
+    display: -webkit-box;
+    display: -ms-flexbox;
+    display: flex;
+    -webkit-box-orient: vertical;
+    -webkit-box-direction: normal;
+    -ms-flex-direction: column;
+    flex-direction: column; }
+    .my-card .image {
+      -webkit-box-flex: 3;
+      -ms-flex: 3;
+      flex: 3; }
+    .my-card .card-body {
+      -webkit-box-flex: 1;
+      -ms-flex: 1;
+      flex: 1;
+      -webkit-transition: -webkit-box-flex 0.3s ease-in;
+      transition: -webkit-box-flex 0.3s ease-in;
+      -o-transition: flex 0.3s ease-in;
+      transition: flex 0.3s ease-in;
+      transition: flex 0.3s ease-in, -webkit-box-flex 0.3s ease-in, -ms-flex 0.3s ease-in;
+      overflow: hidden; } }
 
-.openCard {
-  -webkit-box-flex: 5 !important;
-  -ms-flex: 5 !important;
-  flex: 5 !important; }
+@media (min-width: 992px) {
+  .openCard {
+    -webkit-box-flex: 5 !important;
+    -ms-flex: 5 !important;
+    flex: 5 !important; } }

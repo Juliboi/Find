@@ -59,7 +59,8 @@ background-color: color(background);
     }
 
 
-      .card-img-top {
+      .image {
+        background: url("/img/left-about.jpg") 0% 35%/cover;
         height: 100px;
         object-fit: cover;
         object-position: 0% 35%;
@@ -67,6 +68,14 @@ background-color: color(background);
         @include media-breakpoint-up(lg) {
           height: 400px;
         }
+      }
+
+      .img2 {
+        background: url("/img/middle-about.jpg") 0% 35%/cover;
+      }
+
+      .img3 {
+        background: url("/img/right-about.jpg") 0% 35%/cover;
       }
 
       .card-body {
@@ -93,23 +102,15 @@ background-color: color(background);
 
   }
 }
-.my-card{
-  height: 562px;
-  display: flex;
-  flex-direction: column;
+
+@include media-breakpoint-up(lg) {
+  .my-card{
+    height: 562px;
+    display: flex;
+    flex-direction: column;
 
   .image {
-    background: url("/img/left-about.jpg") 0% 35%/cover;
-    z-index: 0;
     flex: 3;
-  }
-
-  .img2 {
-    background: url("/img/middle-about.jpg") 0% 35%/cover;
-  }
-
-  .img3 {
-    background: url("/img/right-about.jpg") 0% 35%/cover;
   }
 
   .card-body {
@@ -118,11 +119,11 @@ background-color: color(background);
     overflow: hidden;
   }
 }
-
-.openCard {
-  flex: 5 !important;
+ 
 }
 
-.closeImg {
-
+.openCard {
+  @include media-breakpoint-up(lg) {
+    flex: 5 !important;
+  }
 }

@@ -8031,8 +8031,9 @@ a.text-dark:hover, a.text-dark:focus {
     font-size: 23px;
     font-weight: bold;
     color: white; }
-  #career button:hover {
-    background-color: rgba(65, 99, 148, 0.92); }
+  @media (min-width: 992px) {
+    #career button:hover {
+      background-color: rgba(65, 99, 148, 0.92); } }
   #career .btn:focus, #career .btn:active {
     outline: none !important;
     -webkit-box-shadow: none;

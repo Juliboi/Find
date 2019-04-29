@@ -28,49 +28,48 @@
         <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#collapse_target">
           <span class="navbar-toggler-icon"></span>
         </button>
-        <a class="navbar-brand text-white" href="#">Find.</a>
+        <a class="navbar-brand" href="#">Find.</a>
         <a href="#"><span class="navbar-text eng d-lg-none">ENG</span></a>
 
-      <div class="container-fluid">
+        <div class="container-fluid">
+          <!--NAV ITEMS-->
+          <div class="collapse navbar-collapse text-center" id="collapse_target">
+            <ul class="navbar-nav navbar1">
+              <li class="nav-item">
+                <a class="nav-link" href="#form">Find a photographer</a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link" href="#payment-extra">Payment</a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link" href="#career">Career</a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link" href="#about-lg">About us</a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link" href="#footer">Contact</a>
+              </li>
+            </ul>
 
-        <!--NAV ITEMS-->
-        <div class="collapse navbar-collapse text-center" id="collapse_target">
-          <ul class="navbar-nav navbar1">
-            <li class="nav-item">
-              <a class="nav-link" href="#form">Find a photographer</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link" href="#payment-extra">Payment</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link" href="#career">Career</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link" href="#about-lg">About us</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link" href="#footer">Contact</a>
-            </li>
-          </ul>
+          </div>
 
+          <div class="collapse navbar-collapse" id="navbarSupportedContent">
+            <ul class="navbar-nav navbar2 ml-auto">
+              <li class="nav-item">
+                <a class="nav-link" href="#">Login</a>
+              </li>
+              <li class="nav-item">
+                <a class="nav-link" href="#">Register</a>
+              </li>
+              <li><a href="#" class="navbar-text eng">ENG</a></li>
+              <li class="flagbox">
+                <img class="img-fluid" src="img/flag.png" alt="union-jack">
+              </li>
+
+            </ul>
+          </div>
         </div>
-
-        <div class="collapse navbar-collapse" id="navbarSupportedContent">
-          <ul class="navbar-nav navbar2 ml-auto">
-            <li class="nav-item">
-              <a class="nav-link" href="#">Login</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link" href="#">Register</a>
-            </li>
-            <li><a href="#" class="navbar-text eng">ENG</a></li>
-            <li class="flagbox">
-              <img class="img-fluid" src="img/flag.png" alt="union-jack">
-            </li>
-
-          </ul>
-        </div>
-      </div>
       </nav>
 
     <!--FRONT PAGE IMG-->
@@ -165,33 +164,32 @@
       <h2 class="text-center d-md-none">About us</h2>
       <h2 data-aos="fade-up" class="text-center d-none d-md-block">What are we about?</h2>
       <div data-aos="fade-up" class="row pb-2">
-          <div class="col-12 col-lg-4 my-card">
-              <div class="image">
-
-              </div>
-              <div class="card-body no-border">
-                <h5 class="card-title">About us</h5>
-                <p class="card-text">This is a longer card with supporting text below as a natural lead-in to additional content. Lorem ipsum dolor sit amet, consectetuer adipiscing elit.</p>
-              </div>
+        <div class="col-12 col-lg-4 my-card">
+          <div class="image img1">
           </div>
-          <div class="col-12 col-lg-4 my-card">
-                <div class="image img2">
-
-                </div>
-                <div class="card-body no-border">
-                  <h5 class="card-title">Our Story</h5>
-                  <p class="card-text">This card has supporting text below as a natural lead-in to additional content.</p>
-                </div>
+          <div class="card-body no-border">
+            <h5 class="card-title">About us</h5>
+            <p class="card-text">This is a longer card with supporting text below as a natural lead-in to additional content. Lorem ipsum dolor sit amet, consectetuer adipiscing elit.</p>
           </div>
-          <div class="col-12 col-lg-4 my-card">
-                <div class="image img3">
+        </div>
+        <div class="col-12 col-lg-4 my-card">
+          <div class="image img2">
 
-                </div>
-                <div class="card-body no-border">
-                  <h5 class="card-title">How it Works?</h5>
-                  <p class="card-text">This is a wider card with supporting text below as a natural lead-in to additional content. This card has even longer content than the first to show that equal height action.</p>
-                </div>
           </div>
+          <div class="card-body no-border">
+            <h5 class="card-title">Our Story</h5>
+            <p class="card-text">This card has supporting text below as a natural lead-in to additional content.</p>
+          </div>
+        </div>
+        <div class="col-12 col-lg-4 my-card">
+          <div class="image img3">
+          </div>
+          <div class="card-body no-border">
+            <h5 class="card-title">How it Works?</h5>
+            <p class="card-text">This is a wider card with supporting text below as a natural lead-in to additional content. This card has even longer content than the first to show that equal height action.</p>
+          </div>
+        </div>
+
       </div>
     </div>
   </section>
@@ -426,6 +424,8 @@
     });
   </script>
   <script src="JS/cards.js">
+  </script>
+  <script src="JS/navbar.js">
   </script>
 </body>
 </html>

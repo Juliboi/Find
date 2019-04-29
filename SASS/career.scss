@@ -65,10 +65,11 @@ $colors: (
       color: white;
     }
 
-    button:hover {
-      background-color: rgba(#416394, 0.92);
+    @include media-breakpoint-up(lg) {
+      button:hover {
+        background-color: rgba(#416394, 0.92);
+      }
     }
-
     .btn:focus,.btn:active {
      outline: none !important;
      box-shadow: none;
