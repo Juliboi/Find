@@ -8042,13 +8042,27 @@ a.text-dark:hover, a.text-dark:focus {
     height: 60px;
     text-align: center; }
     #about-lg .container-fluid .card-body p {
+      font-family: Georgia;
       font-size: 20px;
       display: none; }
     @media (min-width: 992px) {
       #about-lg .container-fluid .card-body {
         height: 160px; }
+        #about-lg .container-fluid .card-body h5 {
+          font-family: Garamond;
+          font-weight: bold;
+          font-size: 28px; }
         #about-lg .container-fluid .card-body p {
-          display: block; } }
+          display: block;
+          margin-bottom: 10px; }
+        #about-lg .container-fluid .card-body .read-more {
+          font-family: Georgia;
+          display: inline;
+          color: #5976A1;
+          font-size: 15px;
+          font-weight: 600; } }
+  #about-lg .container-fluid .read-more {
+    display: none; }
   #about-lg .container-fluid .no-border {
     background: white; }
 
@@ -8079,6 +8093,6 @@ a.text-dark:hover, a.text-dark:focus {
 
 @media (min-width: 992px) {
   .openCard {
-    -webkit-box-flex: 5 !important;
-    -ms-flex: 5 !important;
-    flex: 5 !important; } }
+    -webkit-box-flex: 4 !important;
+    -ms-flex: 4 !important;
+    flex: 4 !important; } }

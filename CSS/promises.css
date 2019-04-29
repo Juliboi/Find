@@ -8019,3 +8019,7 @@ a.text-dark:hover, a.text-dark:focus {
       justify-content: space-between; }
     #promises .row img {
       width: 160px; }
+    #promises .row p {
+      font-family: Georgia;
+      color: #7d7d7d;
+      font-size: 20px; }

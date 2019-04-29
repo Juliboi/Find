@@ -83,6 +83,7 @@ background-color: color(background);
         text-align: center;
 
         p {
+          font-family: Georgia;
           font-size: 20px;
           display: none;
         }
@@ -90,10 +91,28 @@ background-color: color(background);
         @include media-breakpoint-up(lg) {
           height: 160px;
 
+          h5 {
+            font-family: Garamond;
+            font-weight: bold;
+            font-size: 28px;
+          }
+
           p {
             display: block;
+            margin-bottom: 10px;
+          }
+
+          .read-more {
+            font-family: Georgia;
+            display: inline;
+            color: #5976A1;
+            font-size: 15px;
+            font-weight: 600;
           }
         }
+      }
+      .read-more {
+        display: none;
       }
 
       .no-border {
@@ -119,11 +138,11 @@ background-color: color(background);
     overflow: hidden;
   }
 }
- 
+
 }
 
 .openCard {
   @include media-breakpoint-up(lg) {
-    flex: 5 !important;
+    flex: 4 !important;
   }
 }

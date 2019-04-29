@@ -8056,9 +8056,9 @@ nav {
   nav .navbar2 li a {
     font-size: 18px; }
   nav .flagbox {
-    margin: 6px 20px 0 5px;
-    width: 30px;
-    height: 20px; }
+    margin: 0px 20px 5px 5px;
+    width: 25px;
+    height: 25px; }
   nav .eng {
     font-family: Garamond;
     color: white;
@@ -8070,6 +8070,42 @@ nav {
         margin-left: 20px; } }
   nav .navbar-toggler-icon {
     background-image: url("data:image/svg+xml;charset=utf8,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath stroke='WHITE' stroke-width='2' stroke-linecap='round' stroke-miterlimit='10' d='M4 8h24M4 16h24M4 24h24'/%3E%3C/svg%3E"); }
+
+.right-menu {
+  position: relative; }
+
+.dd-menu {
+  display: none;
+  position: absolute;
+  background: #cbabab !important;
+  width: 120px;
+  z-index: 1;
+  left: 10px;
+  border-radius: 0px 0px 10px 10px;
+  border-top: 0;
+  padding: 10px; }
+
+.dd-menu a {
+  color: green;
+  display: block;
+  text-decoration: none !important; }
+
+.right-menu:hover .dd-menu {
+  display: block; }
+
+.right-menu:hover .eng {
+  background: transparent; }
+
+.flags {
+  width: 25px;
+  height: 25px;
+  margin: 0 0 5px 8px; }
+
+.cz {
+  margin-left: 25px; }
+
+.ger {
+  margin-left: 11px; }
 
 .changeText {
   color: white !important;
