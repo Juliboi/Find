@@ -8075,7 +8075,7 @@ nav {
   position: relative; }
 
 .dd-menu {
-  display: none;
+  visibility: hidden;
   position: absolute;
   background: #cbabab !important;
   width: 120px;
@@ -8083,15 +8083,22 @@ nav {
   left: 10px;
   border-radius: 0px 0px 10px 10px;
   border-top: 0;
-  padding: 10px; }
+  padding: 10px;
+  height: 0;
+  -webkit-transition: all 0.3s ease-in;
+  -o-transition: all 0.3s ease-in;
+  transition: all 0.3s ease-in; }
 
 .dd-menu a {
-  color: green;
-  display: block;
+  visibility: hidden;
   text-decoration: none !important; }
 
 .right-menu:hover .dd-menu {
-  display: block; }
+  visibility: visible;
+  height: 105px; }
+
+.right-menu:hover .dd-menu a {
+  visibility: visible; }
 
 .right-menu:hover .eng {
   background: transparent; }

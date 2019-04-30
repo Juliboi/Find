@@ -135,7 +135,7 @@ nav {
 }
 
 .dd-menu {
-  display: none;
+  visibility: hidden;
   position: absolute;
   background: #cbabab !important;
   width: 120px;
@@ -144,16 +144,22 @@ nav {
   border-radius: 0px 0px 10px 10px;
   border-top: 0;
   padding: 10px;
+  height: 0;
+  transition: all 0.3s ease-in,
 }
 
 .dd-menu a {
-    color: green;
-    display: block;
+    visibility: hidden;
     text-decoration: none !important;
 }
 
 .right-menu:hover .dd-menu {
-  display: block;
+  visibility: visible;
+  height: 105px;
+}
+
+.right-menu:hover .dd-menu a {
+  visibility: visible;
 }
 
 .right-menu:hover .eng {
