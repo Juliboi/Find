@@ -8078,16 +8078,17 @@ nav {
   visibility: hidden;
   position: absolute;
   background: #cbabab !important;
-  width: 120px;
+  width: 98px;
   z-index: 1;
   left: 10px;
   border-radius: 0px 0px 10px 10px;
   border-top: 0;
   padding: 10px;
   height: 0;
-  -webkit-transition: all 0.3s ease-in;
-  -o-transition: all 0.3s ease-in;
-  transition: all 0.3s ease-in; }
+  -webkit-transition: background 0.2s ease-in, height 0.2s ease-in, visibility 0.2s ease-in;
+  -o-transition: background 0.2s ease-in, height 0.2s ease-in, visibility 0.2s ease-in;
+  transition: background 0.2s ease-in, height 0.2s ease-in, visibility 0.2s ease-in;
+  overflow: hidden; }
 
 .dd-menu a {
   visibility: hidden;
@@ -8122,7 +8123,7 @@ nav {
   background: black !important; }
 
 li a:hover {
-  color: #cdcdcd !important; }
+  color: #cbabab  !important; }
 
 #frontpage {
   background: url("../img/frontpage.jpg") center/cover; }

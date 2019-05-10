@@ -1,6 +1,6 @@
 const topPoint = window.scrollY;
 const navbar = document.querySelector('nav');
-const words = document.querySelectorAll('nav a');
+const words = document.querySelectorAll('.navbar a');
 const dropdown = document.querySelector('.dd-menu')
 
 function showNavbar(e) {
@@ -9,7 +9,7 @@ function showNavbar(e) {
       word.classList.add('changeText');
     });
     navbar.classList.add('changeBackground');
-    dropdown.classList.add('changeBackground')
+    dropdown.classList.add('changeBackground');
   } else {
     words.forEach(word => {
       word.classList.remove('changeText');
@@ -20,5 +20,6 @@ function showNavbar(e) {
 }
 
 
-window.addEventListener('scroll', showNavbar)
-console.log(window)
+window.addEventListener('scroll', showNavbar);
+window.addEventListener('DOMContentLoaded', showNavbar);
+//console.log(window)

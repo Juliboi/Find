@@ -54,11 +54,11 @@ background-color: color(background);
       }
     }
 
-    .card {
+    .my-card {
       margin-bottom: 30px;
     }
 
-
+      //images
       .image {
         background: url("/img/left-about.jpg") 0% 35%/cover;
         height: 100px;
@@ -78,27 +78,35 @@ background-color: color(background);
         background: url("/img/right-about.jpg") 0% 35%/cover;
       }
 
+      //body and text
       .card-body {
         height: 60px;
         text-align: center;
+        overflow: hidden;
 
         p {
           font-family: Georgia;
-          font-size: 20px;
-          display: none;
+          font-size: 18px;
+          color: #7e7e7e;
+        }
+
+        h5 {
+          font-family: Garamond;
+          font-weight: bold;
+          font-size: 24px;
+          color: #393939;
         }
 
         @include media-breakpoint-up(lg) {
           height: 160px;
 
           h5 {
-            font-family: Garamond;
-            font-weight: bold;
             font-size: 28px;
           }
 
           p {
             display: block;
+            font-size: 20px;
             margin-bottom: 10px;
           }
 
@@ -141,8 +149,15 @@ background-color: color(background);
 
 }
 
-.openCard {
-  @include media-breakpoint-up(lg) {
-    flex: 4 !important;
+//Card Open
+  //LG
+  .openCard {
+    @include media-breakpoint-up(lg) {
+      flex: 4 !important;
+    }
   }
-}
+
+  //SM
+  .openCardSM {
+    height: 300px !important;
+  }

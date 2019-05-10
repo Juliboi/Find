@@ -8020,7 +8020,8 @@ a.text-dark:hover, a.text-dark:focus {
     font-family: Georgia;
     font-size: 20px;
     color: white;
-    line-height: 32px; }
+    line-height: 32px;
+    text-decoration: none !important; }
   #footer .container-fluid h5 {
     font-family: Garamond;
     font-weight: bold;

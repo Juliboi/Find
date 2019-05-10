@@ -8022,7 +8022,7 @@ a.text-dark:hover, a.text-dark:focus {
     @media (min-width: 992px) {
       #about-lg .container-fluid h2 {
         font-size: 60px; } }
-  #about-lg .container-fluid .card {
+  #about-lg .container-fluid .my-card {
     margin-bottom: 30px; }
   #about-lg .container-fluid .image {
     background: url("/img/left-about.jpg") 0% 35%/cover;
@@ -8040,20 +8040,25 @@ a.text-dark:hover, a.text-dark:focus {
     background: url("/img/right-about.jpg") 0% 35%/cover; }
   #about-lg .container-fluid .card-body {
     height: 60px;
-    text-align: center; }
+    text-align: center;
+    overflow: hidden; }
     #about-lg .container-fluid .card-body p {
       font-family: Georgia;
-      font-size: 20px;
-      display: none; }
+      font-size: 18px;
+      color: #7e7e7e; }
+    #about-lg .container-fluid .card-body h5 {
+      font-family: Garamond;
+      font-weight: bold;
+      font-size: 24px;
+      color: #393939; }
     @media (min-width: 992px) {
       #about-lg .container-fluid .card-body {
         height: 160px; }
         #about-lg .container-fluid .card-body h5 {
-          font-family: Garamond;
-          font-weight: bold;
           font-size: 28px; }
         #about-lg .container-fluid .card-body p {
           display: block;
+          font-size: 20px;
           margin-bottom: 10px; }
         #about-lg .container-fluid .card-body .read-more {
           font-family: Georgia;
@@ -8096,3 +8101,6 @@ a.text-dark:hover, a.text-dark:focus {
     -webkit-box-flex: 4 !important;
     -ms-flex: 4 !important;
     flex: 4 !important; } }
+
+.openCardSM {
+  height: 300px !important; }

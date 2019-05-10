@@ -1,0 +1,30 @@
+const video = document.querySelector('.player');
+const canvas = document.querySelector('.photo');
+const ctx = canvas.getContext('2d');
+const strip = document.querySelector('.strip');
+const snap = document.querySelector('.snap');
+
+function getVideo(){
+  navigator.mediaDevices.getUserMedia({ video: true, audio: false})
+    .then(localMediaStream => {
+      //console.log(localMediaStream);
+      video.srcObject = localMediaStream; //getting the video source
+      video.play();
+    })
+    .catch(err => //what if you dont get the access
+    alert(err.message))
+}
+
+function paintToCanvas() {
+  const width = video.videoWidth; 640
+  const height = video.videoHeight; 480
+  console.log(width, height);
+  canvas.width = width;
+  canvas.height = height;
+
+  setInterval(() => {
+    ctx.drawImage(video, 0, 0, width, height)
+  }, 16);
+}
+
+getVideo()
