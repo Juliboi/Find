@@ -1,0 +1,4 @@
+project_id = "dayflow"
+
+[functions.schedule-day]
+verify_jwt = false
