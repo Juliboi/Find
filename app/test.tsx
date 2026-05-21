@@ -5,19 +5,21 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Text as RNText,
   TextInput,
   View,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { HomePicker } from '@/components/HomePicker';
 import { PlanCard } from '@/components/PlanCard';
-import { TopBar } from '@/components/TopBar';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
+import { TopBar } from '@/components/TopBar';
 import { Button } from '@/components/Button';
 import {
   rescheduleDay,
@@ -52,6 +54,7 @@ export default function TestScreen() {
   const planIt = async () => {
     const text = input.trim();
     if (!text || loading) return;
+    Haptics.selectionAsync().catch(() => undefined);
     setLoading(true);
     setErrorMsg(null);
     try {
@@ -79,9 +82,10 @@ export default function TestScreen() {
   ) => {
     if (!plan || plan.id !== planId || loading) return;
     const question = plan.clarificationQuestion;
-    const isLocationAnswer = /where|which|location|nearby|spot|place|gym|store|cafe|restaurant|shop|office|school/i.test(
-      question ?? '',
-    );
+    const isLocationAnswer =
+      /where|which|location|nearby|spot|place|gym|store|cafe|restaurant|shop|office|school/i.test(
+        question ?? '',
+      );
     const updated: Plan = {
       ...plan,
       location: opts?.location ?? (isLocationAnswer ? answer : plan.location),
@@ -134,8 +138,8 @@ export default function TestScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <TopBar
-          kicker="Developer"
-          title="Sandbox"
+          kicker="Sandbox"
+          title="Try a plan"
           left={{
             icon: 'chevron-back',
             onPress: () => router.back(),
@@ -155,8 +159,8 @@ export default function TestScreen() {
             styles.scrollContent,
             {
               paddingHorizontal: t.spacing.lg,
-              paddingTop: t.spacing.sm,
-              paddingBottom: t.spacing.xxl,
+              paddingTop: t.spacing.md,
+              paddingBottom: 60,
             },
           ]}
           keyboardShouldPersistTaps="handled"
@@ -167,11 +171,7 @@ export default function TestScreen() {
             <Text variant="title3" weight="bold" tight>
               Single plan
             </Text>
-            <Text
-              variant="caption"
-              tone="secondary"
-              style={{ marginTop: 4, marginBottom: 12 }}
-            >
+            <Text variant="bodySm" tone="secondary" style={{ marginTop: 6 }}>
               Type one activity, then tap "Plan it" to send it to the AI in
               isolation. The full clarification flow runs locally on this
               screen — nothing touches your day.
@@ -183,6 +183,7 @@ export default function TestScreen() {
                   backgroundColor: t.colors.fill1,
                   color: t.colors.textPrimary,
                   borderRadius: t.radii.md,
+                  marginTop: 12,
                 },
               ]}
               placeholder="e.g. gym, grocery, lunch, deep work"
@@ -195,34 +196,20 @@ export default function TestScreen() {
               returnKeyType="go"
             />
             <Button
-              title={loading ? 'Planning…' : 'Plan it'}
+              title="Plan it"
               onPress={planIt}
               loading={loading}
-              disabled={loading || input.trim().length === 0}
-              fullWidth
+              disabled={input.trim().length === 0}
               style={{ marginTop: 12 }}
+              fullWidth
             />
           </Card>
 
           {errorMsg ? (
-            <Card
-              padded
-              style={{
-                backgroundColor: t.colors.dangerSoft,
-                borderColor: t.colors.danger,
-                borderWidth: 1,
-              }}
-            >
-              <View style={styles.errorRow}>
-                <Ionicons
-                  name="alert-circle"
-                  size={18}
-                  color={t.colors.danger}
-                />
-                <Text variant="bodySm" tone="danger" style={{ flex: 1 }}>
-                  {errorMsg}
-                </Text>
-              </View>
+            <Card padded style={{ borderColor: t.colors.danger, borderWidth: 1 }}>
+              <Text variant="bodySm" tone="danger">
+                {errorMsg}
+              </Text>
             </Card>
           ) : null}
 
@@ -258,7 +245,10 @@ export default function TestScreen() {
 
           {debug ? (
             <Card padded>
-              <Pressable onPress={() => setShowDebug((v) => !v)} hitSlop={6}>
+              <Pressable
+                onPress={() => setShowDebug((v) => !v)}
+                style={({ pressed }) => [pressed && { opacity: 0.6 }]}
+              >
                 <View style={styles.debugHeader}>
                   <Text variant="title3" weight="bold" tight>
                     Debug
@@ -271,66 +261,64 @@ export default function TestScreen() {
                 </View>
               </Pressable>
               {showDebug ? (
-                <View style={{ gap: 12, marginTop: 12 }}>
-                  <View style={{ gap: 6 }}>
-                    <Text
-                      variant="micro"
-                      tone="secondary"
-                      uppercase
-                      weight="bold"
-                    >
-                      Request
-                    </Text>
-                    <View
+                <>
+                  <Text
+                    variant="micro"
+                    tone="secondary"
+                    uppercase
+                    weight="bold"
+                    style={{ marginTop: 12 }}
+                  >
+                    Request
+                  </Text>
+                  <View
+                    style={[
+                      styles.debugBox,
+                      {
+                        backgroundColor: t.colors.fill1,
+                        borderRadius: t.radii.sm,
+                      },
+                    ]}
+                  >
+                    <RNText
                       style={[
-                        styles.debugBox,
-                        {
-                          backgroundColor: t.colors.fill1,
-                          borderRadius: t.radii.sm,
-                        },
+                        styles.debugText,
+                        { color: t.colors.textPrimary },
                       ]}
+                      selectable
                     >
-                      <Text
-                        style={[
-                          styles.debugText,
-                          { color: t.colors.textPrimary, fontFamily: t.fonts.mono },
-                        ]}
-                        selectable
-                      >
-                        {JSON.stringify(debug.request, null, 2)}
-                      </Text>
-                    </View>
+                      {JSON.stringify(debug.request, null, 2)}
+                    </RNText>
                   </View>
-                  <View style={{ gap: 6 }}>
-                    <Text
-                      variant="micro"
-                      tone="secondary"
-                      uppercase
-                      weight="bold"
-                    >
-                      Response
-                    </Text>
-                    <View
+                  <Text
+                    variant="micro"
+                    tone="secondary"
+                    uppercase
+                    weight="bold"
+                    style={{ marginTop: 12 }}
+                  >
+                    Response
+                  </Text>
+                  <View
+                    style={[
+                      styles.debugBox,
+                      {
+                        backgroundColor: t.colors.fill1,
+                        borderRadius: t.radii.sm,
+                      },
+                    ]}
+                  >
+                    <RNText
                       style={[
-                        styles.debugBox,
-                        {
-                          backgroundColor: t.colors.fill1,
-                          borderRadius: t.radii.sm,
-                        },
+                        styles.debugText,
+                        { color: t.colors.textPrimary },
                       ]}
+                      selectable
                     >
-                      <Text
-                        style={[
-                          styles.debugText,
-                          { color: t.colors.textPrimary, fontFamily: t.fonts.mono },
-                        ]}
-                        selectable
-                      >
-                        {JSON.stringify(debug.response, null, 2)}
-                      </Text>
-                    </View>
+                      {JSON.stringify(debug.response, null, 2)}
+                    </RNText>
                   </View>
-                </View>
+                </>
               ) : null}
             </Card>
           ) : null}
@@ -347,9 +335,8 @@ const styles = StyleSheet.create({
   },
   input: {
     paddingHorizontal: 14,
-    paddingVertical: 14,
-    fontSize: 17,
-    minHeight: 48,
+    paddingVertical: 12,
+    fontSize: 16,
   },
   resultHeader: {
     flexDirection: 'row',
@@ -361,11 +348,6 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
     borderRadius: 999,
   },
-  errorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
   debugHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -373,9 +355,11 @@ const styles = StyleSheet.create({
   },
   debugBox: {
     padding: 10,
+    marginTop: 4,
   },
   debugText: {
     fontSize: 11,
-    lineHeight: 16,
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace' }),
+    lineHeight: 14,
   },
 });
