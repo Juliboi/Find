@@ -1,7 +1,7 @@
-# DayFlow
+# Diem
 
 A mobile app that helps you plan a single day. Instead of being yet another
-calendar, DayFlow is a dynamic helper that:
+calendar, Diem is a dynamic helper that:
 
 - accepts free-form plans you want to do today,
 - orders them so the day flows logically (errands first, gym before meals, focused work in chunks, relaxation later),
@@ -18,7 +18,7 @@ The UI is intentionally minimal and reads more like a chat than a calendar.
 
 ## Stack
 
-- **App**: Expo SDK 51, Expo Router, TypeScript, Zustand for state, AsyncStorage for persistence.
+- **App**: Expo SDK 54, Expo Router, TypeScript, Zustand for state, AsyncStorage for persistence.
 - **Backend**: Supabase (Postgres, Auth-ready, Edge Functions).
 - **AI**: OpenAI `gpt-4o-mini` via a Supabase Edge Function. Heuristic fallback when not configured.
 - **Location / routing**: not in MVP. Designed to slot in later — see [Roadmap](#roadmap).

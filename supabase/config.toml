@@ -2,3 +2,6 @@ project_id = "dayflow"
 
 [functions.schedule-day]
 verify_jwt = false
+
+[functions.find-places]
+verify_jwt = false

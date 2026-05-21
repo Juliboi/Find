@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "DayFlow",
-    "slug": "dayflow",
+    "slug": "diem",
     "version": "0.1.0",
     "orientation": "portrait",
     "scheme": "dayflow",
@@ -25,14 +25,28 @@
       "output": "single"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "DayFlow uses your location to suggest nearby gyms, grocery stores, cafés, and other places when you ask."
+        }
+      ],
+      "@react-native-community/datetimepicker"
     ],
     "experiments": {
       "typedRoutes": true
     },
     "extra": {
       "supabaseUrl": "",
-      "supabaseAnonKey": ""
-    }
+      "supabaseAnonKey": "",
+      "router": {
+        "origin": false
+      },
+      "eas": {
+        "projectId": "b76ccaa1-9136-4863-890a-e8dbc3e2bd75"
+      }
+    },
+    "owner": "cholifyapp"
   }
 }

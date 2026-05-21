@@ -5,17 +5,22 @@ import {
   Platform,
   Pressable,
   StyleSheet,
-  Text,
+  Text as RNText,
   TextInput,
   View,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useDayStore } from '@/store/useDayStore';
 import { useTheme } from '@/theme/useTheme';
 import { Input } from '@/components/Input';
 import { Button } from '@/components/Button';
 import { Chip } from '@/components/Chip';
+import { TopBar } from '@/components/TopBar';
+import { Text } from '@/components/Text';
+import { Card } from '@/components/Card';
 
 const EXAMPLE_PROMPTS = [
   'Go to the gym',
@@ -28,7 +33,7 @@ const EXAMPLE_PROMPTS = [
 
 export default function AddPlanScreen() {
   const router = useRouter();
-  const { colors } = useTheme();
+  const t = useTheme();
 
   const draft = useDayStore((s) => s.draft);
   const addDraft = useDayStore((s) => s.addDraft);
@@ -44,6 +49,7 @@ export default function AddPlanScreen() {
   const onAdd = () => {
     const text = current.trim();
     if (!text) return;
+    Haptics.selectionAsync().catch(() => undefined);
     addDraft(text);
     setCurrent('');
     setTimeout(() => inputRef.current?.focus(), 0);
@@ -53,93 +59,133 @@ export default function AddPlanScreen() {
     const hasPending = current.trim().length > 0;
     if (hasPending) addDraft(current.trim());
     setCurrent('');
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
+      () => undefined,
+    );
     await confirmDraft();
     router.back();
   };
 
+  const onClose = () => {
+    router.back();
+  };
+
+  const canConfirm = draft.length > 0 || current.trim().length > 0;
+
   return (
     <SafeAreaView
-      style={[styles.container, { backgroundColor: colors.background }]}
+      style={[styles.container, { backgroundColor: t.colors.background }]}
       edges={['top', 'bottom']}
     >
       <KeyboardAvoidingView
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <View style={styles.header}>
-          <Pressable
-            hitSlop={12}
-            onPress={() => router.back()}
-            style={({ pressed }) => [pressed && { opacity: 0.6 }]}
-          >
-            <Text style={[styles.headerAction, { color: colors.textMuted }]}>
-              Cancel
-            </Text>
-          </Pressable>
-          <Text style={[styles.headerTitle, { color: colors.text }]}>
-            Add today's plans
-          </Text>
-          {draft.length > 0 ? (
-            <Pressable
-              hitSlop={12}
-              onPress={clearDraft}
-              style={({ pressed }) => [pressed && { opacity: 0.6 }]}
-            >
-              <Text style={[styles.headerAction, { color: colors.textMuted }]}>
-                Clear
-              </Text>
-            </Pressable>
-          ) : (
-            <View style={{ width: 50 }} />
-          )}
-        </View>
+        <TopBar
+          title="Add plans"
+          left={{
+            icon: 'close',
+            onPress: onClose,
+            accessibilityLabel: 'Close',
+          }}
+          actions={[
+            {
+              icon: 'checkmark',
+              accent: true,
+              onPress: canConfirm ? onConfirm : undefined,
+              accessibilityLabel: 'Confirm',
+            },
+          ]}
+        />
 
         <FlatList
           data={draft}
           keyExtractor={(item, idx) => `${idx}-${item}`}
-          contentContainerStyle={styles.listContent}
+          contentContainerStyle={[
+            styles.listContent,
+            {
+              paddingHorizontal: t.spacing.lg,
+              paddingTop: t.spacing.md,
+              paddingBottom: t.spacing.md,
+            },
+          ]}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          keyboardShouldPersistTaps="handled"
           ListHeaderComponent={
             <View style={{ marginBottom: 16 }}>
-              <Text style={[styles.lead, { color: colors.textMuted }]}>
-                Type whatever you want to do today, one plan at a time. You can
-                be vague — DayFlow will ask follow-ups if it needs to.
+              <Text variant="bodySm" tone="secondary">
+                Type whatever you want to do today, one plan at a time. You
+                can be vague — Diem will ask follow-ups if it needs to.
               </Text>
+              {draft.length > 0 ? (
+                <Pressable
+                  onPress={clearDraft}
+                  hitSlop={8}
+                  style={({ pressed }) => [
+                    styles.clearRow,
+                    pressed && { opacity: 0.6 },
+                  ]}
+                >
+                  <Ionicons
+                    name="trash-outline"
+                    size={14}
+                    color={t.colors.textSecondary}
+                  />
+                  <Text variant="caption" tone="secondary" weight="semibold">
+                    Clear all
+                  </Text>
+                </Pressable>
+              ) : null}
             </View>
           }
           renderItem={({ item, index }) => (
-            <View
-              style={[
-                styles.row,
-                {
-                  backgroundColor: colors.surface,
-                  borderColor: colors.border,
-                },
-              ]}
-            >
-              <Text style={[styles.rowIndex, { color: colors.textMuted }]}>
-                {index + 1}
-              </Text>
+            <Card padded small style={styles.row}>
+              <View
+                style={[
+                  styles.rowBadge,
+                  { backgroundColor: t.colors.fill1 },
+                ]}
+              >
+                <RNText
+                  style={[
+                    styles.rowBadgeText,
+                    { color: t.colors.textSecondary },
+                  ]}
+                >
+                  {index + 1}
+                </RNText>
+              </View>
               <TextInput
                 value={item}
-                onChangeText={(t) => updateDraft(index, t)}
-                style={[styles.rowInput, { color: colors.text }]}
-                placeholderTextColor={colors.textMuted}
+                onChangeText={(text) => updateDraft(index, text)}
+                style={[styles.rowInput, { color: t.colors.textPrimary }]}
+                placeholderTextColor={t.colors.textTertiary}
               />
               <Pressable
-                hitSlop={10}
+                hitSlop={8}
                 onPress={() => removeDraft(index)}
-                style={({ pressed }) => [pressed && { opacity: 0.6 }]}
+                style={({ pressed }) => [
+                  styles.rowRemove,
+                  { backgroundColor: t.colors.fill1 },
+                  pressed && { opacity: 0.6 },
+                ]}
               >
-                <Text style={[styles.rowRemove, { color: colors.textMuted }]}>
-                  ×
-                </Text>
+                <Ionicons
+                  name="close"
+                  size={14}
+                  color={t.colors.textSecondary}
+                />
               </Pressable>
-            </View>
+            </Card>
           )}
           ListEmptyComponent={
-            <View style={styles.suggestionsBlock}>
-              <Text style={[styles.suggestionsTitle, { color: colors.textMuted }]}>
+            <View style={{ gap: 14 }}>
+              <Text
+                variant="caption"
+                tone="secondary"
+                uppercase
+                weight="semibold"
+              >
                 Need ideas?
               </Text>
               <View style={styles.suggestionsRow}>
@@ -151,7 +197,18 @@ export default function AddPlanScreen() {
           }
         />
 
-        <View style={[styles.composer, { borderTopColor: colors.border }]}>
+        <View
+          style={[
+            styles.composer,
+            {
+              backgroundColor: t.colors.background,
+              borderTopColor: t.colors.separator,
+              paddingHorizontal: t.spacing.lg,
+              paddingTop: t.spacing.md,
+              paddingBottom: t.spacing.md,
+            },
+          ]}
+        >
           <Input
             ref={inputRef}
             value={current}
@@ -163,23 +220,36 @@ export default function AddPlanScreen() {
           />
           <Button
             title="Add"
-            variant="secondary"
+            variant="tonal"
+            size="md"
             onPress={onAdd}
             disabled={!current.trim()}
-            style={{ marginLeft: 8, paddingHorizontal: 16 }}
+            style={{ marginLeft: 8 }}
           />
         </View>
 
-        <View style={styles.confirmRow}>
+        <View
+          style={[
+            styles.confirmRow,
+            {
+              paddingHorizontal: t.spacing.lg,
+              paddingBottom: t.spacing.md,
+            },
+          ]}
+        >
           <Button
             title={
-              draft.length === 0
+              !canConfirm
                 ? 'Add at least one plan'
-                : `Plan my day (${draft.length})`
+                : `Plan my day (${
+                    draft.length + (current.trim() ? 1 : 0)
+                  })`
             }
             onPress={onConfirm}
-            disabled={draft.length === 0 && !current.trim()}
+            disabled={!canConfirm}
             loading={isScheduling}
+            fullWidth
+            size="lg"
           />
         </View>
       </KeyboardAvoidingView>
@@ -189,65 +259,44 @@ export default function AddPlanScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  header: {
+  listContent: {
+    flexGrow: 1,
+  },
+  clearRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 12,
-  },
-  headerTitle: {
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  headerAction: {
-    fontSize: 15,
-    fontWeight: '500',
-    minWidth: 50,
-  },
-  lead: {
-    fontSize: 15,
-    lineHeight: 22,
-  },
-  listContent: {
-    paddingHorizontal: 20,
-    paddingBottom: 12,
-    flexGrow: 1,
+    gap: 4,
+    marginTop: 10,
+    alignSelf: 'flex-start',
   },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 14,
-    minHeight: 52,
-    borderRadius: 12,
-    borderWidth: 1,
     gap: 10,
+    padding: 12,
   },
-  rowIndex: {
-    width: 18,
-    fontSize: 14,
+  rowBadge: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rowBadgeText: {
+    fontSize: 13,
     fontWeight: '600',
   },
   rowInput: {
     flex: 1,
     fontSize: 16,
-    paddingVertical: 12,
+    paddingVertical: 6,
   },
   rowRemove: {
-    fontSize: 24,
-    lineHeight: 24,
-    fontWeight: '300',
-  },
-  suggestionsBlock: {
-    marginTop: 8,
-    gap: 10,
-  },
-  suggestionsTitle: {
-    fontSize: 13,
-    fontWeight: '500',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
+    width: 24,
+    height: 24,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   suggestionsRow: {
     flexDirection: 'row',
@@ -257,12 +306,9 @@ const styles = StyleSheet.create({
   composer: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 12,
     borderTopWidth: StyleSheet.hairlineWidth,
   },
   confirmRow: {
-    paddingHorizontal: 20,
-    paddingBottom: 8,
+    paddingTop: 4,
   },
 });

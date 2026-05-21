@@ -5,11 +5,11 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 
 export default function RootLayout() {
-  const { colors, scheme } = useTheme();
+  const { colors, isDark } = useTheme();
   return (
     <GestureHandlerRootView style={{ flex: 1, backgroundColor: colors.background }}>
       <SafeAreaProvider>
-        <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
+        <StatusBar style={isDark ? 'light' : 'dark'} />
         <Stack
           screenOptions={{
             headerShown: false,
@@ -18,6 +18,9 @@ export default function RootLayout() {
           }}
         >
           <Stack.Screen name="index" />
+          <Stack.Screen name="plans" />
+          <Stack.Screen name="places" />
+          <Stack.Screen name="settings" />
           <Stack.Screen
             name="add"
             options={{
@@ -25,6 +28,7 @@ export default function RootLayout() {
               animation: 'slide_from_bottom',
             }}
           />
+          <Stack.Screen name="test" />
         </Stack>
       </SafeAreaProvider>
     </GestureHandlerRootView>

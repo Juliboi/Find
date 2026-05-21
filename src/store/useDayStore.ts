@@ -2,9 +2,19 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { Plan } from '@/types/plan';
-import { rescheduleDay, scheduleDay } from '@/lib/ai/scheduler';
+import {
+  rescheduleDay,
+  scheduleDay,
+  type SchedulerContext,
+} from '@/lib/ai/scheduler';
 import { todayISO } from '@/utils/time';
 import { uid } from '@/utils/id';
+import { selectEndOfDay, useHomeStore } from '@/store/useHomeStore';
+
+function currentSchedulerContext(): SchedulerContext {
+  const s = useHomeStore.getState();
+  return { home: s.home, endOfDay: selectEndOfDay(s) };
+}
 
 interface DayState {
   date: string;
@@ -24,7 +34,11 @@ interface DayState {
 
   confirmDraft: (startTime?: string) => Promise<void>;
   reorderAndReschedule: () => Promise<void>;
-  resolveClarification: (planId: string, answer: string) => Promise<void>;
+  resolveClarification: (
+    planId: string,
+    answer: string,
+    opts?: { startTime?: string; location?: string },
+  ) => Promise<void>;
   removePlan: (planId: string) => Promise<void>;
   resetDay: () => void;
 }
@@ -61,7 +75,10 @@ export const useDayStore = create<DayState>()(
         if (drafts.length === 0) return;
         set({ isScheduling: true });
         try {
-          const result = await scheduleDay(drafts, { startTime });
+          const result = await scheduleDay(drafts, {
+            startTime,
+            context: currentSchedulerContext(),
+          });
           set({
             plans: result.plans,
             summary: result.summary,
@@ -78,30 +95,46 @@ export const useDayStore = create<DayState>()(
       reorderAndReschedule: async () => {
         set({ isScheduling: true });
         try {
-          const result = await rescheduleDay(get().plans);
+          const result = await rescheduleDay(get().plans, {
+            context: currentSchedulerContext(),
+          });
           set({
             plans: result.plans,
             summary: result.summary,
             needsClarification: result.needsClarification,
+            usedAi: result.usedAi,
           });
         } finally {
           set({ isScheduling: false });
         }
       },
 
-      resolveClarification: async (planId, answer) => {
-        const plans = get().plans.map((p) =>
-          p.id === planId
-            ? {
-                ...p,
-                location: answer || p.location,
-                description: p.description ?? (answer || undefined),
-                status: 'scheduled' as const,
-                clarificationQuestion: undefined,
-                clarificationSuggestions: undefined,
-              }
-            : p,
-        );
+      resolveClarification: async (planId, answer, opts) => {
+        const plans = get().plans.map((p) => {
+          if (p.id !== planId) return p;
+          const question = p.clarificationQuestion;
+          const isLocationAnswer = /where|which|location|nearby|spot|place|gym|store|cafe|restaurant|shop/i.test(
+            question ?? '',
+          );
+          const nextLocation =
+            opts?.location ?? (isLocationAnswer ? answer : p.location);
+          const nextDescription =
+            opts?.location || isLocationAnswer
+              ? p.description
+              : answer || p.description;
+          return {
+            ...p,
+            location: nextLocation,
+            description: nextDescription,
+            startTime: opts?.startTime ?? p.startTime,
+            status: 'scheduled' as const,
+            clarificationQuestion: undefined,
+            clarificationSuggestions: undefined,
+            resolvedClarification: question
+              ? { question, answer }
+              : p.resolvedClarification,
+          };
+        });
         set({ plans });
         await get().reorderAndReschedule();
       },

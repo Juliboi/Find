@@ -25,6 +25,11 @@ export interface Plan {
   clarificationQuestion?: string;
   /** Pre-baked suggestions for the user to pick from when clarifying. */
   clarificationSuggestions?: string[];
+  /**
+   * Last clarification the user resolved on this plan. Sent back to the AI on
+   * reschedule so it won't ask the same thing again.
+   */
+  resolvedClarification?: { question: string; answer: string };
   status: PlanStatus;
   orderIndex: number;
 }
