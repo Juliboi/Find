@@ -12,6 +12,13 @@ import type { LocationPin } from '@/store/useHomeStore';
 
 export interface SchedulerContext {
   home?: LocationPin | null;
+  /**
+   * User's work / office anchor. Used by the LLM to set the `location`
+   * on plans the user phrases as "at office" / "with colleagues at
+   * work", and by the client to resolve those labels to real coords
+   * for travel-time rendering.
+   */
+  work?: LocationPin | null;
   endOfDay?: LocationPin | null;
   currentLocation?: { latitude: number; longitude: number } | null;
 }
@@ -51,6 +58,9 @@ interface PlanInput {
   title?: string;
   description?: string | null;
   location?: string | null;
+  placeSearchQueries?: string[] | null;
+  /** @deprecated kept so older persisted plans don't lose data on migration. */
+  placeSearchQuery?: string | null;
   durationMinutes?: number;
   startTime?: string;
   subtasks?: { id?: string; title: string; durationMinutes: number }[];
@@ -59,12 +69,22 @@ interface PlanInput {
 }
 
 function planToInput(p: Plan): PlanInput {
+  // Migrate the legacy singular field into the new array form on the
+  // wire. The edge function accepts both, but normalizing here means
+  // the LLM sees a uniform shape regardless of where the plan was
+  // created (new = array, old persisted plan = string).
+  const queries: string[] | null = p.placeSearchQueries?.length
+    ? p.placeSearchQueries
+    : p.placeSearchQuery
+    ? [p.placeSearchQuery]
+    : null;
   return {
     id: p.id,
     rawText: p.rawText,
     title: p.title,
     description: p.description ?? null,
     location: p.location ?? null,
+    placeSearchQueries: queries,
     durationMinutes: p.durationMinutes,
     startTime: p.startTime,
     subtasks: p.subtasks?.map((s) => ({
@@ -158,6 +178,22 @@ function sanitizePlan(raw: any, fallbackIndex: number): Plan | null {
       typeof raw.location === 'string' && raw.location.length > 0
         ? raw.location
         : undefined,
+    placeSearchQueries: (() => {
+      if (!Array.isArray(raw.placeSearchQueries)) return undefined;
+      const cleaned = raw.placeSearchQueries
+        .filter((q: unknown) => typeof q === 'string' && q.trim().length > 0)
+        .map((q: string) => q.trim())
+        .slice(0, 4) as string[];
+      return cleaned.length > 0 ? cleaned : undefined;
+    })(),
+    // Back-compat: if the model still emitted the legacy single field
+    // (older deployments or future regressions), preserve it so the
+    // client can fall back to it. New code reads `placeSearchQueries`.
+    placeSearchQuery:
+      typeof raw.placeSearchQuery === 'string' &&
+      raw.placeSearchQuery.trim().length > 0
+        ? raw.placeSearchQuery.trim()
+        : undefined,
     subtasks,
     durationMinutes: duration,
     startTime: typeof raw.startTime === 'string' ? raw.startTime : undefined,
@@ -200,6 +236,13 @@ function buildContextPayload(ctx?: SchedulerContext): Record<string, unknown> | 
       label: ctx.home.label,
       latitude: ctx.home.latitude,
       longitude: ctx.home.longitude,
+    };
+  }
+  if (ctx.work) {
+    out.work = {
+      label: ctx.work.label,
+      latitude: ctx.work.latitude,
+      longitude: ctx.work.longitude,
     };
   }
   if (ctx.endOfDay) {

@@ -61,7 +61,8 @@ export default function PlacesScreen() {
           ]}
           keyboardShouldPersistTaps="handled"
         >
-          <HomePicker title="Home" />
+          <HomePicker slot="home" title="Home" />
+          <HomePicker slot="work" title="Work" />
 
           <Card padded>
             <View style={styles.row}>
@@ -88,10 +89,11 @@ export default function PlacesScreen() {
               Why this matters
             </Text>
             <Text variant="bodySm" tone="secondary" style={{ marginTop: 6 }}>
-              Diem uses your home location to suggest nearby places when a
-              plan needs a venue (e.g. "go to the gym"). Setting an end-of-day
-              location lets it close the day with something nearby instead of
-              sending you across town.
+              Diem uses Home and Work to anchor your day. Home is the
+              default for plans like "deep work" or "read", and the day
+              always closes with travel home. Work is the default for
+              plans like "poker with colleagues at office" — without it,
+              Diem can't compute travel to office activities.
             </Text>
           </Card>
         </ScrollView>

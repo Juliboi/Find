@@ -16,12 +16,21 @@ import { Text } from './Text';
 import { Button } from './Button';
 import { Input } from './Input';
 
+/**
+ * Which anchor slot the picker operates on. "home" is the primary
+ * residence pin; "work" is the user's office/workplace, used to
+ * resolve plans the user phrases as "at office".
+ */
+export type AnchorSlot = 'home' | 'work';
+
 interface Props {
   /**
-   * Optional title override. The sandbox uses "Home", but this component
-   * can later be reused for any pinned location.
+   * Optional title override. Defaults to a sensible label per slot
+   * ("Home" / "Work"), but callers can pass a custom label if needed.
    */
   title?: string;
+  /** Anchor to read/write. Defaults to "home" for back-compat. */
+  slot?: AnchorSlot;
   /** Render without a wrapping Card (e.g. when inside another Card). */
   flat?: boolean;
 }
@@ -35,11 +44,23 @@ type SearchState =
 
 const SEARCH_DEBOUNCE_MS = 350;
 
-export function HomePicker({ title = 'Home', flat }: Props) {
+export function HomePicker({ title, slot = 'home', flat }: Props) {
   const t = useTheme();
+  // Bind to the right slot. We dereference both — selectors are cheap,
+  // unused values won't subscribe to renders thanks to zustand's
+  // shallow equality on primitive returns.
   const home = useHomeStore((s) => s.home);
+  const work = useHomeStore((s) => s.work);
   const setHome = useHomeStore((s) => s.setHome);
+  const setWork = useHomeStore((s) => s.setWork);
   const clearHome = useHomeStore((s) => s.clearHome);
+  const clearWork = useHomeStore((s) => s.clearWork);
+
+  const pin = slot === 'home' ? home : work;
+  const setPin = (next: LocationPin) =>
+    slot === 'home' ? setHome(next) : setWork(next);
+  const clearPin = () => (slot === 'home' ? clearHome() : clearWork());
+  const resolvedTitle = title ?? (slot === 'home' ? 'Home' : 'Work');
 
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState<SearchState>({ kind: 'idle' });
@@ -83,7 +104,7 @@ export function HomePicker({ title = 'Home', flat }: Props) {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
         () => undefined,
       );
-      setHome(pin);
+      setPin(pin);
       setQuery('');
       setSearch({ kind: 'idle' });
     } finally {
@@ -92,7 +113,7 @@ export function HomePicker({ title = 'Home', flat }: Props) {
   };
 
   const pickHit = (hit: GeocodeHit) => {
-    setHome({
+    setPin({
       label: hit.label,
       latitude: hit.latitude,
       longitude: hit.longitude,
@@ -106,12 +127,12 @@ export function HomePicker({ title = 'Home', flat }: Props) {
     <View style={{ gap: t.spacing.md }}>
       <View style={styles.headerRow}>
         <Text variant="title3" weight="bold" tight>
-          {title}
+          {resolvedTitle}
         </Text>
-        {home ? (
+        {pin ? (
           <Pressable
             hitSlop={8}
-            onPress={clearHome}
+            onPress={clearPin}
             style={({ pressed }) => [pressed && { opacity: 0.6 }]}
           >
             <Text variant="bodySm" tone="accent" weight="semibold">
@@ -121,7 +142,7 @@ export function HomePicker({ title = 'Home', flat }: Props) {
         ) : null}
       </View>
 
-      {home ? (
+      {pin ? (
         <View
           style={[
             styles.currentRow,
@@ -135,21 +156,23 @@ export function HomePicker({ title = 'Home', flat }: Props) {
           <Ionicons name="location" size={18} color={t.colors.accentText} />
           <View style={{ flex: 1 }}>
             <Text variant="bodySm" weight="semibold">
-              {home.label}
+              {pin.label}
             </Text>
             <Text variant="caption" tone="secondary">
-              {home.latitude.toFixed(4)}, {home.longitude.toFixed(4)}
+              {pin.latitude.toFixed(4)}, {pin.longitude.toFixed(4)}
             </Text>
           </View>
         </View>
       ) : (
         <Text variant="bodySm" tone="secondary">
-          Not set yet — pick a place so Diem can plan around it.
+          {slot === 'home'
+            ? 'Not set yet — pick a place so Diem can plan around it.'
+            : 'Not set yet — pick your office so Diem can route work plans.'}
         </Text>
       )}
 
       <Button
-        title={home ? 'Update from GPS' : 'Use current location'}
+        title={pin ? 'Update from GPS' : 'Use current location'}
         variant="tonal"
         size="md"
         leftIcon={

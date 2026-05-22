@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -21,12 +21,24 @@ import {
   isPlaceLookupSuggestion,
   type NearbyPlace,
 } from '@/lib/places';
+import { useDayStore } from '@/store/useDayStore';
+import {
+  useHomeStore,
+  selectAnchors,
+  effectiveCoords,
+} from '@/store/useHomeStore';
 import { Card } from './Card';
 import { Chip } from './Chip';
 import { Text } from './Text';
 
 interface ResolveOptions {
   location?: string;
+  /**
+   * Coordinates of the picked place, when the user resolves via the
+   * place-search list. Lets the store record real lat/lng so we can
+   * compute travel times between plans without re-geocoding.
+   */
+  locationCoords?: { latitude: number; longitude: number };
   startTime?: string;
 }
 
@@ -47,6 +59,7 @@ type Step =
   | {
       kind: 'no_places';
       reason: 'no_supabase' | 'no_location' | 'no_results' | 'error';
+      detail?: string;
     }
   | { kind: 'time_picker'; date: Date };
 
@@ -87,8 +100,40 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
   const t = useTheme();
   const [expanded, setExpanded] = useState(false);
   const [step, setStep] = useState<Step>({ kind: 'chips' });
+  // We block auto-search while the compose pass is in flight — it
+  // will resolve the plan with its picked venue and we don't want a
+  // race where this card flashes "Searching nearby…" before then.
+  // If compose decides to skip this plan (no candidates, etc.) it
+  // flips to false and the effect below fires as a fallback.
+  const isComposing = useDayStore((s) => s.isComposing);
+  const updatePlanLocation = useDayStore((s) => s.updatePlanLocation);
+  // Home + work anchors: surfaced so the "Where?" chip row knows
+  // which buttons to offer and what labels to set.
+  const anchors = useHomeStore(selectAnchors);
 
   const needsClarification = plan.status === 'needs_clarification';
+
+  // A scheduled plan that has no resolvable location is a "ghost" —
+  // the user can't see travel rows around it and the day's geometry
+  // breaks. We surface a small chip row to let them fix it in one
+  // tap. Note: not shown for needs_clarification plans, which already
+  // have the standard clarification block doing this job.
+  const hasResolvableLocation = !!effectiveCoords(plan, anchors);
+  const showWhereChips =
+    plan.status === 'scheduled' && !hasResolvableLocation;
+
+  // Coerce a label into the anchor's coords. We DON'T duplicate the
+  // anchor's lat/lng into the plan when the label and anchor match —
+  // effectiveCoords already does that resolution at render time, so
+  // we only need to set `location`. This keeps the plan small and
+  // future-proof: if the user later moves their home, every plan
+  // that was set to "Home" automatically follows.
+  const setLocationFromAnchor = (which: 'home' | 'work') => {
+    const pin = which === 'home' ? anchors.home : anchors.work;
+    if (!pin) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    updatePlanLocation(plan.id, pin.label);
+  };
 
   const highlight = useMemo(() => {
     const palette = [
@@ -103,6 +148,87 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
 
   const resetStep = () => setStep({ kind: 'chips' });
 
+  // Tracks whether we've already kicked off an automatic place search
+  // for this plan instance. Without this, every re-render would re-fire
+  // the request — and stepping back to 'chips' (via picking a place
+  // then changing your mind) would loop.
+  const autoSearchedRef = useRef<string | null>(null);
+
+  const runPlaceSearch = useCallback(async () => {
+    // Build the queries array used by the multi-query fan-out:
+    //   1. Prefer the LLM-rewritten `placeSearchQueries[]` — these
+    //      are 3-5 variants the model generated specifically to
+    //      hedge Google's inconsistent type tagging.
+    //   2. Fall back to the deprecated single `placeSearchQuery`
+    //      (older persisted plans before multi-query).
+    //   3. Final fallback: the plan title / raw text. Useful for
+    //      the local-heuristics path which doesn't run the LLM.
+    const queries =
+      plan.placeSearchQueries && plan.placeSearchQueries.length > 0
+        ? plan.placeSearchQueries
+        : plan.placeSearchQuery
+        ? [plan.placeSearchQuery]
+        : [plan.title || plan.rawText];
+    // `intent` gives the GPT re-ranker context about what the user is
+    // actually trying to do (e.g. "leg day"), separate from the
+    // sanitized search terms ("gym fitness").
+    const intent = plan.title || plan.rawText;
+    // For display in the loading/results UI we surface the user's
+    // original intent rather than one of the sanitized search terms —
+    // "Searching nearby for leg day…" reads better than
+    // "Searching nearby for gym fitness…".
+    setStep({ kind: 'loading_places', query: intent });
+    const result = await findPlaces(queries, intent);
+    if (result.places.length > 0) {
+      setStep({ kind: 'places', query: intent, places: result.places });
+    } else {
+      setStep({
+        kind: 'no_places',
+        reason: result.reason ?? 'error',
+        detail: result.detail,
+      });
+    }
+  }, [
+    plan.placeSearchQueries,
+    plan.placeSearchQuery,
+    plan.title,
+    plan.rawText,
+  ]);
+
+  // Auto-trigger place search for venue-required plans (dinner out,
+  // gym, haircut, etc.). Conditions:
+  //   - plan has placeSearchQueries from the LLM
+  //   - plan doesn't already have a specific location
+  //   - plan still needs clarification (status hasn't been resolved)
+  //   - we're at the initial chips step (haven't navigated yet)
+  //   - we haven't already auto-searched this plan instance
+  //
+  // This skips the "Find one nearby" tap — the user sees place results
+  // immediately instead of a chip they have to engage with first.
+  useEffect(() => {
+    if (autoSearchedRef.current === plan.id) return;
+    if (step.kind !== 'chips') return;
+    if (plan.location) return;
+    if (plan.status !== 'needs_clarification') return;
+    if (!plan.placeSearchQueries || plan.placeSearchQueries.length === 0) return;
+    // Let the store-level compose pass try first — it has access to
+    // all plans' candidates simultaneously and can optimize the chain.
+    // Only fall back to a per-card search if compose finished without
+    // resolving this plan (e.g. no candidates, or compose-day not
+    // deployed).
+    if (isComposing) return;
+    autoSearchedRef.current = plan.id;
+    void runPlaceSearch();
+  }, [
+    plan.id,
+    plan.location,
+    plan.status,
+    plan.placeSearchQueries,
+    step.kind,
+    runPlaceSearch,
+    isComposing,
+  ]);
+
   const handleChip = async (chip: string) => {
     Haptics.selectionAsync().catch(() => undefined);
     if (isTimePickerChip(chip)) {
@@ -115,14 +241,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
       return;
     }
     if (isPlaceLookupSuggestion(chip)) {
-      const query = plan.title || plan.rawText;
-      setStep({ kind: 'loading_places', query });
-      const result = await findPlaces(query);
-      if (result.places.length > 0) {
-        setStep({ kind: 'places', query, places: result.places });
-      } else {
-        setStep({ kind: 'no_places', reason: result.reason ?? 'error' });
-      }
+      await runPlaceSearch();
       return;
     }
     onResolveClarification?.(plan.id, chip);
@@ -130,7 +249,23 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
 
   const pickPlace = (place: NearbyPlace) => {
     resetStep();
-    onResolveClarification?.(plan.id, place.name, { location: place.name });
+    // Two paths depending on plan status:
+    //   - needs_clarification: go through resolveClarification — it
+    //     also clears the question/suggestions and records the
+    //     answer, then reschedules. This is the original picker path.
+    //   - scheduled: the user is just *relabelling* an already-
+    //     scheduled plan via the "Where?" chips. A full reschedule
+    //     would burn ~3s of LLM latency for a single location swap.
+    //     updatePlanLocation is in-place and instant.
+    const coords = { latitude: place.latitude, longitude: place.longitude };
+    if (plan.status === 'scheduled') {
+      updatePlanLocation(plan.id, place.name, coords);
+    } else {
+      onResolveClarification?.(plan.id, place.name, {
+        location: place.name,
+        locationCoords: coords,
+      });
+    }
   };
 
   const onTimeChange = (event: DateTimePickerEvent, date?: Date) => {
@@ -196,6 +331,16 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
                 </>
               ) : null}
             </View>
+            {plan.composeReasoning ? (
+              <Text
+                variant="caption"
+                tone="accent"
+                numberOfLines={2}
+                style={styles.composeReasoning}
+              >
+                {plan.composeReasoning}
+              </Text>
+            ) : null}
           </View>
           <View style={styles.headerRight}>
             {plan.startTime ? (
@@ -224,6 +369,103 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
           </View>
         </View>
       </Pressable>
+
+      {showWhereChips ? (
+        <View style={styles.whereRow}>
+          <Text variant="caption" tone="secondary" weight="semibold">
+            Where?
+          </Text>
+          <View style={styles.whereChips}>
+            {anchors.home ? (
+              <Chip
+                label={anchors.home.label || 'Home'}
+                icon="home-outline"
+                onPress={() => setLocationFromAnchor('home')}
+              />
+            ) : null}
+            {anchors.work ? (
+              <Chip
+                label={anchors.work.label || 'Office'}
+                icon="briefcase-outline"
+                onPress={() => setLocationFromAnchor('work')}
+              />
+            ) : null}
+            <Chip
+              label="Find nearby"
+              icon="search-outline"
+              onPress={runPlaceSearch}
+            />
+          </View>
+        </View>
+      ) : null}
+
+      {showWhereChips && step.kind === 'loading_places' ? (
+        <View style={styles.loadingRow}>
+          <ActivityIndicator color={t.colors.accentText} />
+          <Text variant="bodySm" tone="accent">
+            Searching nearby for "{step.query}"…
+          </Text>
+        </View>
+      ) : null}
+
+      {showWhereChips && step.kind === 'places' ? (
+        <View style={{ gap: 8 }}>
+          {step.places.map((place) => (
+            <Pressable
+              key={place.id}
+              onPress={() => pickPlace(place)}
+              style={({ pressed }) => [
+                styles.placeRow,
+                { backgroundColor: t.colors.surface1 },
+                pressed && { opacity: 0.7 },
+              ]}
+            >
+              <View
+                style={[
+                  styles.placeThumb,
+                  { backgroundColor: t.colors.fill1 },
+                ]}
+              >
+                {place.photoUrl ? (
+                  <Image
+                    source={{ uri: place.photoUrl }}
+                    style={styles.placeThumbImg}
+                  />
+                ) : (
+                  <Ionicons
+                    name="location"
+                    size={20}
+                    color={t.colors.textTertiary}
+                  />
+                )}
+              </View>
+              <View style={styles.placeBody}>
+                <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                  {place.name}
+                </Text>
+                {place.address ? (
+                  <Text variant="caption" tone="secondary" numberOfLines={1}>
+                    {place.address}
+                  </Text>
+                ) : null}
+              </View>
+              <Text
+                variant="caption"
+                tone="secondary"
+                weight="semibold"
+                style={styles.placeDistance}
+              >
+                {formatDistance(place.distanceM)}
+              </Text>
+            </Pressable>
+          ))}
+          <Pressable hitSlop={6} onPress={resetStep}>
+            <Text variant="caption" tone="accent" weight="semibold">
+              ← Back
+            </Text>
+          </Pressable>
+        </View>
+      ) : null}
 
       {needsClarification && plan.clarificationQuestion ? (
         <View
@@ -325,6 +567,16 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
                         ) : null}
                       </View>
                     ) : null}
+                    {place.reasoning ? (
+                      <Text
+                        variant="caption"
+                        tone="accent"
+                        numberOfLines={2}
+                        style={styles.placeReasoning}
+                      >
+                        {place.reasoning}
+                      </Text>
+                    ) : null}
                     {place.address ? (
                       <Text
                         variant="caption"
@@ -358,6 +610,23 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
               <Text variant="caption" tone="accent">
                 {noPlacesMessage(step.reason)}
               </Text>
+              {step.detail ? (
+                <View
+                  style={[
+                    styles.errorDetail,
+                    { backgroundColor: t.colors.surface1 },
+                  ]}
+                >
+                  <Text
+                    variant="caption"
+                    tone="secondary"
+                    selectable
+                    style={styles.errorDetailText}
+                  >
+                    {step.detail}
+                  </Text>
+                </View>
+              ) : null}
               <Pressable hitSlop={6} onPress={resetStep}>
                 <Text variant="caption" tone="accent" weight="semibold">
                   ← Back to suggestions
@@ -515,7 +784,35 @@ const styles = StyleSheet.create({
     gap: 8,
     alignItems: 'center',
   },
+  placeReasoning: {
+    fontStyle: 'italic',
+    lineHeight: 16,
+  },
+  composeReasoning: {
+    fontStyle: 'italic',
+    lineHeight: 16,
+    marginTop: 2,
+  },
+  whereRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  whereChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    flex: 1,
+  },
   placeDistance: {
+    fontVariant: ['tabular-nums'],
+  },
+  errorDetail: {
+    padding: 8,
+    borderRadius: 8,
+  },
+  errorDetailText: {
     fontVariant: ['tabular-nums'],
   },
   pickerWrap: {

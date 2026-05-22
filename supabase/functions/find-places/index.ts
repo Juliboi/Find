@@ -45,6 +45,12 @@ interface UnifiedPlace {
   priceLevel: number | null;
   types: string[];
   openNow: boolean | null;
+  /**
+   * GPT-written ~1 sentence pitch for why this place is recommended.
+   * Set by the AI re-rank pass; absent if OPENAI_API_KEY is missing
+   * or the model gave no reasoning for this specific candidate.
+   */
+  reasoning?: string;
 }
 
 // ------------------------------------------------------------------- helpers
@@ -58,11 +64,65 @@ function corsHeaders(): Record<string, string> {
   };
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders(),
+      ...(extraHeaders ?? {}),
+    },
   });
+}
+
+// ----------------------------------------------------------- in-memory cache
+//
+// Deno Deploy keeps the same isolate warm for a while across requests on
+// the same edge, so a process-local Map is a cheap way to absorb repeat
+// "gym near home" calls without burning Overpass quota or the user's
+// patience. The cache key includes ~100m-rounded coords so small GPS
+// drift still hits a warm entry. Cap the size so a long-lived isolate
+// doesn't grow unbounded.
+
+interface CachedResponse {
+  at: number;
+  body: unknown;
+}
+
+const SERVER_CACHE_TTL_MS = 5 * 60 * 1000;
+const SERVER_CACHE_MAX = 256;
+const serverCache = new Map<string, CachedResponse>();
+
+function serverCacheKey(
+  query: string,
+  lat: number,
+  lon: number,
+  radiusM: number,
+  limit: number,
+): string {
+  // Round to ~100m
+  const rLat = Math.round(lat * 1000) / 1000;
+  const rLon = Math.round(lon * 1000) / 1000;
+  return `${query.toLowerCase()}@${rLat},${rLon}|r=${radiusM}|n=${limit}`;
+}
+
+function readServerCache(key: string): unknown | null {
+  const entry = serverCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > SERVER_CACHE_TTL_MS) {
+    serverCache.delete(key);
+    return null;
+  }
+  return entry.body;
+}
+
+function writeServerCache(key: string, body: unknown): void {
+  if (serverCache.size >= SERVER_CACHE_MAX) {
+    // Evict oldest. Map iteration order = insertion order.
+    const oldestKey = serverCache.keys().next().value;
+    if (typeof oldestKey === 'string') serverCache.delete(oldestKey);
+  }
+  serverCache.set(key, { at: Date.now(), body });
 }
 
 function haversineMeters(
@@ -211,18 +271,91 @@ function resolveCategory(q: string): CategoryMap | null {
 }
 
 // ------------------------------------------------------------- Google Places
+//
+// We use the Text Search endpoint (`places:searchText`) rather than
+// Nearby Search. Why:
+//
+//   - Nearby Search ranks places by raw distance and matches on the
+//     `includedTypes` set. For category "gym" that means *any* OSM-style
+//     "gym" (including pilates studios and boxing schools, both of which
+//     Google tags as type `gym`) — surfacing the wrong kind of place
+//     close by instead of the right kind a few hundred meters away.
+//   - Text Search uses Google's actual web-search relevance model — the
+//     same algorithm behind google.com — which has been trained to
+//     understand that "gym" colloquially means a workout facility, not
+//     a martial-arts dojo. The result: ONEGYM, Form Factory, Iron Base
+//     Gym, etc., for our query, not Boxing Čimice.
+//
+// Text Search also natively handles open-ended queries the original
+// architecture couldn't ("italian dinner", "place to do focused work",
+// "specialty coffee shop") because it doesn't depend on our brittle
+// regex-based `CATEGORY_MAPS`. We pass the user's raw query verbatim.
 
-async function searchGoogle(
+// Off-category type heuristics. When the user query implies a
+// general-purpose category (e.g. "gym"), Google Text Search is mostly
+// right but occasionally drops in a niche venue tagged with the same
+// broad type. This list lets us defensively reject obvious mismatches
+// based on the `types[]` array returned with each place. Keep it tight:
+// false positives here remove legitimate results.
+const TYPE_BLACKLIST_BY_QUERY: Array<{ test: RegExp; bad: string[] }> = [
+  {
+    test: /\b(gym|fitness|workout|crossfit|weights?|lifting)\b/i,
+    bad: [
+      'pilates_studio',
+      'yoga_studio',
+      'martial_arts_school',
+      'boxing_club', // not always a real google type but harmless to list
+      'dance_studio',
+    ],
+  },
+  {
+    // Generic "restaurant" shouldn't surface fast-food chains or bars
+    test: /\brestaurant\b/i,
+    bad: ['fast_food_restaurant', 'bar'],
+  },
+];
+
+function shouldRejectByTypes(query: string, types: string[]): boolean {
+  for (const rule of TYPE_BLACKLIST_BY_QUERY) {
+    if (!rule.test.test(query)) continue;
+    for (const t of types) {
+      if (rule.bad.includes(t)) return true;
+    }
+  }
+  return false;
+}
+
+// ----------------------------------------------------------- Google primitive
+//
+// `searchGoogleOnce` is the single-query primitive: fires one Text Search
+// call, resolves photos, applies distance + type post-filters, and returns
+// the full filtered candidate list (no truncation). The multi-query
+// orchestration layer fans this out across query variants and merges
+// results into a single ranked list.
+
+interface ScoredCandidate extends UnifiedPlace {
+  /** Best (lowest) position this place achieved across the queries
+   *  that returned it. 0 = top of Google's relevance ranking. */
+  bestPosition: number;
+  /** How many of the user's query variants surfaced this place — a
+   *  rough corroboration signal: appearing in 3/3 queries is a much
+   *  stronger match than appearing in 1/3. */
+  matchCount: number;
+  /** Composite score 0..1, used to pick the top-N for the AI re-rank. */
+  compositeScore: number;
+  /** Which queries surfaced this place (for debugging). */
+  matchedQueries: string[];
+}
+
+async function searchGoogleOnce(
   query: string,
   lat: number,
   lon: number,
   radiusM: number,
-  limit: number,
   apiKey: string,
-  category: CategoryMap,
-): Promise<{ provider: 'google'; places: UnifiedPlace[] }> {
+): Promise<UnifiedPlace[]> {
   const res = await fetch(
-    'https://places.googleapis.com/v1/places:searchNearby',
+    'https://places.googleapis.com/v1/places:searchText',
     {
       method: 'POST',
       headers: {
@@ -232,10 +365,10 @@ async function searchGoogle(
           'places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.types,places.rating,places.userRatingCount,places.priceLevel,places.photos,places.currentOpeningHours.openNow',
       },
       body: JSON.stringify({
-        includedTypes: category.google,
-        maxResultCount: Math.min(20, limit),
-        rankPreference: 'DISTANCE',
-        locationRestriction: {
+        textQuery: query,
+        maxResultCount: 20,
+        rankPreference: 'RELEVANCE',
+        locationBias: {
           circle: {
             center: { latitude: lat, longitude: lon },
             radius: radiusM,
@@ -251,9 +384,8 @@ async function searchGoogle(
   const data = await res.json();
   const raw: any[] = Array.isArray(data?.places) ? data.places : [];
 
-  // Resolve photos for top results in parallel
   const places = await Promise.all(
-    raw.slice(0, limit).map(async (p) => {
+    raw.map(async (p) => {
       const elLat = p?.location?.latitude;
       const elLon = p?.location?.longitude;
       const name = p?.displayName?.text;
@@ -310,10 +442,533 @@ async function searchGoogle(
       return place;
     }),
   );
+
+  return (places.filter(Boolean) as UnifiedPlace[]).filter((p) => {
+    if (p.distanceM > radiusM * 1.5) return false;
+    if (shouldRejectByTypes(query, p.types)) return false;
+    return true;
+  });
+}
+
+// ----------------------------------------------------------- Composite score
+//
+// Aggregates signals from one or more query variants into a single
+// scalar used to *pre-filter* the candidate pool down to ~15 venues
+// before the GPT re-rank. The GPT pass does the final 6-pick; this
+// score is just a triage to keep token usage bounded.
+//
+// Two weighting profiles, keyed off intent type:
+//
+//   EVERYDAY (restaurant, café, grocery, …)
+//   ─ distance dominates (0.55). People don't drive across town for
+//     dinner; a 5 km famous restaurant should NOT outrank a 500 m
+//     neighbourhood spot.
+//   ─ Sharp distance decay: max(800m, radius/4) constant.
+//
+//   COMMUTE-WORTHY (gym, yoga, museum, climbing wall, …)
+//   ─ Distance still matters but less (0.35). A 2.5 km gym with a
+//     strong rating and many reviews is a legitimate option — people
+//     pick a gym based on equipment / vibe / class schedule, not
+//     just walking distance.
+//   ─ Quality weighs more (rating 0.30, reviews 0.15).
+//   ─ Gentler decay: max(1500m, radius/2) constant.
+
+interface ScoreContext {
+  bestPosition: number;
+  place: UnifiedPlace;
+  radiusM: number;
+  everyday: boolean;
+}
+
+function scoreCandidate(c: ScoreContext): number {
+  const pos = 1 / (1 + c.bestPosition);
+  const decayConstant = c.everyday
+    ? Math.max(800, c.radiusM / 4)
+    : Math.max(1500, c.radiusM / 2);
+  const dist = Math.exp(-(c.place.distanceM / decayConstant));
+  const rating = c.place.rating != null ? c.place.rating / 5 : 0;
+  const reviewsRaw = c.place.ratingCount ?? 0;
+  const reviews = reviewsRaw > 0
+    ? Math.min(1, Math.log10(reviewsRaw + 1) / 3)
+    : 0;
+  const open = c.place.openNow === false ? 0 : 1;
+
+  if (c.everyday) {
+    return (
+      dist * 0.55 +
+      pos * 0.10 +
+      rating * 0.20 +
+      reviews * 0.10 +
+      open * 0.05
+    );
+  }
+  return (
+    dist * 0.35 +
+    pos * 0.10 +
+    rating * 0.30 +
+    reviews * 0.15 +
+    open * 0.05 +
+    // Small bonus for venues with strong rating + many reviews —
+    // the user explicitly wants well-validated far gyms to surface.
+    (rating >= 0.9 && reviewsRaw >= 200 ? 0.05 : 0)
+  );
+}
+
+// --------------------------------------------------- Google multi-query fan-out
+//
+// Runs the user's queries in parallel, merges by place id, and emits a
+// list of ScoredCandidate sorted by composite score, capped at
+// `candidatePoolSize`. 20 is a good balance: enough variety for the
+// GPT re-rank to actually re-rank (especially with 4-5 input queries
+// producing 60-100 unique candidates pre-trim), few enough that token
+// use stays low. One failing query doesn't sink the whole call.
+
+async function searchGoogleFanOut(
+  queries: string[],
+  lat: number,
+  lon: number,
+  radiusM: number,
+  apiKey: string,
+  everyday: boolean,
+  candidatePoolSize = 20,
+): Promise<{ candidates: ScoredCandidate[]; perQueryCounts: Record<string, number> }> {
+  const settled = await Promise.allSettled(
+    queries.map((q) => searchGoogleOnce(q, lat, lon, radiusM, apiKey)),
+  );
+
+  const merged = new Map<string, ScoredCandidate>();
+  const perQueryCounts: Record<string, number> = {};
+
+  settled.forEach((res, i) => {
+    const q = queries[i];
+    if (res.status !== 'fulfilled') {
+      perQueryCounts[q] = -1; // signal failure
+      return;
+    }
+    const places = res.value;
+    perQueryCounts[q] = places.length;
+    places.forEach((p, position) => {
+      const existing = merged.get(p.id);
+      if (existing) {
+        existing.matchCount += 1;
+        existing.matchedQueries.push(q);
+        if (position < existing.bestPosition) existing.bestPosition = position;
+      } else {
+        merged.set(p.id, {
+          ...p,
+          bestPosition: position,
+          matchCount: 1,
+          matchedQueries: [q],
+          compositeScore: 0,
+        });
+      }
+    });
+  });
+
+  // Compute composite scores. Multi-query corroboration is folded in
+  // as a small additive bonus (capped) rather than a weight — places
+  // appearing in 3/3 queries get a +0.05, in 2/3 get +0.025, in 1/3
+  // get +0.
+  const candidates = Array.from(merged.values()).map((c) => {
+    const corroboration = Math.min(0.05, (c.matchCount - 1) * 0.025);
+    c.compositeScore =
+      scoreCandidate({
+        bestPosition: c.bestPosition,
+        place: c,
+        radiusM,
+        everyday,
+      }) + corroboration;
+    return c;
+  });
+
+  candidates.sort((a, b) => b.compositeScore - a.compositeScore);
+  return {
+    candidates: candidates.slice(0, candidatePoolSize),
+    perQueryCounts,
+  };
+}
+
+// --------------------------------------------------------- GPT re-rank pass
+//
+// Sends the composite-scored top-15 to gpt-4o-mini with the user's
+// original intent. The model returns 5-6 picks with a short pitch
+// for each. Closed places are deprioritized inside the prompt; the
+// model is told to drop them unless excluding them leaves the user
+// with too few options.
+//
+// On any failure we silently fall back to the composite-scored list —
+// the user still gets good results, just without reasoning text.
+
+interface LLMPickResult {
+  picks: Array<{ id: string; reasoning?: string }>;
+  failureReason?: string;
+}
+
+async function analyzeWithLLM(
+  intent: string,
+  queries: string[],
+  candidates: ScoredCandidate[],
+  limit: number,
+  apiKey: string,
+  everyday: boolean,
+): Promise<LLMPickResult> {
+  // Compact representation. We only include what the model needs to
+  // form a judgement — full coordinates and photo URLs would just
+  // burn tokens.
+  const compact = candidates.map((c) => ({
+    id: c.id,
+    name: c.name,
+    types: c.types.slice(0, 4),
+    rating: c.rating,
+    ratingCount: c.ratingCount,
+    address: c.address,
+    distanceM: c.distanceM,
+    openNow: c.openNow,
+    priceLevel: c.priceLevel,
+    matchedIn: c.matchedQueries.length,
+  }));
+
+  const system = `You are a local-recommendation expert helping a user
+pick the best venue for a specific plan. You will be given the user's
+intent, the search queries used, and a candidate list from Google Maps
+already pre-ranked by composite score (distance + relevance + rating
++ reviews).
+
+Think of this as building a SHOPPING LIST of nearby options, not
+curating a critics' top-pick. The user wants to see what's available
+to them; they'll choose. Give them every reasonable option.
+
+Your job:
+1. SELECT picks using this exact procedure:
+     STEP A — Walk every candidate in order. Mark a candidate as
+     "QUALIFIED" if ALL of:
+       (a) it satisfies the proximity rule below,
+       (b) it is on-intent (e.g. not a bar when intent is "lunch"),
+       (c) rating is null OR ≥4.0.
+     STEP B — Apply the openNow rule (rule 3 below) to drop closed
+     venues unless keeping them prevents under-supply.
+     STEP C — From the remaining QUALIFIED set, output up to
+     ${limit} picks. If 5 qualify, output 5. If 7 qualify, output
+     ${limit}. If 2 qualify, output 2.
+
+   Two failures you must avoid:
+     • Padding with a candidate that didn't qualify in STEP A.
+     • Stopping at 3 picks "because that feels enough" when 5 or 6
+       candidates actually qualified. Inclusivity is the default.
+
+2. For each pick, write ONE concise sentence that explains why it
+   fits — mention distinctive signals (cuisine/type, rating + review
+   count, price level, vibe). Plain language, no marketing fluff. If
+   you reference distance, paraphrase ("a short walk", "a bit out of
+   the way") rather than quoting numbers; the user sees the exact
+   distance in the UI already.
+3. Drop venues with openNow === false UNLESS removing them would
+   leave fewer than 3 picks AND the venue is exceptional (4.7+ rating
+   with 200+ reviews). Open/closed status is shown to the user
+   visually — do NOT mention it in the reasoning sentence.
+4. Never invent facts you can't see in the candidate metadata.
+
+PROXIMITY RULE — the intent type determines how strict to be:
+
+${everyday
+  ? `This is an EVERYDAY VENUE intent (restaurant, café, bar,
+grocery, pharmacy, bakery, food) — something the user might do
+multiple times a week and won't travel far for.
+  • Strongly prefer ≤1.5 km. These should fill most slots.
+  • A venue 1.5–3 km is acceptable ONLY when there are fewer than
+    2 reasonable ≤1.5 km venues in the candidate list.
+  • A venue >3 km is acceptable ONLY when there is ZERO reasonable
+    ≤2 km venue. Popularity / fame does NOT justify the trip.
+  • Returning fewer picks (3-4) is strictly better than padding
+    with far venues.`
+  : `This is a DESTINATION VENUE intent (gym, yoga, climbing wall,
+museum, doctor, specialty store) — somewhere the user commits to
+going. People pick a gym based on equipment, vibe, hours — distance
+matters less.
+  • Up to ~3 km is freely acceptable, no justification needed.
+  • Venues 3–5 km are good options when they have strong signals:
+    rating ≥4.5 OR ≥200 reviews. INCLUDE them — the user wants
+    well-validated alternatives, not just the closest 3.
+  • Venues 5–7 km are acceptable when they are genuinely standout:
+    ≥4.6 rating AND ≥200 reviews. A famous-with-1700-mediocre-
+    reviews gym (★3.6) does NOT qualify.
+  • Beyond 7 km, only include if the venue is uniquely on-intent
+    (e.g. the only climbing wall in the area).
+  • For destinations, do NOT prefer few picks. Show every well-
+    validated option — the user is choosing where to commit.`}
+
+A "reasonable" venue means rating ≥3.8 (or unrated) AND not visibly
+inappropriate for the intent (e.g. don't pick a bar for "lunch").
+
+VARIETY (soft preference, NOT a filter): if you have to ORDER picks,
+slot a different cuisine/style near the top after the closest pick.
+But you must NEVER drop a qualifying close venue just because another
+similar one is already in the list. The user gets value from seeing
+multiple comparable options.
+
+Output ONLY JSON:
+{ "picks": [ { "id": "...", "reasoning": "..." }, ... ] }`;
+
+  const user = JSON.stringify({
+    intent,
+    queries,
+    candidates: compact,
+  });
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      // gpt-4o-mini handles this task well at ~$0.0001 per call vs.
+      // ~$0.003 for the full-size 4o. Quality difference is marginal
+      // once the candidate pool is already pre-ranked by composite
+      // score and the proximity rule is enforced server-side.
+      model: 'gpt-4o-mini',
+      // Temperature 0.3 gives the most consistent count + variety
+      // tradeoff in our probes (0.0 is over-deterministic and
+      // sometimes returns 2 picks; higher temps drift into picking
+      // far popular venues over close ones).
+      temperature: 0.3,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    return { picks: [], failureReason: `OpenAI ${res.status}: ${text.slice(0, 200)}` };
+  }
+  const completion = await res.json();
+  const content: string = completion?.choices?.[0]?.message?.content ?? '{}';
+  try {
+    const parsed = JSON.parse(content);
+    const picks = Array.isArray(parsed?.picks) ? parsed.picks : [];
+    return {
+      picks: picks
+        .map((p: any) => ({
+          id: typeof p?.id === 'string' ? p.id : '',
+          reasoning: typeof p?.reasoning === 'string' ? p.reasoning : undefined,
+        }))
+        .filter((p: any) => p.id),
+    };
+  } catch {
+    return { picks: [], failureReason: 'invalid JSON' };
+  }
+}
+
+// --------------------------------------------------- Post-AI cleanup helpers
+//
+// gpt-4o-mini doesn't always follow prompt instructions about
+// formatting and proximity. These helpers enforce the contract
+// deterministically so a stray model output can't break the UX.
+
+/** Strip patterns the AI keeps hallucinating despite the prompt. */
+function scrubReasoning(s: string | undefined): string | undefined {
+  if (!s) return s;
+  let out = s.trim();
+  // Closed-status is shown by a UI badge; the AI sometimes still
+  // prefixes "Closed now — " (even when the place is actually open,
+  // which is a factual error). Strip the prefix unconditionally.
+  out = out.replace(/^closed\s+now\s*[—-]\s*/i, '');
+  // Same family: "Currently closed — "
+  out = out.replace(/^currently\s+closed\s*[—-]\s*/i, '');
+  return out;
+}
+
+/** Heuristic: does the intent describe a routine, walk-to-it venue? */
+function isEverydayIntent(intent: string, queries: string[]): boolean {
+  const haystack = [intent, ...queries].join(' ').toLowerCase();
+  return /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|café|coffee|bar|pub|bistro|grocery|pharmacy|bakery|eat|drink|takeout|takeaway)\b/.test(
+    haystack,
+  );
+}
+
+// ------------------------------------------------------- Google high-level API
+
+async function searchGoogle(
+  queries: string[],
+  intent: string,
+  lat: number,
+  lon: number,
+  radiusM: number,
+  limit: number,
+  apiKey: string,
+  openaiKey: string | undefined,
+): Promise<{
+  provider: 'google';
+  places: UnifiedPlace[];
+  debug: {
+    perQueryCounts: Record<string, number>;
+    candidatePoolSize: number;
+    aiUsed: boolean;
+    aiFailureReason?: string;
+  };
+}> {
+  // Everyday-vs-destination drives composite weighting, the AI's
+  // proximity rule, and code-side safety nets. Compute once, pass
+  // everywhere.
+  const everyday = isEverydayIntent(intent, queries);
+
+  const { candidates, perQueryCounts } = await searchGoogleFanOut(
+    queries,
+    lat,
+    lon,
+    radiusM,
+    apiKey,
+    everyday,
+  );
+
+  if (candidates.length === 0) {
+    return {
+      provider: 'google',
+      places: [],
+      debug: { perQueryCounts, candidatePoolSize: 0, aiUsed: false },
+    };
+  }
+
+  // No OpenAI key → return the top `limit` by composite score as-is.
+  if (!openaiKey) {
+    return {
+      provider: 'google',
+      places: candidates.slice(0, limit).map(stripScoringFields),
+      debug: {
+        perQueryCounts,
+        candidatePoolSize: candidates.length,
+        aiUsed: false,
+        aiFailureReason: 'no OPENAI_API_KEY',
+      },
+    };
+  }
+
+  // With OpenAI → ask the model to pick + reason.
+  const llm = await analyzeWithLLM(intent, queries, candidates, limit, openaiKey, everyday);
+  if (llm.picks.length === 0) {
+    return {
+      provider: 'google',
+      places: candidates.slice(0, limit).map(stripScoringFields),
+      debug: {
+        perQueryCounts,
+        candidatePoolSize: candidates.length,
+        aiUsed: false,
+        aiFailureReason: llm.failureReason ?? 'model returned no picks',
+      },
+    };
+  }
+
+  // Apply the model's picks. Order = the order the model returned.
+  // We *do not* top up with composite-ranked filler if the AI returned
+  // fewer picks than `limit` — when the model says "5 is enough", the
+  // user gets 5 confident picks rather than 5 confident + 1 awkward
+  // unjustified extra. The AI's prompt explicitly instructs it to
+  // return fewer rather than include filler.
+  const byId = new Map(candidates.map((c) => [c.id, c]));
+  let picked: UnifiedPlace[] = [];
+  for (const pick of llm.picks) {
+    const c = byId.get(pick.id);
+    if (!c) continue;
+    picked.push({
+      ...stripScoringFields(c),
+      reasoning: scrubReasoning(pick.reasoning),
+    });
+    if (picked.length >= limit) break;
+  }
+
+  // Code-side proximity + completeness safety net. The AI is erratic
+  // in two opposing ways:
+  //   - sometimes pads with a famous-but-distant venue when great
+  //     close picks exist (the "U Prince 5 km" problem for dinner),
+  //   - sometimes drops great close picks and returns only the
+  //     famous-but-distant venues directly.
+  //
+  // For EVERYDAY intents (restaurant, café, …) the rule is strict:
+  // anything >3 km is fallback only — drop it when close alternatives
+  // exist, then top up from the close pool.
+  //
+  // For COMMUTE-WORTHY intents (gym, yoga, museum, …) the rule is
+  // looser. The "qualifying" pool extends to 5 km, and we explicitly
+  // include WELL-VALIDATED far venues (≥4.5 rating AND ≥200 reviews)
+  // up to 7.5 km — those are exactly the "yes I'll commute for this"
+  // options the user wants to see surfaced.
+
+  const everydayProxLimit = everyday ? 2500 : 5000;
+  const closePool = candidates.filter(
+    (c) =>
+      c.distanceM <= everydayProxLimit &&
+      (c.rating === null || c.rating >= 4.0) &&
+      c.openNow !== false,
+  );
+  // Well-validated far pool — only used for non-everyday intents.
+  // These are venues the user would genuinely consider despite
+  // distance: high rating AND meaningful review count.
+  const wellValidatedFarPool = everyday
+    ? []
+    : candidates.filter(
+        (c) =>
+          c.distanceM > everydayProxLimit &&
+          c.distanceM <= 7500 &&
+          (c.rating ?? 0) >= 4.5 &&
+          (c.ratingCount ?? 0) >= 200 &&
+          c.openNow !== false,
+      );
+
+  if (everyday && closePool.length > 0) {
+    // Drop AI picks beyond 3 km when close alternatives exist.
+    picked = picked.filter((p) => p.distanceM <= 3000);
+  }
+
+  // Top up from the close pool when AI under-included. For non-
+  // everyday intents we also fold in well-validated far venues so
+  // they don't fall through the cracks.
+  const supplementPool = [...closePool, ...wellValidatedFarPool];
+  const desiredMin = Math.min(
+    limit,
+    Math.max(3, supplementPool.length),
+  );
+  if (picked.length < desiredMin) {
+    const pickedIds = new Set(picked.map((p) => p.id));
+    for (const c of supplementPool) {
+      if (picked.length >= desiredMin) break;
+      if (pickedIds.has(c.id)) continue;
+      picked.push(stripScoringFields(c));
+      pickedIds.add(c.id);
+    }
+  }
+
+  // Edge case: AI returned 0 picks (very rare — would mean model
+  // hallucinated all ids). Fall back to composite-ranked list so the
+  // user still sees results instead of an empty state.
+  if (picked.length === 0) {
+    return {
+      provider: 'google',
+      places: candidates.slice(0, limit).map(stripScoringFields),
+      debug: {
+        perQueryCounts,
+        candidatePoolSize: candidates.length,
+        aiUsed: false,
+        aiFailureReason: 'model returned only invalid ids',
+      },
+    };
+  }
+
   return {
     provider: 'google',
-    places: places.filter(Boolean) as UnifiedPlace[],
+    places: picked,
+    debug: {
+      perQueryCounts,
+      candidatePoolSize: candidates.length,
+      aiUsed: true,
+    },
   };
+}
+
+function stripScoringFields(c: ScoredCandidate): UnifiedPlace {
+  const { bestPosition, matchCount, compositeScore, matchedQueries, ...rest } = c;
+  return rest;
 }
 
 // --------------------------------------------------------------- Foursquare
@@ -402,11 +1057,14 @@ function buildOverpassQuery(
   lon: number,
   radiusM: number,
 ): string {
+  // `nwr` matches node|way|relation in a single statement, which halves
+  // the number of clauses Overpass has to parse compared to listing
+  // `node...` and `way...` separately. Internal timeout dropped from 15s
+  // to 10s — we'd rather have the server give up early and let us fall
+  // back to another mirror than hold a TCP connection for 15s.
   const around = `(around:${radiusM},${lat},${lon})`;
-  const parts = filters
-    .flatMap((f) => [`node${f}${around};`, `way${f}${around};`])
-    .join('\n');
-  return `[out:json][timeout:15];(${parts});out center 30;`;
+  const parts = filters.map((f) => `nwr${f}${around};`).join('');
+  return `[out:json][timeout:10];(${parts});out center 30;`;
 }
 
 function formatOsmAddress(tags: any): string | null {
@@ -418,6 +1076,102 @@ function formatOsmAddress(tags: any): string | null {
     tags['addr:city'],
   ].filter(Boolean);
   return parts.length > 0 ? parts.join(', ') : null;
+}
+
+// Public Overpass mirrors, ordered by observed reliability *right now*.
+// Public Overpass mirrors are notoriously volatile (regularly rate-limit
+// cloud egress IPs, get DDoSed, get overloaded by OSM contributor scripts)
+// so we always race a few of them and take the first 2xx response.
+//
+// Lessons learned during this iteration:
+//   - overpass-api.de       : canonical instance, fast (~0.6s) for typical
+//                             radius=2.5km queries. Returns 406 unless
+//                             Accept includes "*/*" — see fetchOverpass().
+//   - lz4.overpass-api.de   : backup of the canonical, currently times out
+//                             (504 from their reverse proxy) but worth
+//                             keeping as a tertiary.
+//   - overpass.kumi.systems : usually top-tier, currently timing out;
+//                             expected to recover.
+//   - overpass.private.coffee : EU mirror, currently timing out.
+//   - overpass.osm.ch       : DROPPED — returns 200 with an empty dataset
+//                             (`elements: []` for *every* query), which
+//                             would silently masquerade as "no results".
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+  'https://lz4.overpass-api.de/api/interpreter',
+];
+
+const OVERPASS_PER_TRY_MS = 9000;
+const OVERPASS_RETRY_DELAY_MS = 250;
+
+async function fetchOverpass(
+  endpoint: string,
+  body: string,
+): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OVERPASS_PER_TRY_MS);
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        // overpass-api.de rejects POSTs that don't accept "*/*" — using
+        // "application/json" alone earns a 406. Send both.
+        Accept: 'application/json, */*;q=0.1',
+        // Some mirrors require an identifying User-Agent. Keep it short
+        // but real so we don't get rejected as a bot.
+        'User-Agent': 'DayFlow/0.1.0 (https://github.com/dayflow)',
+      },
+      body,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      // Try to read a snippet of the body so we can identify what the
+      // mirror disliked (e.g. 429 with backoff hint).
+      let detail = '';
+      try {
+        detail = (await res.text()).slice(0, 120);
+      } catch {
+        // ignore
+      }
+      throw new Error(
+        `HTTP ${res.status}${detail ? ` ${detail}` : ''} from ${endpoint}`,
+      );
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Race every mirror in parallel and resolve with the first 2xx body.
+ * Rejects only when *all* mirrors fail (timeout, non-2xx, network).
+ */
+function raceOverpass(body: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const errors: string[] = [];
+    let remaining = OVERPASS_ENDPOINTS.length;
+    let settled = false;
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+      fetchOverpass(endpoint, body)
+        .then((json) => {
+          if (settled) return;
+          settled = true;
+          resolve(json);
+        })
+        .catch((e) => {
+          errors.push(`${endpoint}: ${String(e?.message ?? e)}`);
+          remaining -= 1;
+          if (remaining === 0 && !settled) {
+            settled = true;
+            reject(new Error(errors.join(' | ')));
+          }
+        });
+    }
+  });
 }
 
 async function searchOverpass(
@@ -434,29 +1188,28 @@ async function searchOverpass(
     lon,
     radiusM,
   );
-  // Hard cap the request so the function fails fast when Overpass is
-  // overloaded (common for dense categories like restaurants in cities).
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
-  let res: Response;
+  const body = `data=${encodeURIComponent(overpassQL)}`;
+
+  // First round: race mirrors. If all fail, give them a short breath
+  // and retry once. In practice the public Overpass mirrors warm up
+  // within ~200ms — a single retry catches the majority of intermittent
+  // aborts without blowing past the function's 25s budget.
+  let data: any;
   try {
-    res = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'DayFlow/0.1.0 (https://github.com/dayflow)',
-        Accept: 'application/json',
-      },
-      body: `data=${encodeURIComponent(overpassQL)}`,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
+    data = await raceOverpass(body);
+  } catch (firstError) {
+    await new Promise((r) => setTimeout(r, OVERPASS_RETRY_DELAY_MS));
+    try {
+      data = await raceOverpass(body);
+    } catch (secondError) {
+      throw new Error(
+        `Overpass unavailable after retry. Round 1: ${String(
+          (firstError as Error).message,
+        )} || Round 2: ${String((secondError as Error).message)}`,
+      );
+    }
   }
-  if (!res.ok) {
-    throw new Error(`Overpass error ${res.status}`);
-  }
-  const data = await res.json();
+
   const elements: any[] = Array.isArray(data?.elements) ? data.elements : [];
 
   const places: UnifiedPlace[] = elements
@@ -503,6 +1256,8 @@ Deno.serve(async (req: Request) => {
 
   let payload: {
     query?: string;
+    queries?: string[];
+    intent?: string;
     latitude?: number;
     longitude?: number;
     radiusM?: number;
@@ -514,11 +1269,36 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Invalid JSON body' }, 400);
   }
 
-  const query = typeof payload.query === 'string' ? payload.query.trim() : '';
+  // Normalize queries: prefer the `queries` array, fall back to the
+  // legacy single `query` field. Trim, dedupe (case-insensitive), and
+  // cap at 6 — that's the upper bound the LLM produces, and beyond
+  // that the marginal API cost outweighs the marginal coverage gain.
+  const rawQueries = Array.isArray(payload.queries)
+    ? payload.queries
+    : typeof payload.query === 'string'
+    ? [payload.query]
+    : [];
+  const seen = new Set<string>();
+  const queries = rawQueries
+    .map((q) => (typeof q === 'string' ? q.trim() : ''))
+    .filter((q) => {
+      if (!q) return false;
+      const k = q.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .slice(0, 6);
+
+  const intent =
+    (typeof payload.intent === 'string' && payload.intent.trim()) ||
+    queries[0] ||
+    '';
+
   const lat = Number(payload.latitude);
   const lon = Number(payload.longitude);
   if (
-    !query ||
+    queries.length === 0 ||
     !Number.isFinite(lat) ||
     !Number.isFinite(lon) ||
     lat < -90 ||
@@ -527,46 +1307,75 @@ Deno.serve(async (req: Request) => {
     lon > 180
   ) {
     return jsonResponse(
-      { error: 'query, latitude, and longitude are required.' },
+      { error: 'queries (or query), latitude, and longitude are required.' },
       400,
     );
   }
 
   const radiusM = Math.min(
     10000,
-    Math.max(200, Number(payload.radiusM) || 2500),
+    Math.max(200, Number(payload.radiusM) || 5000),
   );
-  const limit = Math.min(20, Math.max(1, Number(payload.limit) || 5));
+  const limit = Math.min(20, Math.max(1, Number(payload.limit) || 6));
 
-  const category = resolveCategory(query);
-  if (!category) {
-    return jsonResponse({
-      query,
-      provider: 'none',
-      category: null,
-      places: [],
-      note: 'No category mapping for this query. Add one in CATEGORY_MAPS.',
+  const cacheKey = serverCacheKey(
+    queries.join('|') + (intent && intent !== queries[0] ? `::${intent}` : ''),
+    lat,
+    lon,
+    radiusM,
+    limit,
+  );
+  const cached = readServerCache(cacheKey);
+  if (cached) {
+    return jsonResponse(cached, 200, {
+      'X-Cache': 'hit',
+      'Cache-Control': 'public, max-age=300',
     });
   }
 
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
+  const openaiKey = Deno.env.get('OPENAI_API_KEY');
   const fsqKey = Deno.env.get('FOURSQUARE_API_KEY');
 
+  // Foursquare / OSM fallbacks still need our regex-based category
+  // mapping. Use the first query to detect category.
+  const category = resolveCategory(queries[0]);
+
+  if (!googleKey && !fsqKey && !category) {
+    return jsonResponse({
+      query: queries[0],
+      queries,
+      intent,
+      provider: 'none',
+      category: null,
+      places: [],
+      note:
+        'No place provider available for these queries. Either configure ' +
+        'a GOOGLE_PLACES_API_KEY (handles any query) or add a category ' +
+        'mapping for the OSM fallback.',
+    });
+  }
+
   try {
-    let result: { provider: string; places: UnifiedPlace[] };
+    let result: {
+      provider: string;
+      places: UnifiedPlace[];
+      debug?: Record<string, unknown>;
+    };
     if (googleKey) {
       result = await searchGoogle(
-        query,
+        queries,
+        intent,
         lat,
         lon,
         radiusM,
         limit,
         googleKey,
-        category,
+        openaiKey,
       );
-    } else if (fsqKey) {
+    } else if (fsqKey && category) {
       result = await searchFoursquare(
-        query,
+        queries[0],
         lat,
         lon,
         radiusM,
@@ -574,21 +1383,34 @@ Deno.serve(async (req: Request) => {
         fsqKey,
         category,
       );
-    } else {
+    } else if (category) {
       result = await searchOverpass(
-        query,
+        queries[0],
         lat,
         lon,
         radiusM,
         limit,
         category,
       );
+    } else {
+      return jsonResponse(
+        { query: queries[0], provider: 'none', category: null, places: [] },
+        200,
+      );
     }
-    return jsonResponse({
-      query,
+    const body = {
+      query: queries[0],
+      queries,
+      intent,
       provider: result.provider,
-      category: category.category,
+      category: category?.category ?? null,
       places: result.places,
+      debug: result.debug,
+    };
+    if (result.places.length > 0) writeServerCache(cacheKey, body);
+    return jsonResponse(body, 200, {
+      'X-Cache': 'miss',
+      'Cache-Control': 'public, max-age=300',
     });
   } catch (e) {
     return jsonResponse(

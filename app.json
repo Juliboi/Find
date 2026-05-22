@@ -12,10 +12,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.dayflow.app"
+      "bundleIdentifier": "com.diem.app"
     },
     "android": {
-      "package": "com.dayflow.app",
+      "package": "com.diem.app",
       "adaptiveIcon": {
         "backgroundColor": "#ffffff"
       }

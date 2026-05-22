@@ -17,6 +17,7 @@ import { TopBar } from '@/components/TopBar';
 import { SectionHeader } from '@/components/SectionHeader';
 import { Chip } from '@/components/Chip';
 import { Button } from '@/components/Button';
+import { ComposerStatus } from '@/components/ComposerStatus';
 import { EmptyState } from '@/components/EmptyState';
 import { FloatingTabBar } from '@/components/FloatingTabBar';
 import { PRIMARY_TABS } from '@/components/nav/tabs';
@@ -61,10 +62,16 @@ export default function HomeScreen() {
   const plans = useDayStore((s) => s.plans);
   const summary = useDayStore((s) => s.summary);
   const isScheduling = useDayStore((s) => s.isScheduling);
+  const isComposing = useDayStore((s) => s.isComposing);
   const usedAi = useDayStore((s) => s.usedAi);
   const reorderAndReschedule = useDayStore((s) => s.reorderAndReschedule);
+  const dismissComposeSummary = useDayStore((s) => s.dismissComposeSummary);
+  // While the AI pipeline runs we want the empty-state to *not* show —
+  // it'd flash up between submission and the first plan landing. Treat
+  // "we're working on it" as already having content.
+  const isWorking = isScheduling || isComposing;
 
-  const isEmpty = plans.length === 0;
+  const isEmpty = plans.length === 0 && !isWorking;
   const upNext = plans.slice(0, 3);
   const remaining = Math.max(0, plans.length - upNext.length);
 
@@ -154,6 +161,7 @@ export default function HomeScreen() {
           />
         ) : (
           <View style={[styles.stack, { gap: t.spacing.xl }]}>
+            <ComposerStatus onDismissSummary={dismissComposeSummary} />
             {summary ? (
               <Card padded>
                 <Text variant="caption" tone="secondary" uppercase weight="semibold">

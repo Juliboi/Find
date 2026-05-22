@@ -5,3 +5,6 @@ verify_jwt = false
 
 [functions.find-places]
 verify_jwt = false
+
+[functions.compose-day]
+verify_jwt = false

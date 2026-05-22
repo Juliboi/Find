@@ -55,14 +55,18 @@ export default function AddPlanScreen() {
     setTimeout(() => inputRef.current?.focus(), 0);
   };
 
-  const onConfirm = async () => {
+  const onConfirm = () => {
     const hasPending = current.trim().length > 0;
     if (hasPending) addDraft(current.trim());
     setCurrent('');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
       () => undefined,
     );
-    await confirmDraft();
+    // Fire-and-forget: navigate back immediately so the user lands on
+    // the home screen and sees the day "build itself" (parse → search
+    // → compose) instead of staring at a blocking spinner here. Errors
+    // surface via the home screen's loading/error states.
+    void confirmDraft();
     router.back();
   };
 
