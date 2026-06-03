@@ -33,6 +33,7 @@ export default function RootLayout() {
             }}
           />
           <Stack.Screen name="test" />
+          <Stack.Screen name="itinerary" />
         </Stack>
       </SafeAreaProvider>
     </GestureHandlerRootView>

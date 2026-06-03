@@ -225,6 +225,14 @@ export default function SettingsScreen() {
             subtitle="Inspect AI scheduling for a single plan"
             onPress={() => router.push('/test')}
           />
+          <Row
+            icon="sparkles-outline"
+            iconBg={t.colors.accentSoft}
+            iconColor={t.colors.accentText}
+            title="Day planner (v2)"
+            subtitle="Whole-day itinerary as place objects"
+            onPress={() => router.push('/itinerary')}
+          />
         </Card>
 
         <Card padded style={{ padding: 0 }}>

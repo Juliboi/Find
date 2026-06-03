@@ -8,3 +8,6 @@ verify_jwt = false
 
 [functions.compose-day]
 verify_jwt = false
+
+[functions.plan-itinerary]
+verify_jwt = false

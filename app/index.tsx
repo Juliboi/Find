@@ -1,5 +1,7 @@
 import React from 'react';
 import {
+  Image,
+  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -10,6 +12,10 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { useDayStore } from '@/store/useDayStore';
+import {
+  useSavedItineraries,
+  type SavedItinerary,
+} from '@/store/useSavedItineraries';
 import { useTheme } from '@/theme/useTheme';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
@@ -43,6 +49,16 @@ function formatKicker(iso: string): string {
     .toUpperCase();
 }
 
+function tripSubtitle(trip: SavedItinerary): string {
+  const parts: string[] = [];
+  if (trip.stopCount > 0) {
+    parts.push(`${trip.stopCount} stop${trip.stopCount === 1 ? '' : 's'}`);
+  }
+  const place = trip.city ?? trip.origin;
+  if (place) parts.push(place.split(',')[0]);
+  return parts.join(' · ');
+}
+
 function highlightForIndex(idx: number, c: ReturnType<typeof useTheme>['colors']) {
   const palette = [
     c.highlightBlue,
@@ -57,6 +73,8 @@ function highlightForIndex(idx: number, c: ReturnType<typeof useTheme>['colors']
 export default function HomeScreen() {
   const router = useRouter();
   const t = useTheme();
+
+  const savedTrips = useSavedItineraries((s) => s.items);
 
   const date = useDayStore((s) => s.date);
   const plans = useDayStore((s) => s.plans);
@@ -151,6 +169,76 @@ export default function HomeScreen() {
             ) : null}
           </View>
         </View>
+
+        {savedTrips.length > 0 ? (
+          <View style={{ gap: t.spacing.sm }}>
+            <SectionHeader title="Day trips" showChevron={false} />
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.tripsRow}
+            >
+              {savedTrips.map((trip) => (
+                <Pressable
+                  key={trip.id}
+                  onPress={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    router.push({ pathname: '/itinerary', params: { id: trip.id } });
+                  }}
+                  style={({ pressed }) => [
+                    styles.tripCard,
+                    {
+                      backgroundColor: t.colors.surface2,
+                      borderColor: t.colors.separator,
+                    },
+                    pressed && { opacity: 0.85 },
+                  ]}
+                >
+                  <View
+                    style={[styles.tripThumb, { backgroundColor: t.colors.fill1 }]}
+                  >
+                    {trip.thumbUrl ? (
+                      <Image
+                        source={{ uri: trip.thumbUrl }}
+                        style={styles.tripThumbImg}
+                      />
+                    ) : (
+                      <Ionicons
+                        name="map-outline"
+                        size={22}
+                        color={t.colors.textSecondary}
+                      />
+                    )}
+                  </View>
+                  <View style={styles.tripMeta}>
+                    <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                      {trip.title}
+                    </Text>
+                    <Text variant="caption" tone="secondary" numberOfLines={1}>
+                      {tripSubtitle(trip)}
+                    </Text>
+                  </View>
+                </Pressable>
+              ))}
+              <Pressable
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  router.push('/itinerary');
+                }}
+                style={({ pressed }) => [
+                  styles.tripNewCard,
+                  { borderColor: t.colors.separator },
+                  pressed && { opacity: 0.7 },
+                ]}
+              >
+                <Ionicons name="add" size={24} color={t.colors.accent} />
+                <Text variant="caption" weight="semibold" tone="accent">
+                  New plan
+                </Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        ) : null}
 
         {isEmpty ? (
           <EmptyState
@@ -304,12 +392,18 @@ export default function HomeScreen() {
         )}
 
         {isEmpty ? (
-          <View style={{ alignItems: 'center', paddingVertical: 12 }}>
+          <View style={{ alignItems: 'center', paddingVertical: 12, gap: 2 }}>
             <Button
               title="Or open the sandbox"
               variant="ghost"
               size="sm"
               onPress={() => router.push('/test')}
+            />
+            <Button
+              title="Try the day planner (v2)"
+              variant="ghost"
+              size="sm"
+              onPress={() => router.push('/itinerary')}
             />
           </View>
         ) : null}
@@ -367,5 +461,38 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
+  },
+  tripsRow: {
+    gap: 12,
+    paddingRight: 4,
+    paddingVertical: 2,
+  },
+  tripCard: {
+    width: 168,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+  },
+  tripThumb: {
+    height: 92,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tripThumbImg: {
+    width: '100%',
+    height: '100%',
+  },
+  tripMeta: {
+    padding: 10,
+    gap: 2,
+  },
+  tripNewCard: {
+    width: 110,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderStyle: 'dashed',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
   },
 });
