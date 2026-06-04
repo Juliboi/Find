@@ -38,17 +38,7 @@ import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
 import { Button } from '@/components/Button';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
-import {
-  planItinerary,
-  regroundItineraryPlaces,
-  type ItineraryDebug,
-  type RegroundStats,
-} from '@/lib/ai/itinerary';
-import { getCurrentCoords } from '@/lib/places';
-import {
-  enrichItineraryPlaces,
-  type EnrichStats,
-} from '@/lib/itineraryEnrich';
+import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
 import {
   Itinerary,
   ItineraryItem,
@@ -132,6 +122,68 @@ const HOME_ID = '__home__';
 // Don't flag tiny slivers as "free time" — only gaps worth noticing.
 const GAP_MIN_MINUTES = 20;
 
+const HOME_NAME_RE = /^(home|my home|house|residence)$/i;
+
+function normalisePlaceName(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
+    .trim();
+}
+
+function haversineM(
+  a: { latitude: number; longitude: number },
+  b: { latitude: number; longitude: number },
+): number {
+  const R = 6371000;
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.latitude)) *
+      Math.cos(toRad(b.latitude)) *
+      Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+}
+
+/**
+ * Mirrors the server's `scrubHomePlaces`: when a saved itinerary carries
+ * a place block whose name is literally "Home" / equals the home label /
+ * sits on top of the home pin, drop that place block. Catches itineraries
+ * saved before the server filter existed (the ALZHEIMER-HOME photo on a
+ * "Languages at home" card).
+ */
+function scrubHomePlacesFromSaved(
+  itin: Itinerary,
+  home: { latitude: number; longitude: number; label?: string } | null | undefined,
+): Itinerary {
+  const homeLabelNorm = home?.label ? normalisePlaceName(home.label) : '';
+  const looksLikeHome = (
+    name: string,
+    coords?: { latitude: number; longitude: number },
+  ): boolean => {
+    if (HOME_NAME_RE.test(name.trim())) return true;
+    if (homeLabelNorm && normalisePlaceName(name) === homeLabelNorm) return true;
+    if (home && coords && haversineM(home, coords) <= 75) return true;
+    return false;
+  };
+  let changed = false;
+  const sections = itin.sections.map((section) => ({
+    ...section,
+    items: section.items.map((item) => {
+      const p = item.place;
+      if (!p?.name) return item;
+      if (looksLikeHome(p.name, p.coords)) {
+        changed = true;
+        return { ...item, place: undefined };
+      }
+      return item;
+    }),
+  }));
+  return changed ? { ...itin, sections } : itin;
+}
+
 /** Decodes a Google-encoded polyline into lat/lng points for the map line. */
 function decodePolyline(encoded: string): LatLng[] {
   const points: LatLng[] = [];
@@ -173,22 +225,25 @@ export default function ItineraryScreen() {
 
   // Opening a saved plan from the homepage: hydrate it (once) so the screen
   // shows the preview straight away with the drawer already collapsed.
+  // We also defensively scrub "Home"-looking place blocks (the
+  // ALZHEIMER-HOME / Sevt-Inc doppelgängers an earlier build let through)
+  // so old saves heal themselves on the next open instead of carrying that
+  // stale enrichment forever.
   const params = useLocalSearchParams<{ id?: string }>();
   const preloaded = useMemo(() => {
     if (!params.id) return null;
-    return (
-      useSavedItineraries.getState().items.find((i) => i.id === params.id)
-        ?.itinerary ?? null
-    );
-  }, [params.id]);
+    const saved = useSavedItineraries
+      .getState()
+      .items.find((i) => i.id === params.id)?.itinerary;
+    if (!saved) return null;
+    return scrubHomePlacesFromSaved(saved, home);
+  }, [params.id, home]);
 
   const [input, setInput] = useState(SAMPLE_PROMPT);
   const [itinerary, setItinerary] = useState<Itinerary | null>(preloaded);
   const [usedAi, setUsedAi] = useState(!!preloaded);
   const [loading, setLoading] = useState(false);
   const [debug, setDebug] = useState<ItineraryDebug | null>(null);
-  const [regroundStats, setRegroundStats] = useState<RegroundStats | null>(null);
-  const [enrichStats, setEnrichStats] = useState<EnrichStats | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
@@ -455,31 +510,7 @@ export default function ItineraryScreen() {
         date: todayISO(),
         debug: true,
       });
-      let itin = result.itinerary;
-      if (itin && result.usedAi && result.usedGrounded) {
-        // Grounded path: planner picked the right venues already. We just
-        // backfill the Google Maps fidelity it can't return (photo URL,
-        // ratingCount, opening hours, canonical Place coords) via a per-
-        // unique-venue lookup through the existing find-places edge fn.
-        const enriched = await enrichItineraryPlaces(itin);
-        itin = enriched.itinerary;
-        setEnrichStats(enriched.stats);
-        setRegroundStats(null);
-      } else if (itin && result.usedAi && !result.usedGrounded) {
-        // Legacy edge-function path: per-stop re-grounding against home as
-        // before. No enrichment needed — `find-places` already returns
-        // photos / ratings on this path.
-        const anchor = home
-          ? { latitude: home.latitude, longitude: home.longitude, label: home.label }
-          : await getCurrentCoords().catch(() => null);
-        const reg = await regroundItineraryPlaces(itin, anchor);
-        itin = reg.itinerary;
-        setRegroundStats(reg.stats);
-        setEnrichStats(null);
-      } else {
-        setRegroundStats(null);
-        setEnrichStats(null);
-      }
+      const itin = result.itinerary;
       setItinerary(itin);
       setUsedAi(result.usedAi);
       setDebug(result.debug ?? null);
@@ -505,8 +536,6 @@ export default function ItineraryScreen() {
   const reset = () => {
     setItinerary(null);
     setDebug(null);
-    setRegroundStats(null);
-    setEnrichStats(null);
     setErrorMsg(null);
     setUsedAi(false);
     resetTracking();
@@ -873,94 +902,19 @@ export default function ItineraryScreen() {
                     </View>
                   </Pressable>
                   {showDebug ? (
-                    <>
-                      {enrichStats ? (
-                        <>
-                          <Text
-                            variant="micro"
-                            tone="secondary"
-                            uppercase
-                            weight="bold"
-                            style={{ marginTop: 12 }}
-                          >
-                            Enrichment (find-places lookup)
-                          </Text>
-                          <View
-                            style={[
-                              styles.debugBox,
-                              {
-                                backgroundColor: t.colors.fill1,
-                                borderRadius: t.radii.sm,
-                              },
-                            ]}
-                          >
-                            <RNText
-                              style={[
-                                styles.debugText,
-                                { color: t.colors.textPrimary },
-                              ]}
-                              selectable
-                            >
-                              {JSON.stringify(enrichStats, null, 2)}
-                            </RNText>
-                          </View>
-                        </>
-                      ) : null}
-                      {regroundStats ? (
-                        <>
-                          <Text
-                            variant="micro"
-                            tone="secondary"
-                            uppercase
-                            weight="bold"
-                            style={{ marginTop: 12 }}
-                          >
-                            Re-grounding (client-side)
-                          </Text>
-                          <View
-                            style={[
-                              styles.debugBox,
-                              {
-                                backgroundColor: t.colors.fill1,
-                                borderRadius: t.radii.sm,
-                              },
-                            ]}
-                          >
-                            <RNText
-                              style={[
-                                styles.debugText,
-                                { color: t.colors.textPrimary },
-                              ]}
-                              selectable
-                            >
-                              {JSON.stringify(regroundStats, null, 2)}
-                            </RNText>
-                          </View>
-                        </>
-                      ) : null}
-                      <Text
-                        variant="micro"
-                        tone="secondary"
-                        uppercase
-                        weight="bold"
-                        style={{ marginTop: 12 }}
+                    <View
+                      style={[
+                        styles.debugBox,
+                        { backgroundColor: t.colors.fill1, borderRadius: t.radii.sm },
+                      ]}
+                    >
+                      <RNText
+                        style={[styles.debugText, { color: t.colors.textPrimary }]}
+                        selectable
                       >
-                        Plan response (server)
-                      </Text>
-                      <View
-                        style={[
-                          styles.debugBox,
-                          { backgroundColor: t.colors.fill1, borderRadius: t.radii.sm },
-                        ]}
-                      >
-                        <RNText
-                          style={[styles.debugText, { color: t.colors.textPrimary }]}
-                          selectable
-                        >
-                          {JSON.stringify(debug.response, null, 2)}
-                        </RNText>
-                      </View>
-                    </>
+                        {JSON.stringify(debug.response, null, 2)}
+                      </RNText>
+                    </View>
                   ) : null}
                 </Card>
               ) : null}
@@ -1053,9 +1007,21 @@ function SectionBlock({
         const active = item.id === nowItemId;
         const past = itemEndMin(item) <= nowMin;
         const leg = item.travelFromPrev;
-        // When you should leave the previous stop to arrive on time.
+        // "Leave by HH:MM" semantics depend on what kind of item the leg
+        // is feeding:
+        //   - Normal item (meal, work, meetup, …): item.startTime is when
+        //     you ARRIVE on-site, so leaveBy = startTime − leg.minutes.
+        //   - kind="travel" item (the walk-to-station card, the train
+        //     ride): item.startTime is when you DEPART (board the train,
+        //     start the walk), so leaveBy ≡ startTime. Subtracting the
+        //     journey length from boarding time is what produced the
+        //     "Leave by 06:25" for a 08:45 train.
         const leaveBy =
-          leg && item.startTime ? addMinutes(item.startTime, -leg.minutes) : undefined;
+          leg && item.startTime
+            ? item.kind === 'travel'
+              ? item.startTime
+              : addMinutes(item.startTime, -leg.minutes)
+            : undefined;
         return (
           <Animated.View
             key={item.id}

@@ -1,1087 +1,52 @@
 // Supabase Edge Function: plan-itinerary
 //
-// The "v2" planning architecture. Where `schedule-day` takes a list of
-// short activities and orders them, this function takes ONE free-form
-// description of a whole day ("I want to go to Olomouc, do 1-2h deep
-// work, meet a friend, watch the horse show, then drinks") and returns a
-// fully structured, Gemini-style itinerary: an ordered list of rich place
-// objects, each tagged with a time-flexibility so the client can re-flow
-// the flexible blocks around the fixed commitments later.
+// The "v2" planning architecture, server-side.
+//
+//   1. ONE grounded Gemini call (Gemini + Google Search) takes the user's
+//      free-form description of a day and returns the WHOLE itinerary
+//      (sections, items, time blocks, venues, approximate travel legs) in
+//      a single pass — using Google Search to ground real venue names,
+//      addresses, and ratings near the user's home.
+//   2. A per-unique-venue Google Places lookup backfills the data Gemini
+//      can't return: an auth-free CDN photo URL, the canonical place
+//      coordinates, ratingCount, and an "Open now / Closed now" hint.
+//      At-home activities (the model emits no place block for those) and
+//      the home venue itself are skipped so we never resolve "Home" to
+//      some random nearby building.
 //
 // Request body:
-//   { request: string, date?: "YYYY-MM-DD", context?: Context }
+//   { request: string, date?: "YYYY-MM-DD", context?: { home?: { latitude, longitude, label } } }
 //
-// Returns an Itinerary object (see src/types/itinerary.ts) or a 501 when
-// OPENAI_API_KEY is unset so the client can fall back to a sample.
+// Response body: an Itinerary object (see src/types/itinerary.ts).
+//
+// Required env vars:
+//   GEMINI_API_KEY         — Google AI Studio key with the Generative
+//                            Language API enabled.
+//   GOOGLE_PLACES_API_KEY  — optional. Enables photo / rating / openNow
+//                            backfill. Without it the plan still renders,
+//                            just without those fields.
 
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
-const SYSTEM_PROMPT = `You are DayFlow's itinerary architect. The user
-gives you a free-form description of ONE day they want to have — things to
-do, people to meet, constraints (a fixed event time, "1-2h of deep work",
-an address to start from). You do the CORE STRUCTURE PLANNING: WHAT each
-block is and WHERE it should happen (near home, clustered, at home …). You
-do NOT pick exact venues — the app resolves the best real venue near the
-anchor you choose, and computes all the real travel. Think like a sharp
-local who RESPECTS THE USER'S TIME.
-
-# Be strategic about time and distance (THIS IS THE MOST IMPORTANT PART)
-A good day minimizes pointless travel and clusters things sensibly. For
-EACH block, decide the smartest location rather than scattering the user
-across the city:
-- HOME-ONLY activities stay home — at_home, place null, venueQuery null,
-  no travel: cooking / making food or coffee, eating a home meal, showering,
-  skincare, napping, ordering something online, laundry & chores. You cannot
-  cook or shower at a cafe, so NEVER give these a venue.
-- Activities that CAN happen anywhere (deep work, study/learning, reading, a
-  call, a rest) DEFAULT to at_home. Only send the user out for them (a cafe /
-  library / park via near_home or near_prev) when they're already out nearby
-  or explicitly want a change of scene. Say why in the description (e.g.
-  "kept at home to save a round trip before your 18:00").
-- BATCH so the user never bounces home mid-trip: do home things before
-  leaving and after returning, and chain all the out-and-about stops into ONE
-  outing. NEVER sandwich a home activity (cooking, a nap, skincare) between
-  two out-of-home stops — that implies an invisible trip home.
-- Cluster errands and stops that are near each other (groceries on the way
-  back, two sights in the same quarter).
-- Do NOT send the user across town for an everyday thing (gym, pool,
-  supermarket, cafe, pharmacy) when a good option is near home or near
-  where they already are. Quality still matters — a clearly better option
-  a few minutes or a few stops away is worth it — but fame is NOT worth a
-  long detour.
-- Adapt to the DAY TYPE: a local work/errands day stays tight around home;
-  a day with one far destination (a day trip, a specific event) is built
-  around that anchor; a combined day does both, batching the local stuff.
-
-# Energy & mindfulness (sequence by how the body feels)
-- Match blocks to energy. Front-load DEMANDING focus — deep work, studying a
-  language, anything cognitively heavy — into the fresh hours. Put LOW-ENERGY
-  things — reading, skincare, a gentle walk, light chores, relaxing — in the
-  evening. Don't schedule heavy learning late at night; by ~20:00 most people
-  are spent. (On a busy out-and-about day this matters less — fit focus where
-  it fits around the fixed stops.)
-- Leave breathing room — don't pack blocks wall-to-wall. When the user asks
-  for relaxation / downtime / chore space, EMIT explicit at_home "break"
-  items ("Relax / downtime", "Chores & reset") placed where they suit the
-  energy arc — usually the evening on a calm day. The app also surfaces the
-  free gaps between blocks, so it's fine to leave slack rather than invent
-  filler.
-
-# Locations: describe INTENT, not a specific venue
-For every block output these three fields:
-- "locationStrategy": one of
-    "at_home"     — happens at the user's home. NO venue, NO travel.
-    "near_home"   — a venue close to home.
-    "near_prev"   — cluster it with the block right before it.
-    "near_anchor" — near the day's fixed commitment (the meetup/event).
-    "anywhere"    — wherever is most convenient for the day's shape.
-- "venueQuery": a short, Google-searchable phrase for the TYPE of place
-  ("well-equipped gym", "swimming pool", "supermarket", "specialty coffee
-  shop with seating to work", "cosy pub"). NOT a brand — UNLESS the user
-  named one. Null ONLY when locationStrategy is "at_home".
-- "userSpecified": true ONLY if the user explicitly named THIS exact venue
-  (then also put that name in place.name; the app keeps it and won't swap
-  it for a "better" one). Otherwise false.
-Never invent venue names, ratings, addresses, or coordinates — the app
-attaches the real ones.
-
-# Start at home; the app handles ALL travel
-- MORNING ROUTINE: when a home/origin is given and the day starts in the
-  morning, OPEN with "Wake & get ready" (~30m) then "Breakfast" (~25m),
-  both locationStrategy "at_home", place null, venueQuery null. The FIRST
-  block's startTime is the wake time and ANCHORS the whole day — pick a
-  realistic one that still makes every fixed commitment reachable.
-- NEVER output travel/commute items (no "train to X", "walk to station",
-  "drive to Y"). The app inserts the real door-to-door journey (walk → bus
-  → metro → train) between every stop, including long inter-city trips.
-- The trip BACK home is drawn automatically too — whenever a home block
-  follows an outing, the app inserts the return journey. So just place each
-  home block where it actually belongs (e.g. cooking right after you'd get
-  home) and GROUP outings together; never add a "go home" item, and don't
-  pile every home task at the very end if some of them fit better earlier.
-
-# Durations & clock
-- "durationMinutes" = the on-site length of the activity ITSELF (EXCLUDE
-  travel; the app measures and inserts travel).
-- Set "startTime" ONLY on (1) the very first block (the wake time) and
-  (2) a "fixed" commitment with a HARD START hour. Leave startTime/endTime
-  null everywhere else; order blocks sensibly and the app cascades times.
-
-# Time flexibility (REQUIRED) — and SCHEDULE EARLY
-  - "fixed":    a HARD START time — "meet at 18:00", a show at 20:00, a
-                booked table. Put that hour in startTime. Use ONLY for a real
-                start time, NEVER for a deadline.
-  - "window":   a deadline or earliest-time constraint; the slot still floats
-                and the app places it AS EARLY as possible within the window.
-                "no later than / by / max till 15:30" -> window, windowEnd
-                "15:30" (do NOT make it fixed at 15:30!). "not before 14:00"
-                -> window, windowStart "14:00". So "gym, can go early but no
-                later than 15:30" lands right after the morning, not at 15:30.
-  - "flexible": free to slide/reorder — deep work, a walk, errands, drinks.
-Default to "flexible". A deadline or earliest-time is "window"; only a hard
-start hour is "fixed". Never park a block at its deadline to fill time —
-schedule it early and let the free time show.
-
-# Relative-time constraints -> compute windows
-Turn "X after/before Y" phrases into windowStart/windowEnd in clock time:
-  - "eat lunch at most 3h after breakfast" (breakfast ~12:00-12:25) ->
-    lunch windowEnd "15:25".
-  - "can only start 2h after I order" (order ~12:55) -> windowStart "14:55".
-  - A deadline applies to the OUTCOME, not the block's start. If cooking lunch
-    takes ~1h and lunch must be EATEN within 3h of breakfast (by ~15:25), the
-    cook+eat block must START by ~14:25 (deadline minus its own duration).
-Then ORDER the day so those windows are actually met. If the user's
-constraints CONFLICT or cannot all fit (e.g. a 1h lunch that must be both
->2h after a 12:55 order AND <3h after a 12:00 breakfast — only ~30 min
-overlap), satisfy the most important / health-related one, do your best on
-the rest, and SAY SO plainly in that item's description.
-
-# Concreteness
-One activity per item. Don't lump a sightseeing list into one block — emit
-ONE item per spot, each with its own venueQuery. Per-item "title" is the
-concrete activity ("Deep work session", "Gym session", "Grocery run",
-"Holy Trinity Column"); the catchy headline lives on the SECTION.
-
-# Sections (catchy grouping)
-Group the day into 4-8 SECTIONS, each with a catchy upbeat "title"
-("Rise and Shine!", "Get Fit!", "The Main Event", "Wind Down"), an optional
-"period" ("Morning" | "Afternoon" | "Evening"), and "items".
-
-# Output (JSON only) — EXACTLY this shape:
-{
-  "title": string,                 // e.g. "A productive day in Prague"
-  "summary": string,               // 1-2 sentence intro framing the day
-  "origin": string | null,         // where the day starts (user's address)
-  "city": string | null,           // primary city, e.g. "Prague, Czechia"
-  "sections": [
-    {
-      "title": string,             // catchy section headline
-      "period": string | null,     // "Morning" | "Afternoon" | "Evening"
-      "items": [
-        {
-          "title": string,         // concrete per-item activity title
-          "kind": "work" | "sightseeing" | "meal" | "event" | "meetup" | "drinks" | "activity" | "break" | "other",
-          "flexibility": "fixed" | "window" | "flexible",
-          "startTime": string | null,  // "HH:MM" 24h — only first block + fixed items
-          "durationMinutes": number,   // REQUIRED — on-site length, EXCLUDING travel
-          "windowStart": string | null,
-          "windowEnd": string | null,
-          "locationStrategy": "at_home" | "near_home" | "near_prev" | "near_anchor" | "anywhere",
-          "venueQuery": string | null, // searchable venue TYPE; null iff at_home
-          "userSpecified": boolean,    // true only if the user named this exact venue
-          "place": {                   // null iff at_home; hints only — the app fills name/coords/rating/photo
-            "name": string | null,     // set ONLY when userSpecified
-            "category": string | null, // human label, e.g. "Gym", "Coffee shop"
-            "emoji": string | null,    // one emoji for the category, e.g. "🏋️", "☕"
-            "priceLevel": string | null
-          } | null,
-          "description": string,       // vivid 1-3 sentence "what / why" (mention the time/distance trade-off when relevant)
-          "highlights": string[] | null
-        }
-      ]
-    }
-  ]
-}
-Return JSON only — no prose outside the JSON object.`;
-
-// --- venue resolution (location-biased, quality-vs-proximity) --------------
-//
-// The AI no longer names venues; it emits a venueQuery (the TYPE of place)
-// and a locationStrategy (where it should be: near home, near the previous
-// stop, near the fixed anchor, …). We resolve each to a REAL venue by
-// biasing a Google Text Search around the right anchor and picking the best
-// candidate by the same distance-vs-quality composite that powers
-// `find-places` — so "swimming pool" near home becomes a good LOCAL pool,
-// not the famous water-park 20 km away, while a clearly better gym a few
-// stops out can still win.
-
-interface ResolvedPlace {
-  name: string;
-  coords: { latitude: number; longitude: number };
-  address?: string;
-  rating?: number;
-  ratingCount?: number;
-  priceLevel?: number;
-  photoUrl?: string;
-}
-
-const LOCATION_STRATEGIES = new Set([
-  'at_home',
-  'near_home',
-  'near_prev',
-  'near_anchor',
-  'anywhere',
-]);
-
-const EVERYDAY_QUERY_RE =
-  /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|caf\u00e9|coffee|bar|pub|bistro|grocer|groceries|supermarket|market|pharmacy|chemist|bakery|eat|drink|takeout|takeaway|deli|walk|stroll|park|promenade|trail|riverside)\b/i;
-
-function isEverydayQuery(q: string): boolean {
-  return EVERYDAY_QUERY_RE.test(q || '');
-}
-
-function priceLevelToNum(v: unknown): number | undefined {
-  switch (v) {
-    case 'PRICE_LEVEL_INEXPENSIVE':
-      return 1;
-    case 'PRICE_LEVEL_MODERATE':
-      return 2;
-    case 'PRICE_LEVEL_EXPENSIVE':
-      return 3;
-    case 'PRICE_LEVEL_VERY_EXPENSIVE':
-      return 4;
-    default:
-      return undefined;
-  }
-}
-
-function priceNumToStr(n: number | undefined): string | null {
-  if (!n || n < 1) return null;
-  return '$'.repeat(Math.min(4, n));
-}
-
-/** Resolve a Places photo reference to an auth-free CDN URL (best-effort). */
-async function resolvePhotoUrl(
-  photoName: string | undefined,
-  apiKey: string,
-): Promise<string | undefined> {
-  if (!photoName) return undefined;
-  try {
-    const res = await fetch(
-      `https://places.googleapis.com/v1/${photoName}/media?key=${apiKey}&maxHeightPx=400&maxWidthPx=400&skipHttpRedirect=true`,
-    );
-    if (!res.ok) return undefined;
-    const json = await res.json();
-    return typeof json?.photoUri === 'string' ? json.photoUri : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * One location-biased Text Search. `center` biases (does not restrict)
- * the search; pass null to search unbiased (no home known). Returns the
- * raw candidate list with distance-from-center, ready for scoring.
- */
-async function searchTextBiased(
-  query: string,
-  center: Coords | null,
-  radiusM: number,
-  apiKey: string,
-): Promise<any[]> {
-  const body: any = {
-    textQuery: query,
-    maxResultCount: 12,
-    rankPreference: 'RELEVANCE',
-  };
-  if (center) {
-    body.locationBias = {
-      circle: {
-        center: { latitude: center.latitude, longitude: center.longitude },
-        radius: Math.min(50000, Math.max(500, radiusM)),
-      },
-    };
-  }
-  let data: any;
-  try {
-    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask':
-          'places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.photos',
-      },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) return [];
-    data = await res.json();
-  } catch {
-    return [];
-  }
-  const raw: any[] = Array.isArray(data?.places) ? data.places : [];
-  const out: any[] = [];
-  raw.forEach((p, i) => {
-    const lat = p?.location?.latitude;
-    const lon = p?.location?.longitude;
-    const name = p?.displayName?.text;
-    if (typeof lat !== 'number' || typeof lon !== 'number' || !name) return;
-    const coords = { latitude: lat, longitude: lon };
-    out.push({
-      name,
-      coords,
-      address:
-        (typeof p.shortFormattedAddress === 'string' ? p.shortFormattedAddress : null) ??
-        (typeof p.formattedAddress === 'string' ? p.formattedAddress : undefined),
-      rating: typeof p.rating === 'number' ? p.rating : undefined,
-      ratingCount: typeof p.userRatingCount === 'number' ? p.userRatingCount : undefined,
-      priceLevel: priceLevelToNum(p.priceLevel),
-      photoName: p?.photos?.[0]?.name,
-      distanceM: center ? Math.round(haversineMeters(center, coords)) : 0,
-      position: i,
-    });
-  });
-  return out;
-}
-
-/**
- * Composite score (0..1) blending distance decay, relevance position,
- * rating and review count. Two profiles: EVERYDAY venues weight proximity
- * heavily (you won't cross town for a coffee), DESTINATION venues let a
- * well-validated farther option win (you'll commute for the right gym).
- * Ported from `find-places` `scoreCandidate`.
- */
-function scoreVenue(c: any, radiusM: number, everyday: boolean): number {
-  const pos = 1 / (1 + (c.position ?? 0));
-  const decay = everyday ? Math.max(800, radiusM / 4) : Math.max(1500, radiusM / 2);
-  const dist = Math.exp(-((c.distanceM ?? 0) / decay));
-  const rating = typeof c.rating === 'number' ? c.rating / 5 : 0;
-  const reviewsRaw = c.ratingCount ?? 0;
-  const reviews = reviewsRaw > 0 ? Math.min(1, Math.log10(reviewsRaw + 1) / 3) : 0;
-  if (everyday) {
-    return dist * 0.55 + pos * 0.1 + rating * 0.2 + reviews * 0.1 + 0.05;
-  }
-  return (
-    dist * 0.35 +
-    pos * 0.1 +
-    rating * 0.3 +
-    reviews * 0.15 +
-    0.05 +
-    (rating >= 0.9 && reviewsRaw >= 200 ? 0.05 : 0)
-  );
-}
-
-/**
- * Resolve a venueQuery to the single best real venue near `center`.
- * `trustName` (a user-named venue) takes the top relevance match over a
- * wide area instead of re-picking by proximity, so a deliberately-far
- * choice the user named is honoured.
- */
-async function pickVenue(
-  query: string,
-  center: Coords | null,
-  apiKey: string,
-  opts: { trustName?: boolean } = {},
-): Promise<ResolvedPlace | null> {
-  const everyday = isEverydayQuery(query);
-  const radius = opts.trustName ? 50000 : everyday ? 2500 : 6000;
-  let cands = await searchTextBiased(query, center, radius, apiKey);
-  if (cands.length === 0 && center) {
-    // Widen once before giving up — the right venue may sit just outside.
-    cands = await searchTextBiased(query, center, Math.max(radius * 2, 12000), apiKey);
-  }
-  if (cands.length === 0) return null;
-
-  const best = opts.trustName
-    ? cands[0]
-    : cands
-        .slice()
-        .sort((a, b) => scoreVenue(b, radius, everyday) - scoreVenue(a, radius, everyday))[0];
-  if (!best) return null;
-
-  return {
-    name: best.name,
-    coords: best.coords,
-    address: best.address,
-    rating: best.rating,
-    ratingCount: best.ratingCount,
-    priceLevel: best.priceLevel,
-    photoUrl: await resolvePhotoUrl(best.photoName, apiKey),
-  };
-}
-
-/** Best searchable phrase for an item: the user's named venue, else the type. */
-function venueQueryOf(item: any): string {
-  if (item?.userSpecified && typeof item?.place?.name === 'string' && item.place.name.trim()) {
-    return item.place.name.trim();
-  }
-  if (typeof item?.venueQuery === 'string' && item.venueQuery.trim()) {
-    return item.venueQuery.trim();
-  }
-  if (typeof item?.place?.name === 'string' && item.place.name.trim()) {
-    return item.place.name.trim();
-  }
-  return typeof item?.title === 'string' ? item.title : '';
-}
-
-/** Validate the model's locationStrategy, inferring a sane default. */
-function normalizeStrategy(item: any): string {
-  const s = item?.locationStrategy;
-  if (typeof s === 'string' && LOCATION_STRATEGIES.has(s)) return s;
-  const hasQuery = typeof item?.venueQuery === 'string' && item.venueQuery.trim();
-  const hasName = typeof item?.place?.name === 'string' && item.place.name.trim();
-  return hasQuery || hasName ? 'near_home' : 'at_home';
-}
-
-function centroidOf(coordsList: Coords[]): Coords | null {
-  if (coordsList.length === 0) return null;
-  let lat = 0;
-  let lon = 0;
-  for (const c of coordsList) {
-    lat += c.latitude;
-    lon += c.longitude;
-  }
-  return { latitude: lat / coordsList.length, longitude: lon / coordsList.length };
-}
-
-/**
- * Walks the parsed itinerary and resolves a real venue for every block that
- * needs one, biasing each search to the smartest anchor. Two passes so that
- * cluster-relative blocks (near_prev / near_anchor / anywhere) can lean on
- * coordinates resolved in the first pass. Mutates `parsed` in place.
- */
-async function resolveVenues(parsed: any, context: any, apiKey?: string): Promise<void> {
-  if (!parsed || !Array.isArray(parsed.sections)) return;
-  const home: Coords | null = context?.home
-    ? { latitude: context.home.latitude, longitude: context.home.longitude }
-    : null;
-  const items = flattenItems(parsed);
-
-  const apply = (item: any, r: ResolvedPlace | null) => {
-    if (!r) return;
-    const hint = item.place && typeof item.place === 'object' ? item.place : {};
-    item.place = {
-      name: r.name ?? hint.name ?? null,
-      category: typeof hint.category === 'string' ? hint.category : null,
-      emoji: typeof hint.emoji === 'string' ? hint.emoji : null,
-      address: r.address ?? (typeof hint.address === 'string' ? hint.address : null),
-      rating: typeof r.rating === 'number' ? r.rating : null,
-      ratingCount: typeof r.ratingCount === 'number' ? r.ratingCount : null,
-      priceLevel:
-        (typeof hint.priceLevel === 'string' ? hint.priceLevel : null) ??
-        priceNumToStr(r.priceLevel),
-      openStatus: null,
-      coords: r.coords,
-      photoUrl: r.photoUrl ?? null,
-    };
-  };
-
-  // Normalize strategy + clear at-home blocks (these have no venue/travel).
-  for (const item of items) {
-    item.locationStrategy = normalizeStrategy(item);
-    if (item.locationStrategy === 'at_home') item.place = null;
-  }
-
-  if (!apiKey) return; // no Google key → keep AI hints, no coords (dev/offline)
-
-  const needsVenue = (item: any) =>
-    item.locationStrategy !== 'at_home' && !item.place?.coords && !!venueQueryOf(item);
-
-  // Pass A — anchors: user-named venues, fixed commitments, and near_home.
-  // All biased to home (a named venue uses a wide radius so a deliberately
-  // far pick is still found).
-  await Promise.all(
-    items
-      .filter(
-        (it) =>
-          needsVenue(it) &&
-          (it.userSpecified ||
-            it.flexibility === 'fixed' ||
-            it.locationStrategy === 'near_home'),
-      )
-      .map(async (it) => {
-        const r = await pickVenue(venueQueryOf(it), home, apiKey, {
-          trustName: !!it.userSpecified,
-        });
-        apply(it, r);
-      }),
-  );
-
-  // Pass B — cluster-relative: near_prev / near_anchor / anywhere (and any
-  // leftover), biased to coordinates resolved in pass A.
-  const resolvedCoords = (): Coords[] =>
-    items.map((it) => it.place?.coords).filter(Boolean) as Coords[];
-  const anchorCoordsNear = (idx: number): Coords | null => {
-    // Nearest (by position in the day) fixed/located item's coords.
-    for (let d = 1; d < items.length; d++) {
-      const before = items[idx - d];
-      const after = items[idx + d];
-      if (before?.flexibility === 'fixed' && before?.place?.coords) return before.place.coords;
-      if (after?.flexibility === 'fixed' && after?.place?.coords) return after.place.coords;
-    }
-    return null;
-  };
-
-  await Promise.all(
-    items.map(async (it, idx) => {
-      if (!needsVenue(it)) return;
-      let center: Coords | null = home;
-      if (it.locationStrategy === 'near_prev') {
-        for (let j = idx - 1; j >= 0; j--) {
-          if (items[j].place?.coords) {
-            center = items[j].place.coords;
-            break;
-          }
-        }
-      } else if (it.locationStrategy === 'near_anchor') {
-        center = anchorCoordsNear(idx) ?? home;
-      } else {
-        // anywhere → the day's center of mass, else home
-        center = centroidOf(resolvedCoords()) ?? home;
-      }
-      const r = await pickVenue(venueQueryOf(it), center, apiKey, {});
-      apply(it, r);
-    }),
-  );
-}
-
-// --- travel routing + scheduling -------------------------------------------
-//
-// The AI hands us structure + durations; we turn it into a real clock. For
-// each consecutive pair of LOCATED stops we ask Google Routes for the true
-// door-to-door time (mode-aware), then cascade start/end times from the
-// day's anchor, snapping fixed commitments to their hard time. This is what
-// makes the plan practical ("leave home at 07:15 to make the 12:00 meetup")
-// rather than a string of guessed thresholds.
-
-type TravelMode = 'walk' | 'bike' | 'transit' | 'drive';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 interface Coords {
   latitude: number;
   longitude: number;
 }
 
-function haversineMeters(a: Coords, b: Coords): number {
-  const R = 6371000;
-  const toRad = (x: number) => (x * Math.PI) / 180;
-  const dLat = toRad(b.latitude - a.latitude);
-  const dLon = toRad(b.longitude - a.longitude);
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(a.latitude)) * Math.cos(toRad(b.latitude)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+interface HomePin {
+  label: string;
+  latitude: number;
+  longitude: number;
 }
 
-// Straight-line under-counts real routing distance; pad before picking mode.
-const DETOUR_FACTOR = 1.3;
-
-const SPEED_M_PER_MIN: Record<TravelMode, number> = {
-  walk: 80,
-  bike: 250,
-  transit: 200,
-  drive: 400,
-};
-const MODE_OVERHEAD_MIN: Record<TravelMode, number> = {
-  walk: 1,
-  bike: 2,
-  transit: 4,
-  drive: 3,
-};
-const ROUTES_TRAVEL_MODE: Record<TravelMode, string> = {
-  walk: 'WALK',
-  bike: 'BICYCLE',
-  transit: 'TRANSIT',
-  drive: 'DRIVE',
-};
-
-function pickMode(distanceM: number): TravelMode {
-  if (distanceM <= 1300) return 'walk';
-  return 'transit';
+interface Context {
+  home?: HomePin;
 }
 
-function estimateMinutes(distanceM: number, mode: TravelMode): number {
-  return Math.max(1, Math.round(distanceM / SPEED_M_PER_MIN[mode] + MODE_OVERHEAD_MIN[mode]));
-}
-
-type TravelStepMode = 'walk' | 'bus' | 'tram' | 'subway' | 'train' | 'ferry' | 'transit';
-
-interface TravelStep {
-  mode: TravelStepMode;
-  line?: string;
-  from?: string;
-  to?: string;
-  durationMinutes?: number;
-  numStops?: number;
-  fromCoords?: Coords;
-  toCoords?: Coords;
-}
-
-interface RouteResult {
-  minutes: number;
-  distanceMeters?: number;
-  steps?: TravelStep[];
-  polyline?: string;
-}
-
-/** Google Routes transit vehicle type → our coarse step sub-mode. */
-function vehicleToStepMode(type: unknown): TravelStepMode {
-  switch (type) {
-    case 'BUS':
-    case 'INTERCITY_BUS':
-    case 'TROLLEYBUS':
-    case 'SHARE_TAXI':
-      return 'bus';
-    case 'SUBWAY':
-    case 'METRO_RAIL':
-    case 'MONORAIL':
-      return 'subway';
-    case 'TRAM':
-    case 'LIGHT_RAIL':
-    case 'CABLE_CAR':
-    case 'GONDOLA_LIFT':
-    case 'FUNICULAR':
-      return 'tram';
-    case 'HEAVY_RAIL':
-    case 'RAIL':
-    case 'COMMUTER_TRAIN':
-    case 'HIGH_SPEED_TRAIN':
-    case 'LONG_DISTANCE_TRAIN':
-      return 'train';
-    case 'FERRY':
-      return 'ferry';
-    default:
-      return 'transit';
-  }
-}
-
-function secsToMin(v: unknown): number | undefined {
-  const secs = typeof v === 'string' ? parseInt(v.replace(/s$/, ''), 10) : Number(v);
-  return Number.isFinite(secs) ? Math.max(1, Math.round(secs / 60)) : undefined;
-}
-
-/** Reads a {latitude, longitude} out of a Routes API latLng, if present. */
-function latLngOf(loc: any): Coords | undefined {
-  const ll = loc?.latLng ?? loc;
-  const lat = Number(ll?.latitude);
-  const lng = Number(ll?.longitude);
-  return Number.isFinite(lat) && Number.isFinite(lng)
-    ? { latitude: lat, longitude: lng }
-    : undefined;
-}
-
-/** Pulls a readable walk → bus → metro → train breakdown out of a route. */
-function parseSteps(route: any): TravelStep[] {
-  const legs = Array.isArray(route?.legs) ? route.legs : [];
-  const out: TravelStep[] = [];
-  for (const leg of legs) {
-    const steps = Array.isArray(leg?.steps) ? leg.steps : [];
-    for (const st of steps) {
-      if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
-        const td = st.transitDetails;
-        const line: string | undefined =
-          td?.transitLine?.nameShort || td?.transitLine?.name || undefined;
-        out.push({
-          mode: vehicleToStepMode(td?.transitLine?.vehicle?.type),
-          line: typeof line === 'string' ? line : undefined,
-          from: typeof td?.stopDetails?.departureStop?.name === 'string'
-            ? td.stopDetails.departureStop.name
-            : undefined,
-          to: typeof td?.stopDetails?.arrivalStop?.name === 'string'
-            ? td.stopDetails.arrivalStop.name
-            : undefined,
-          durationMinutes: secsToMin(st?.staticDuration),
-          numStops: typeof td?.stopCount === 'number' ? td.stopCount : undefined,
-          fromCoords: latLngOf(td?.stopDetails?.departureStop?.location),
-          toCoords: latLngOf(td?.stopDetails?.arrivalStop?.location),
-        });
-      } else if (st?.travelMode === 'WALK') {
-        const dmin = secsToMin(st?.staticDuration);
-        // Skip trivial in-station shuffles; keep walks that matter.
-        if (dmin && dmin >= 2) out.push({ mode: 'walk', durationMinutes: dmin });
-      }
-    }
-  }
-  return out;
-}
-
-/**
- * Real door-to-door route via Google Routes (computeRoutes): total minutes
- * plus the transit step breakdown. Returns null on any failure so the
- * caller can fall back to the haversine estimate.
- */
-async function computeRoute(
-  origin: Coords,
-  dest: Coords,
-  mode: TravelMode,
-  apiKey: string,
-): Promise<RouteResult | null> {
-  try {
-    const res = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask':
-          'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.travelMode,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails',
-      },
-      body: JSON.stringify({
-        origin: { location: { latLng: { latitude: origin.latitude, longitude: origin.longitude } } },
-        destination: { location: { latLng: { latitude: dest.latitude, longitude: dest.longitude } } },
-        travelMode: ROUTES_TRAVEL_MODE[mode],
-      }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const route = Array.isArray(data?.routes) ? data.routes[0] : null;
-    if (!route) return null;
-    const secs =
-      typeof route.duration === 'string'
-        ? parseInt(route.duration.replace(/s$/, ''), 10)
-        : Number(route.duration);
-    if (!Number.isFinite(secs)) return null;
-    const steps = parseSteps(route);
-    const polyline =
-      typeof route?.polyline?.encodedPolyline === 'string'
-        ? route.polyline.encodedPolyline
-        : undefined;
-    return {
-      minutes: Math.max(1, Math.round(secs / 60)),
-      distanceMeters: typeof route.distanceMeters === 'number' ? route.distanceMeters : undefined,
-      steps: steps.length > 1 ? steps : undefined,
-      polyline,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function parseHHMM(v: unknown): number | null {
-  if (typeof v !== 'string') return null;
-  const m = v.match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return null;
-  const h = Number(m[1]);
-  const min = Number(m[2]);
-  if (!Number.isFinite(h) || !Number.isFinite(min)) return null;
-  return h * 60 + min;
-}
-
-function fmtHHMM(totalMin: number): string {
-  const wrapped = ((Math.round(totalMin) % 1440) + 1440) % 1440;
-  const h = Math.floor(wrapped / 60);
-  const m = wrapped % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-}
-
-function itemDuration(item: any): number {
-  const d = Number(item?.durationMinutes);
-  if (Number.isFinite(d) && d > 0) return Math.round(d);
-  const s = parseHHMM(item?.startTime);
-  const e = parseHHMM(item?.endTime);
-  if (s != null && e != null && e > s) return e - s;
-  return 30;
-}
-
-function flattenItems(parsed: any): any[] {
-  if (!parsed || !Array.isArray(parsed.sections)) return [];
-  return parsed.sections.flatMap((s: any) => (s && Array.isArray(s.items) ? s.items : []));
-}
-
-/**
- * Safety net: the model is told never to emit "travel" items (the app draws
- * all travel as connectors), but it sometimes still does — a "Train to X"
- * card that breaks the visual continuity. Drop any AI-produced travel items
- * (and now-empty sections) so the journey is rendered as the routed,
- * step-by-step leg between the real places instead.
- */
-function stripAiTravelItems(parsed: any): void {
-  if (!parsed || !Array.isArray(parsed.sections)) return;
-  for (const s of parsed.sections) {
-    if (s && Array.isArray(s.items)) {
-      s.items = s.items.filter((it: any) => it?.kind !== 'travel');
-    }
-  }
-  parsed.sections = parsed.sections.filter(
-    (s: any) => s && Array.isArray(s.items) && s.items.length > 0,
-  );
-}
-
-/** Routes one hop, attaching the transit step breakdown, with a fallback. */
-async function computeLeg(
-  origin: Coords,
-  dest: Coords,
-  apiKey: string,
-  fromLabel?: string,
-): Promise<any> {
-  const straight = haversineMeters(origin, dest);
-  const distanceM = Math.round(straight * DETOUR_FACTOR);
-  const mode = pickMode(distanceM);
-  const routed = await computeRoute(origin, dest, mode, apiKey);
-  const leg: any = routed
-    ? {
-        mode,
-        minutes: routed.minutes,
-        distanceMeters: routed.distanceMeters ?? distanceM,
-        steps: routed.steps,
-        polyline: routed.polyline,
-        estimated: false,
-      }
-    : {
-        mode,
-        minutes: estimateMinutes(distanceM, mode),
-        distanceMeters: distanceM,
-        estimated: true,
-      };
-  if (fromLabel) leg.fromLabel = fromLabel;
-  return leg;
-}
-
-/**
- * Attaches a real travel leg (with transit steps) to every located stop —
- * from the previous stop, or from HOME for the first one so the day can
- * never "teleport" into another city. Adds a routed trip back home when the
- * day ends away from it. Then cascades the clock around fixed anchors.
- */
-async function routeAndSchedule(
-  parsed: any,
-  context: Context,
-  apiKey: string | undefined,
-): Promise<void> {
-  if (!parsed || !Array.isArray(parsed.sections)) return;
-
-  // Drop any stray AI-emitted "travel" cards; we draw travel ourselves.
-  stripAiTravelItems(parsed);
-
-  // 1) Travel legs (needs a Google key to route with). Each hop's endpoints
-  //    are already known (from the place coords), so the hops don't depend on
-  //    each other — we route them ALL IN PARALLEL instead of one-by-one,
-  //    which is the main latency win for a multi-stop day.
-  if (apiKey) {
-    const homeCoords: Coords | null = context.home
-      ? { latitude: context.home.latitude, longitude: context.home.longitude }
-      : null;
-
-    // Build a routing sequence over ALL blocks. Located blocks use their venue
-    // coords; at-home blocks use HOME coords so the trip home is computed
-    // naturally the moment the day goes from an outing back to a home block
-    // (no teleporting into "cook lunch", and no "Head Home" bolted on when the
-    // day actually ends at home). Other placeless blocks (an unresolved venue)
-    // simply don't participate — they don't break the chain.
-    type RouteNode = { item: any; coords: Coords; isHome: boolean };
-    const seq: RouteNode[] = [];
-    for (const item of flattenItems(parsed)) {
-      const placeCoords: Coords | undefined = item?.place?.coords;
-      if (placeCoords) seq.push({ item, coords: placeCoords, isHome: false });
-      else if (homeCoords && item?.locationStrategy === 'at_home')
-        seq.push({ item, coords: homeCoords, isHome: true });
-    }
-
-    const hops: {
-      item: any;
-      origin: Coords;
-      dest: Coords;
-      fromLabel?: string;
-    }[] = [];
-
-    // Walk the sequence; a leg is the move between two consecutive anchors that
-    // are genuinely in different places (home→home is 0m → no leg).
-    let prev: RouteNode | null = homeCoords
-      ? { item: null, coords: homeCoords, isHome: true }
-      : null;
-    for (const node of seq) {
-      if (prev && haversineMeters(prev.coords, node.coords) > 25) {
-        hops.push({
-          item: node.item,
-          origin: prev.coords,
-          dest: node.coords,
-          // Name the origin only when leaving home; an inter-stop hop starts at
-          // the card directly above, so naming it would be noise.
-          fromLabel: prev.isHome ? context.home?.label : undefined,
-        });
-      }
-      prev = node;
-    }
-
-    // An explicit trip back is only needed when the day ENDS meaningfully away
-    // from home; otherwise the return is already a leg on the first home block
-    // after the last outing.
-    let backHomeItem: any = null;
-    if (homeCoords && prev && !prev.isHome && haversineMeters(prev.coords, homeCoords) > 400) {
-      backHomeItem = {
-        title: 'Back home',
-        kind: 'travel',
-        flexibility: 'flexible',
-        durationMinutes: 0,
-        place: null,
-        arrival: true,
-        travelFromPrev: null,
-      };
-      hops.push({ item: backHomeItem, origin: prev.coords, dest: homeCoords });
-    }
-
-    await Promise.all(
-      hops.map(async (h) => {
-        h.item.travelFromPrev = await computeLeg(h.origin, h.dest, apiKey, h.fromLabel);
-      }),
-    );
-
-    if (backHomeItem) {
-      parsed.sections.push({
-        title: 'Head Home',
-        period: 'Evening',
-        items: [backHomeItem],
-      });
-    }
-  }
-
-  // 2) Cascade the clock (re-flatten so any appended return item is timed).
-  const items = flattenItems(parsed);
-  if (items.length === 0) return;
-  let cursor = parseHHMM(items[0]?.startTime);
-  if (cursor == null) cursor = 8 * 60;
-  for (const item of items) {
-    const legMin = Number(item?.travelFromPrev?.minutes);
-    if (Number.isFinite(legMin) && legMin > 0) cursor += legMin;
-    let start = cursor;
-    if (item?.flexibility === 'fixed') {
-      const fixed = parseHHMM(item.startTime);
-      // Arrive early → wait for the fixed time. Arrive late → we can't go
-      // back in time, so keep the real (late) arrival; the user sees the slip.
-      if (fixed != null && fixed >= start) start = fixed;
-    } else if (item?.flexibility === 'window') {
-      // A window floats but opens at windowStart (e.g. "cook only 2h after I
-      // order"). Wait for it to open if we'd otherwise begin too early.
-      // windowEnd is a soft deadline — we already place ASAP, so honouring it
-      // is just about ordering, not pushing the block later here.
-      const ws = parseHHMM(item.windowStart);
-      if (ws != null && ws > start) start = ws;
-    }
-    // Only the synthetic "Back home" is a pure arrival (zero length). At-home
-    // blocks are placeless too but real activities now carry a travel leg (the
-    // trip home), so key off the explicit flag instead of "placeless + leg".
-    const isArrival = item?.arrival === true;
-    const dur = isArrival ? 0 : itemDuration(item);
-    item.startTime = fmtHHMM(start);
-    if (dur > 0) {
-      item.endTime = fmtHHMM(start + dur);
-      item.durationMinutes = dur;
-    } else {
-      item.endTime = null;
-      item.durationMinutes = null;
-    }
-    cursor = start + dur;
-  }
-}
-
-// --- order optimization (minimize back-and-forth travel) -------------------
-//
-// Venue resolution already clusters most stops near home/anchors; this pass
-// removes the remaining zig-zag by reordering RUNS of flexible located
-// sections to flow along the route. Fixed-time commitments and placeless
-// (at-home) sections act as fences, so the day's energy arc and hard times
-// are preserved. The user's stated order is only the seed; manual/AI
-// re-balancing is a later feature.
-
-function permutations<T>(arr: T[]): T[][] {
-  if (arr.length <= 1) return [arr];
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i++) {
-    const rest = arr.slice(0, i).concat(arr.slice(i + 1));
-    for (const p of permutations(rest)) out.push([arr[i], ...p]);
-  }
-  return out;
-}
-
-function sectionCoords(section: any): Coords | null {
-  if (!section || !Array.isArray(section.items)) return null;
-  for (const it of section.items) {
-    if (it?.place?.coords) return it.place.coords;
-  }
-  return null;
-}
-
-function sectionHasFixed(section: any): boolean {
-  return (
-    !!section &&
-    Array.isArray(section.items) &&
-    section.items.some(
-      (it: any) => it?.flexibility === 'fixed' && parseHHMM(it?.startTime) != null,
-    )
-  );
-}
-
-/** Order a small run of nodes to minimize entry -> ... -> exit travel. */
-function orderRun(run: any[], entry: Coords | null, exit: Coords | null): any[] {
-  if (run.length <= 1) return run;
-  const d = (a: Coords | null, b: Coords | null) => (a && b ? haversineMeters(a, b) : 0);
-  const cost = (seq: any[]) => {
-    let total = 0;
-    let prev = entry;
-    for (const n of seq) {
-      total += d(prev, n.coords);
-      prev = n.coords;
-    }
-    return total + d(prev, exit);
-  };
-  if (run.length <= 6) {
-    // Tiny path-TSP — brute force is exact and cheap at this size.
-    let best = run;
-    let bestCost = Infinity;
-    for (const perm of permutations(run)) {
-      const c = cost(perm);
-      if (c < bestCost) {
-        bestCost = c;
-        best = perm;
-      }
-    }
-    return best;
-  }
-  // Larger runs (rare): greedy nearest-neighbour from the entry point.
-  const remaining = run.slice();
-  const out: any[] = [];
-  let prev = entry;
-  while (remaining.length) {
-    let bi = 0;
-    let bd = Infinity;
-    remaining.forEach((n, idx) => {
-      const dist = d(prev, n.coords);
-      if (dist < bd) {
-        bd = dist;
-        bi = idx;
-      }
-    });
-    const [n] = remaining.splice(bi, 1);
-    out.push(n);
-    prev = n.coords;
-  }
-  return out;
-}
-
-/**
- * Reorders flexible located sections to minimize travel, keeping fixed-time
- * and placeless (at-home) sections fixed as fences. Mutates `parsed`.
- */
-function reorderSectionsForTravel(parsed: any, home: Coords | null): void {
-  if (!parsed || !Array.isArray(parsed.sections) || parsed.sections.length < 3) return;
-  const nodes = parsed.sections.map((s: any) => ({
-    section: s,
-    coords: sectionCoords(s),
-    fixed: sectionHasFixed(s),
-  }));
-  const movable = (n: any) => !!n.coords && !n.fixed;
-
-  const result: any[] = [];
-  const lastCoords = (): Coords | null => {
-    for (let k = result.length - 1; k >= 0; k--) {
-      if (result[k].coords) return result[k].coords;
-    }
-    return home;
-  };
-
-  let i = 0;
-  while (i < nodes.length) {
-    if (!movable(nodes[i])) {
-      result.push(nodes[i]);
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < nodes.length && movable(nodes[j])) j++;
-    const run = nodes.slice(i, j);
-    const entry = lastCoords();
-    let exit: Coords | null = home;
-    for (let k = j; k < nodes.length; k++) {
-      if (nodes[k].coords) {
-        exit = nodes[k].coords;
-        break;
-      }
-    }
-    result.push(...orderRun(run, entry, exit));
-    i = j;
-  }
-
-  parsed.sections = result.map((n) => n.section);
-}
+// ----------------------------------------------------------- HTTP helpers
 
 function corsHeaders(): Record<string, string> {
   return {
@@ -1099,49 +64,455 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-interface LocationPin {
-  label: string;
-  latitude: number;
-  longitude: number;
+// ----------------------------------------------------------- utilities
+
+function haversineMeters(a: Coords, b: Coords): number {
+  const R = 6371000;
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.latitude)) *
+      Math.cos(toRad(b.latitude)) *
+      Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
-interface Context {
-  home?: LocationPin;
-  work?: LocationPin;
-  endOfDay?: LocationPin;
-  currentLocation?: { latitude: number; longitude: number };
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
-function normalizePin(input: any): LocationPin | undefined {
+function normaliseName(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, ' ')
+    .trim();
+}
+
+/** Loose name match: equality, containment, or Jaccard ≥ 0.5 on tokens. */
+function nameSimilar(a: string, b: string): boolean {
+  const na = normaliseName(a);
+  const nb = normaliseName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true;
+  const ta = new Set(na.split(' ').filter(Boolean));
+  const tb = new Set(nb.split(' ').filter(Boolean));
+  if (ta.size === 0 || tb.size === 0) return false;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter += 1;
+  const union = new Set([...ta, ...tb]).size;
+  return union > 0 && inter / union >= 0.5;
+}
+
+function extractJsonObject(text: string): any | null {
+  if (!text) return null;
+  const fenced = text.replace(/```json\s*|\s*```/g, '');
+  const match = fenced.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------------- input normalize
+
+function normalizeHome(input: any): HomePin | undefined {
   if (!input || typeof input !== 'object') return undefined;
   const lat = Number(input.latitude);
   const lon = Number(input.longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
   return {
-    label: typeof input.label === 'string' ? input.label : 'Pin',
+    label: typeof input.label === 'string' ? input.label : 'home',
     latitude: lat,
     longitude: lon,
   };
 }
 
 function normalizeContext(input: any): Context {
-  if (!input || typeof input !== 'object') return {};
   const ctx: Context = {};
-  const home = normalizePin(input.home);
+  if (!input || typeof input !== 'object') return ctx;
+  const home = normalizeHome(input.home);
   if (home) ctx.home = home;
-  const work = normalizePin(input.work);
-  if (work) ctx.work = work;
-  const endOfDay = normalizePin(input.endOfDay);
-  if (endOfDay) ctx.endOfDay = endOfDay;
-  if (input.currentLocation && typeof input.currentLocation === 'object') {
-    const lat = Number(input.currentLocation.latitude);
-    const lon = Number(input.currentLocation.longitude);
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      ctx.currentLocation = { latitude: lat, longitude: lon };
-    }
-  }
   return ctx;
 }
+
+// ----------------------------------------------------------- Gemini prompt
+
+function buildPlannerPrompt(args: {
+  userText: string;
+  home: HomePin | null;
+  date: string;
+}): string {
+  const home = args.home;
+  const homeBlock = home
+    ? `- Home: "${home.label}" at latitude ${home.latitude}, longitude ${home.longitude}.`
+    : '- The user has not pinned a home location. Keep venue picks generic and assume the day happens close to wherever they start.';
+  const originDefault = home?.label ?? 'home';
+
+  return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
+
+CONTEXT
+${homeBlock}
+- Today is ${args.date}.
+
+USER REQUEST (their own words, between triple quotes):
+"""
+${args.userText}
+"""
+
+REQUIREMENTS
+1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
+2. Cover the WHOLE day continuously. No invisible gaps. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. The only allowed gaps are explicit relax/buffer/chores items the user asked for (use kind="break").
+3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
+4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it's well-known. Return real name, address, rating (0–5), and an opening-status hint when known. If the user NAMED a venue (e.g. "OC Krakov Max Fitness"), honour that exact venue regardless of distance.
+5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
+6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
+7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
+8. Each item needs realistic startTime / endTime / durationMinutes. Include a 1–2 sentence description, and up to 4 "highlights" for items with concrete to-dos (e.g. ["Eggs", "Toast", "Phone on silent"]).
+9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
+
+Output ONLY a single JSON object, no prose, no markdown fences. Match this schema. OMIT optional fields you don't have rather than inventing. Use null for unknown ratings; do not make up transit line numbers.
+
+{
+  "title": "<catchy day title>",
+  "summary": "<2–3 sentence summary of how the day flows>",
+  "date": "${args.date}",
+  "origin": ${JSON.stringify(originDefault)},
+  "city": "<city, e.g. Prague, Czechia>",
+  "sections": [
+    {
+      "title": "<section headline>",
+      "period": "Morning" | "Afternoon" | "Evening",
+      "items": [
+        {
+          "title": "<short action title>",
+          "kind": "travel" | "work" | "sightseeing" | "meal" | "event" | "meetup" | "drinks" | "activity" | "break" | "other",
+          "flexibility": "fixed" | "window" | "flexible",
+          "startTime": "HH:MM",
+          "endTime": "HH:MM",
+          "durationMinutes": 30,
+          "place": {
+            "name": "Max Fitness Krakov",
+            "category": "Gym",
+            "emoji": "🏋️",
+            "address": "Lodžská 850/6, Prague 8",
+            "rating": 4.6,
+            "coords": { "latitude": 50.13, "longitude": 14.42 }
+          },
+          "travelFromPrev": {
+            "mode": "transit",
+            "minutes": 18,
+            "fromLabel": "Home",
+            "estimated": true,
+            "steps": [
+              { "mode": "walk", "durationMinutes": 5 },
+              { "mode": "bus", "line": "152", "from": "Přívorská", "to": "Krakov", "durationMinutes": 8 },
+              { "mode": "walk", "durationMinutes": 3 }
+            ]
+          },
+          "description": "Strength session at the OC Krakov gym — the Max Fitness spot the user named.",
+          "highlights": ["Warm-up 10 min", "Main lift 60 min", "Sauna after"]
+        }
+      ]
+    }
+  ]
+}`;
+}
+
+// ----------------------------------------------------------- Gemini call
+
+async function callGeminiPlanner(args: {
+  prompt: string;
+  apiKey: string;
+}): Promise<
+  | {
+      ok: true;
+      parsed: any;
+      rawText: string;
+      elapsedMs: number;
+      sources: string[];
+    }
+  | { ok: false; status: number; detail: string }
+> {
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: args.prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: 0.4 },
+  };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${args.apiKey}`;
+
+  const t0 = Date.now();
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e: any) {
+    return { ok: false, status: 502, detail: `Gemini fetch error: ${String(e?.message ?? e)}` };
+  }
+  if (!res.ok) {
+    const detail = await res.text();
+    return { ok: false, status: 502, detail: `Gemini ${res.status}: ${detail.slice(0, 500)}` };
+  }
+  const data = await res.json();
+  const elapsedMs = Date.now() - t0;
+  const candidate = data?.candidates?.[0];
+  const rawText: string = (candidate?.content?.parts ?? [])
+    .map((p: any) => p?.text ?? '')
+    .join('')
+    .trim();
+  const parsed = extractJsonObject(rawText);
+  if (!parsed) {
+    return {
+      ok: false,
+      status: 502,
+      detail: `Model returned unparseable JSON. Raw: ${rawText.slice(0, 500)}`,
+    };
+  }
+  const sources: string[] = (candidate?.groundingMetadata?.groundingChunks ?? [])
+    .map((c: any) => c?.web?.title || c?.web?.uri)
+    .filter((s: unknown): s is string => typeof s === 'string');
+  return { ok: true, parsed, rawText, elapsedMs, sources };
+}
+
+// ----------------------------------------------------------- Google enrichment
+
+interface EnrichedRecord {
+  name: string;
+  address: string | null;
+  rating: number | null;
+  ratingCount: number | null;
+  photoUrl: string | null;
+  openNow: boolean | null;
+  latitude: number;
+  longitude: number;
+}
+
+async function resolvePhotoUrl(
+  photoName: string | undefined,
+  apiKey: string,
+): Promise<string | null> {
+  if (!photoName) return null;
+  try {
+    const res = await fetch(
+      `https://places.googleapis.com/v1/${photoName}/media?key=${apiKey}&maxHeightPx=400&maxWidthPx=400&skipHttpRedirect=true`,
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    return typeof json?.photoUri === 'string' ? json.photoUri : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Looks up one venue near `center` via Google Places Text Search, picking
+ * the candidate whose name actually matches the model's intended name.
+ * Tight radius on purpose — the model's coords should be within a few
+ * hundred metres of the real venue, and widening pulls in popular
+ * doppelgängers across town.
+ */
+async function lookupGooglePlace(args: {
+  name: string;
+  center: Coords;
+  apiKey: string;
+  radiusM?: number;
+}): Promise<EnrichedRecord | null> {
+  const radius = args.radiusM ?? 1500;
+  const body = {
+    textQuery: args.name,
+    maxResultCount: 5,
+    rankPreference: 'RELEVANCE',
+    locationBias: {
+      circle: {
+        center: { latitude: args.center.latitude, longitude: args.center.longitude },
+        radius: Math.max(500, Math.min(20000, radius)),
+      },
+    },
+  };
+  let data: any;
+  try {
+    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': args.apiKey,
+        'X-Goog-FieldMask':
+          'places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.rating,places.userRatingCount,places.photos,places.currentOpeningHours.openNow',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return null;
+    data = await res.json();
+  } catch {
+    return null;
+  }
+  const raw: any[] = Array.isArray(data?.places) ? data.places : [];
+  if (raw.length === 0) return null;
+  const match =
+    raw.find((p) => nameSimilar(p?.displayName?.text ?? '', args.name)) ?? raw[0];
+  const lat = match?.location?.latitude;
+  const lon = match?.location?.longitude;
+  const name = match?.displayName?.text;
+  if (typeof lat !== 'number' || typeof lon !== 'number' || typeof name !== 'string') {
+    return null;
+  }
+  // Strict-ish name guard — we still let the top result through if it's
+  // similar enough, but a totally different business (the "Sevt, Inc." /
+  // "ALZHEIMER HOME" case) won't be merged in.
+  if (!nameSimilar(name, args.name)) {
+    return null;
+  }
+  const photoUrl = await resolvePhotoUrl(match?.photos?.[0]?.name, args.apiKey);
+  return {
+    name,
+    address:
+      (typeof match.shortFormattedAddress === 'string' ? match.shortFormattedAddress : null) ??
+      (typeof match.formattedAddress === 'string' ? match.formattedAddress : null),
+    rating: typeof match.rating === 'number' ? match.rating : null,
+    ratingCount: typeof match.userRatingCount === 'number' ? match.userRatingCount : null,
+    photoUrl,
+    openNow:
+      typeof match?.currentOpeningHours?.openNow === 'boolean'
+        ? match.currentOpeningHours.openNow
+        : null,
+    latitude: lat,
+    longitude: lon,
+  };
+}
+
+function openStatusFromBool(b: boolean | null): string | null {
+  if (b === true) return 'Open now';
+  if (b === false) return 'Closed now';
+  return null;
+}
+
+/**
+ * Walks the parsed itinerary and merges Google Places fields into every
+ * unique venue the model returned. Skips:
+ *   - items with no place block (at-home / break items the model wisely omits)
+ *   - "Home"-looking place blocks (defensive — see scrubHomePlaces below)
+ *   - venues whose model coords are essentially at home (≤ 75 m)
+ * Mutates `parsed` in place.
+ */
+async function enrichItinerary(
+  parsed: any,
+  home: HomePin | null,
+  apiKey: string,
+): Promise<void> {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+
+  // Index every (name, rounded-coord) venue across the day.
+  interface Slot {
+    item: any;
+    name: string;
+    coords: Coords;
+  }
+  const slotsByKey = new Map<string, Slot[]>();
+  const keyOf = (name: string, c: Coords) =>
+    `${normaliseName(name)}|${c.latitude.toFixed(3)},${c.longitude.toFixed(3)}`;
+
+  for (const section of parsed.sections) {
+    if (!section || !Array.isArray(section.items)) continue;
+    for (const item of section.items) {
+      const p = item?.place;
+      if (!p || typeof p !== 'object') continue;
+      const name = typeof p.name === 'string' ? p.name.trim() : '';
+      const lat = Number(p?.coords?.latitude);
+      const lon = Number(p?.coords?.longitude);
+      if (!name || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+      const coords: Coords = { latitude: lat, longitude: lon };
+
+      // Defensive: refuse to enrich anything that looks like "Home" — the
+      // model is told not to emit one, but if it slips through we don't
+      // want Google's nearest "Home"-named business to override the user.
+      if (looksLikeHome(name, coords, home)) {
+        item.place = undefined;
+        continue;
+      }
+
+      const k = keyOf(name, coords);
+      if (!slotsByKey.has(k)) slotsByKey.set(k, []);
+      slotsByKey.get(k)!.push({ item, name, coords });
+    }
+  }
+
+  if (slotsByKey.size === 0) return;
+
+  // One lookup per unique venue, in parallel.
+  await Promise.all(
+    Array.from(slotsByKey.values()).map(async (slots) => {
+      const { name, coords } = slots[0];
+      const record = await lookupGooglePlace({ name, center: coords, apiKey });
+      if (!record) return;
+      for (const { item } of slots) {
+        const hint = item.place && typeof item.place === 'object' ? item.place : {};
+        item.place = {
+          ...hint,
+          name: record.name,
+          address: record.address ?? hint.address ?? null,
+          rating: record.rating ?? (typeof hint.rating === 'number' ? hint.rating : null),
+          ratingCount: record.ratingCount,
+          openStatus: openStatusFromBool(record.openNow),
+          photoUrl: record.photoUrl,
+          coords: { latitude: record.latitude, longitude: record.longitude },
+        };
+      }
+    }),
+  );
+}
+
+const HOME_NAME_RE = /^(home|my home|house|residence)$/i;
+
+function looksLikeHome(name: string, coords: Coords, home: HomePin | null): boolean {
+  if (HOME_NAME_RE.test(name.trim())) return true;
+  if (!home) return false;
+  // The model often parrots the home address back as the place name.
+  const homeLabel = home.label?.trim().toLowerCase() ?? '';
+  if (homeLabel && normaliseName(name) === normaliseName(home.label)) return true;
+  // Or it gives an obvious-home coordinate. 75 m is enough slack for
+  // "Bohnice" vs "Pekařova 859/12" both pointing at the same building.
+  if (haversineMeters(coords, home) <= 75) return true;
+  return false;
+}
+
+/**
+ * Belt-and-braces pass run BEFORE enrichment: strip any "Home"-looking
+ * place block the model managed to emit despite the prompt. Operates on
+ * the raw parsed object so the rest of the pipeline never sees them.
+ */
+function scrubHomePlaces(parsed: any, home: HomePin | null): void {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+  for (const section of parsed.sections) {
+    if (!section || !Array.isArray(section.items)) continue;
+    for (const item of section.items) {
+      const p = item?.place;
+      if (!p || typeof p !== 'object') continue;
+      const name = typeof p.name === 'string' ? p.name.trim() : '';
+      const lat = Number(p?.coords?.latitude);
+      const lon = Number(p?.coords?.longitude);
+      if (!name) {
+        item.place = undefined;
+        continue;
+      }
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        if (looksLikeHome(name, { latitude: lat, longitude: lon }, home)) {
+          item.place = undefined;
+        }
+      } else if (HOME_NAME_RE.test(name)) {
+        item.place = undefined;
+      }
+    }
+  }
+}
+
+// ----------------------------------------------------------- entrypoint
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
@@ -1151,10 +522,14 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Method not allowed' }, 405);
   }
 
-  const apiKey = Deno.env.get('OPENAI_API_KEY');
-  if (!apiKey) {
+  const geminiKey = Deno.env.get('GEMINI_API_KEY');
+  if (!geminiKey) {
     return jsonResponse(
-      { error: 'OPENAI_API_KEY not configured on the server.' },
+      {
+        error: 'GEMINI_API_KEY not configured on the server.',
+        detail:
+          'Set it via `supabase secrets set GEMINI_API_KEY=...` and redeploy this function.',
+      },
       501,
     );
   }
@@ -1165,85 +540,40 @@ Deno.serve(async (req: Request) => {
   } catch {
     return jsonResponse({ error: 'Invalid JSON body' }, 400);
   }
-
   const request = typeof payload.request === 'string' ? payload.request.trim() : '';
   if (!request) {
     return jsonResponse({ error: 'Missing `request` text.' }, 400);
   }
-  const date = typeof payload.date === 'string' ? payload.date : undefined;
+  const date = typeof payload.date === 'string' ? payload.date : todayISO();
   const context = normalizeContext(payload.context);
 
-  const userMessage = JSON.stringify({ request, date, context });
-
-  const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: 'gpt-5.4-mini',
-      // Reasoning model: it "thinks" before answering, which is what this
-      // multi-constraint day planning needs (windows, clustering, energy arc).
-      // `temperature` is not accepted on reasoning models, so it's omitted.
-      reasoning_effort: 'medium',
-      // Reasoning tokens are billed as output and consume this budget BEFORE
-      // the JSON is written — set it generously or a long think truncates the
-      // answer into empty/invalid JSON.
-      max_completion_tokens: 16000,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userMessage },
-      ],
-    }),
+  // 1) Single grounded Gemini call that produces the whole itinerary.
+  const prompt = buildPlannerPrompt({
+    userText: request,
+    home: context.home ?? null,
+    date,
   });
-
-  if (!openaiRes.ok) {
-    const text = await openaiRes.text();
-    return jsonResponse({ error: 'OpenAI error', detail: text }, 502);
+  const gem = await callGeminiPlanner({ prompt, apiKey: geminiKey });
+  if (!gem.ok) {
+    return jsonResponse({ error: 'Planner failed', detail: gem.detail }, gem.status);
   }
+  const parsed = gem.parsed;
 
-  const completion = await openaiRes.json();
-  const content: string = completion?.choices?.[0]?.message?.content ?? '{}';
+  // 2) Defensive: drop any "Home"-looking place blocks BEFORE enrichment so
+  //    we never look those up in Google (this is what produced "ALZHEIMER
+  //    HOME Libeň" as a "Home" match in the previous build).
+  scrubHomePlaces(parsed, context.home ?? null);
 
-  let parsed: any;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    return jsonResponse({ error: 'Model returned invalid JSON', raw: content }, 502);
-  }
-
+  // 3) Per-unique-venue Google Places lookup to backfill photo, rating
+  //    count, opening status, and canonical coords. Best-effort — never
+  //    fail the request if Google hiccups.
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
-
-  // 1) Resolve each block's venueQuery to a real, well-rated venue near the
-  //    smartest anchor (location-biased, quality-vs-proximity). Best-effort:
-  //    without a key, at-home blocks are cleared and the rest keep AI hints.
-  try {
-    await resolveVenues(parsed, context, googleKey);
-  } catch {
-    // never fail the request because resolution hiccuped
-  }
-
-  // 2) Reorder flexible located stops to minimize back-and-forth (needs the
-  //    coords from step 1; fixed + at-home blocks stay put as fences).
-  try {
-    const homeCoords = context.home
-      ? { latitude: context.home.latitude, longitude: context.home.longitude }
-      : null;
-    reorderSectionsForTravel(parsed, homeCoords);
-  } catch {
-    // keep the resolved order if reordering hiccuped
-  }
-
-  // 3) Turn structure + durations into a real clock: attach map-based travel
-  //    legs between the real coords and cascade times around fixed anchors.
-  //    Runs even without a Google key — then it just cascades durations with
-  //    no travel inserted. Best-effort: never fail the request.
-  try {
-    await routeAndSchedule(parsed, context, googleKey);
-  } catch {
-    // keep the unscheduled structure if routing/scheduling hiccuped
+  if (googleKey) {
+    try {
+      await enrichItinerary(parsed, context.home ?? null, googleKey);
+    } catch {
+      // ignore — the unenriched plan is still useful
+    }
   }
 
   return jsonResponse(parsed);
