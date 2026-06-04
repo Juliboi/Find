@@ -38,7 +38,17 @@ import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
 import { Button } from '@/components/Button';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
-import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
+import {
+  planItinerary,
+  regroundItineraryPlaces,
+  type ItineraryDebug,
+  type RegroundStats,
+} from '@/lib/ai/itinerary';
+import { getCurrentCoords } from '@/lib/places';
+import {
+  enrichItineraryPlaces,
+  type EnrichStats,
+} from '@/lib/itineraryEnrich';
 import {
   Itinerary,
   ItineraryItem,
@@ -177,6 +187,8 @@ export default function ItineraryScreen() {
   const [usedAi, setUsedAi] = useState(!!preloaded);
   const [loading, setLoading] = useState(false);
   const [debug, setDebug] = useState<ItineraryDebug | null>(null);
+  const [regroundStats, setRegroundStats] = useState<RegroundStats | null>(null);
+  const [enrichStats, setEnrichStats] = useState<EnrichStats | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
@@ -242,6 +254,30 @@ export default function ItineraryScreen() {
   );
   const flatItemsRef = useRef(flatItems);
   flatItemsRef.current = flatItems;
+
+  // Item IDs that are "continuations" — the previous item in the day was at
+  // the SAME venue (matched by name + rounded coords). The card render uses
+  // this to suppress the duplicate place block / photo / category chip, so a
+  // run like "Run to pull-up bar" → "Pull-up workout" reads as one venue
+  // visited continuously instead of repeating the photo three times.
+  const continuationIds = useMemo(() => {
+    const ids = new Set<string>();
+    const venueKey = (it: ItineraryItem): string | null => {
+      const p = it.place;
+      if (!p?.name) return null;
+      const c = p.coords;
+      const cKey = c
+        ? `${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`
+        : '';
+      return `${p.name.toLowerCase()}|${cKey}`;
+    };
+    for (let i = 1; i < flatItems.length; i++) {
+      const prev = venueKey(flatItems[i - 1]);
+      const cur = venueKey(flatItems[i]);
+      if (cur && prev && cur === prev) ids.add(flatItems[i].id);
+    }
+    return ids;
+  }, [flatItems]);
 
   // The block happening now (or the next one up if we're between blocks): the
   // first whose end is still in the future. This is the one that glows.
@@ -364,8 +400,18 @@ export default function ItineraryScreen() {
       }
       const c = item.place?.coords;
       if (c) {
+        const k = key(c);
+        // Dedupe by coordinate: when a run of items happens at the same venue
+        // (e.g. "Run to pull-up bar" + "Pull-up workout"), they collapse into
+        // ONE numbered pin instead of stacking 5 invisible markers on top of
+        // each other. Also skips items whose coords match the home pin so
+        // "Languages at home" doesn't pin on top of Home.
+        if (seen.has(k)) {
+          if (!leg?.polyline) routeCoords.push(c);
+          continue;
+        }
         n += 1;
-        seen.add(key(c)); // a numbered stop wins over a coincident station dot
+        seen.add(k);
         pins.push({
           id: item.id,
           kind: 'stop',
@@ -409,14 +455,39 @@ export default function ItineraryScreen() {
         date: todayISO(),
         debug: true,
       });
-      setItinerary(result.itinerary);
+      let itin = result.itinerary;
+      if (itin && result.usedAi && result.usedGrounded) {
+        // Grounded path: planner picked the right venues already. We just
+        // backfill the Google Maps fidelity it can't return (photo URL,
+        // ratingCount, opening hours, canonical Place coords) via a per-
+        // unique-venue lookup through the existing find-places edge fn.
+        const enriched = await enrichItineraryPlaces(itin);
+        itin = enriched.itinerary;
+        setEnrichStats(enriched.stats);
+        setRegroundStats(null);
+      } else if (itin && result.usedAi && !result.usedGrounded) {
+        // Legacy edge-function path: per-stop re-grounding against home as
+        // before. No enrichment needed — `find-places` already returns
+        // photos / ratings on this path.
+        const anchor = home
+          ? { latitude: home.latitude, longitude: home.longitude, label: home.label }
+          : await getCurrentCoords().catch(() => null);
+        const reg = await regroundItineraryPlaces(itin, anchor);
+        itin = reg.itinerary;
+        setRegroundStats(reg.stats);
+        setEnrichStats(null);
+      } else {
+        setRegroundStats(null);
+        setEnrichStats(null);
+      }
+      setItinerary(itin);
       setUsedAi(result.usedAi);
       setDebug(result.debug ?? null);
-      if (!result.itinerary) {
+      if (!itin) {
         setErrorMsg('No itinerary was produced. Check the debug section.');
       } else {
         // Keep it for later — it'll surface on the homepage's "Day trips".
-        saveItinerary(result.itinerary);
+        saveItinerary(itin);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
           () => undefined,
         );
@@ -434,6 +505,8 @@ export default function ItineraryScreen() {
   const reset = () => {
     setItinerary(null);
     setDebug(null);
+    setRegroundStats(null);
+    setEnrichStats(null);
     setErrorMsg(null);
     setUsedAi(false);
     resetTracking();
@@ -759,6 +832,7 @@ export default function ItineraryScreen() {
                   first={si === 0}
                   index={si}
                   gapsById={gapsById}
+                  continuationIds={continuationIds}
                   glow={glowPulse}
                   nowItemId={nowItemId}
                   nowMin={nowMin}
@@ -799,19 +873,94 @@ export default function ItineraryScreen() {
                     </View>
                   </Pressable>
                   {showDebug ? (
-                    <View
-                      style={[
-                        styles.debugBox,
-                        { backgroundColor: t.colors.fill1, borderRadius: t.radii.sm },
-                      ]}
-                    >
-                      <RNText
-                        style={[styles.debugText, { color: t.colors.textPrimary }]}
-                        selectable
+                    <>
+                      {enrichStats ? (
+                        <>
+                          <Text
+                            variant="micro"
+                            tone="secondary"
+                            uppercase
+                            weight="bold"
+                            style={{ marginTop: 12 }}
+                          >
+                            Enrichment (find-places lookup)
+                          </Text>
+                          <View
+                            style={[
+                              styles.debugBox,
+                              {
+                                backgroundColor: t.colors.fill1,
+                                borderRadius: t.radii.sm,
+                              },
+                            ]}
+                          >
+                            <RNText
+                              style={[
+                                styles.debugText,
+                                { color: t.colors.textPrimary },
+                              ]}
+                              selectable
+                            >
+                              {JSON.stringify(enrichStats, null, 2)}
+                            </RNText>
+                          </View>
+                        </>
+                      ) : null}
+                      {regroundStats ? (
+                        <>
+                          <Text
+                            variant="micro"
+                            tone="secondary"
+                            uppercase
+                            weight="bold"
+                            style={{ marginTop: 12 }}
+                          >
+                            Re-grounding (client-side)
+                          </Text>
+                          <View
+                            style={[
+                              styles.debugBox,
+                              {
+                                backgroundColor: t.colors.fill1,
+                                borderRadius: t.radii.sm,
+                              },
+                            ]}
+                          >
+                            <RNText
+                              style={[
+                                styles.debugText,
+                                { color: t.colors.textPrimary },
+                              ]}
+                              selectable
+                            >
+                              {JSON.stringify(regroundStats, null, 2)}
+                            </RNText>
+                          </View>
+                        </>
+                      ) : null}
+                      <Text
+                        variant="micro"
+                        tone="secondary"
+                        uppercase
+                        weight="bold"
+                        style={{ marginTop: 12 }}
                       >
-                        {JSON.stringify(debug.response, null, 2)}
-                      </RNText>
-                    </View>
+                        Plan response (server)
+                      </Text>
+                      <View
+                        style={[
+                          styles.debugBox,
+                          { backgroundColor: t.colors.fill1, borderRadius: t.radii.sm },
+                        ]}
+                      >
+                        <RNText
+                          style={[styles.debugText, { color: t.colors.textPrimary }]}
+                          selectable
+                        >
+                          {JSON.stringify(debug.response, null, 2)}
+                        </RNText>
+                      </View>
+                    </>
                   ) : null}
                 </Card>
               ) : null}
@@ -859,6 +1008,7 @@ function RoundButton({
 function SectionBlock({
   section,
   first,
+  continuationIds,
   index,
   gapsById,
   glow,
@@ -872,6 +1022,7 @@ function SectionBlock({
 }: {
   section: ItinerarySection;
   first: boolean;
+  continuationIds: Set<string>;
   index: number;
   gapsById: Record<string, number>;
   glow: SharedValue<number>;
@@ -921,7 +1072,7 @@ function SectionBlock({
                   onCardLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
                 }
               >
-                <ItemCard item={item} />
+                <ItemCard item={item} isContinuation={continuationIds.has(item.id)} />
                 {active ? <CardGlow glow={glow} /> : null}
               </View>
             </View>
@@ -1320,9 +1471,19 @@ function TravelLegRow({ leg, leaveBy }: { leg: TravelLeg; leaveBy?: string }) {
   );
 }
 
-function ItemCard({ item }: { item: ItineraryItem }) {
+function ItemCard({
+  item,
+  isContinuation,
+}: {
+  item: ItineraryItem;
+  /** True when the previous item was at the SAME venue. We suppress the place
+   * block (photo / name / rating / open status) so the same venue card doesn't
+   * repeat across consecutive items like "Run to pull-up bar" → "Pull-up
+   * workout" — the title alone makes the continuity clear. */
+  isContinuation?: boolean;
+}) {
   const t = useTheme();
-  const place = item.place;
+  const place = isContinuation ? undefined : item.place;
   const emoji = place?.emoji ?? KIND_EMOJI[item.kind];
   const timeRange =
     item.startTime && item.endTime

@@ -1,5 +1,11 @@
 import * as Location from 'expo-location';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
+import {
+  findPlacesGrounded,
+  isGeminiConfigured,
+  isGroundedError,
+  type GroundedPlace,
+} from '@/lib/groundedPlaces';
 
 export interface Coords {
   latitude: number;
@@ -29,7 +35,7 @@ export interface NearbyPlace {
   reasoning?: string;
 }
 
-export type PlacesProvider = 'google' | 'foursquare' | 'osm' | 'none';
+export type PlacesProvider = 'gemini' | 'google' | 'foursquare' | 'osm' | 'none';
 
 interface CachedCoords {
   coords: Coords;
@@ -128,6 +134,82 @@ export function clearPlacesCache(): void {
   placesCache.clear();
 }
 
+// ------------------------------------------------- grounded → NearbyPlace map
+//
+// The grounded finder (one Gemini + Google Search call) returns a lean shape:
+// name, address, coords, approx distance, rating, and a one-line "why". We map
+// it into the `NearbyPlace` the rest of the app already consumes so PlanCard,
+// the day store, and the compose pass need zero changes.
+
+/**
+ * A single grounded call occasionally hallucinates a coordinate in the wrong
+ * city. Anything past this from the user is almost certainly wrong for a
+ * "find a place near me" intent — this is the distance guard the old edge
+ * pipeline was missing (the Mladá Boleslav-from-Bohnice bug).
+ */
+const GROUNDED_MAX_DISTANCE_M = 30000;
+
+function haversineMeters(
+  aLat: number,
+  aLon: number,
+  bLat: number,
+  bLon: number,
+): number {
+  const R = 6371000;
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+function groundedToNearby(
+  places: GroundedPlace[],
+  coords: Coords,
+): NearbyPlace[] {
+  const out: NearbyPlace[] = [];
+  const seen = new Set<string>();
+  for (const p of places) {
+    const lat = p.latitude;
+    const lon = p.longitude;
+    const hasCoords = lat != null && lon != null;
+    // Trust our own haversine over the model's approxDistanceKm; fall back to
+    // the model's estimate only when it gave no coordinates.
+    const distanceM = hasCoords
+      ? Math.round(haversineMeters(coords.latitude, coords.longitude, lat!, lon!))
+      : p.approxDistanceKm != null
+      ? Math.round(p.approxDistanceKm * 1000)
+      : 0;
+    // Sanity guard: drop coordinates that are implausibly far away.
+    if (hasCoords && distanceM > GROUNDED_MAX_DISTANCE_M) continue;
+
+    const dedupeKey = `${p.name.toLowerCase()}|${Math.round(
+      (lat ?? 0) * 1000,
+    )},${Math.round((lon ?? 0) * 1000)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    out.push({
+      id: `gemini-${lat ?? 'x'},${lon ?? 'x'}-${p.name}`,
+      name: p.name,
+      address: p.address,
+      distanceM,
+      latitude: lat ?? coords.latitude,
+      longitude: lon ?? coords.longitude,
+      photoUrl: null,
+      rating: p.rating,
+      ratingCount: null,
+      priceLevel: null,
+      types: [],
+      openNow: null,
+      reasoning: p.why ?? undefined,
+    });
+  }
+  return out;
+}
+
 // ----------------------------------------------------------------- main API
 
 /**
@@ -150,9 +232,7 @@ export async function findPlaces(
   if (queries.length === 0) {
     return { places: [], category: null, provider: 'none', reason: 'no_results' };
   }
-  if (!isSupabaseConfigured || !supabase) {
-    return { places: [], category: null, provider: 'none', reason: 'no_supabase' };
-  }
+  // Both paths need the user's coordinates.
   const coords = await getCurrentCoords();
   if (!coords) {
     return { places: [], category: null, provider: 'none', reason: 'no_location' };
@@ -160,6 +240,51 @@ export async function findPlaces(
   const key = cacheKey(queries.join('|') + (intent ? `:${intent}` : ''), coords);
   const cached = readCache(key);
   if (cached) return cached;
+
+  // Preferred path: one grounded client-side call (Gemini + Google Search).
+  // No edge function, no regex categories, no composite score, no re-rank —
+  // the model reasons about intent + locality in a single step. We fall back
+  // to the edge pipeline only when Gemini is unconfigured or returns nothing.
+  if (isGeminiConfigured) {
+    const groundingQuery = (intent && intent.trim()) || queries[0];
+    const grounded = await findPlacesGrounded(
+      groundingQuery,
+      coords.latitude,
+      coords.longitude,
+    );
+    if (!isGroundedError(grounded)) {
+      const places = groundedToNearby(grounded.places, coords);
+      if (places.length > 0) {
+        const result: FindPlacesResult = {
+          places,
+          category: null,
+          provider: 'gemini',
+          debug: grounded.debug,
+        };
+        writeCache(key, result);
+        return result;
+      }
+      // Grounded returned no usable places — fall through to the edge pipeline
+      // when it's available, otherwise report no results.
+    } else if (!isSupabaseConfigured || !supabase) {
+      // Grounded errored and there's no fallback configured — surface it.
+      return {
+        places: [],
+        category: null,
+        provider: 'none',
+        reason: 'error',
+        detail: grounded.detail
+          ? `${grounded.error}: ${grounded.detail}`
+          : grounded.error,
+        debug: grounded.debug,
+      };
+    }
+  }
+
+  // Fallback path: existing Supabase `find-places` edge function.
+  if (!isSupabaseConfigured || !supabase) {
+    return { places: [], category: null, provider: 'none', reason: 'no_supabase' };
+  }
 
   try {
     const { data, error } = await supabase.functions.invoke('find-places', {

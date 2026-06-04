@@ -405,6 +405,12 @@ export default function HomeScreen() {
               size="sm"
               onPress={() => router.push('/itinerary')}
             />
+            <Button
+              title="Grounded place finder (experiment)"
+              variant="ghost"
+              size="sm"
+              onPress={() => router.push('/place-finder')}
+            />
           </View>
         ) : null}
       </ScrollView>
