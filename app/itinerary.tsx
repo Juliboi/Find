@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   type DimensionValue,
@@ -18,6 +18,7 @@ import Animated, {
   FadeIn,
   FadeInDown,
   runOnJS,
+  type SharedValue,
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
@@ -50,7 +51,13 @@ import {
   TravelStepMode,
 } from '@/types/itinerary';
 import type { SchedulerContext } from '@/lib/ai/scheduler';
-import { formatDuration, todayISO } from '@/utils/time';
+import {
+  addMinutes,
+  currentHHMM,
+  formatDuration,
+  minutesOfDay,
+  todayISO,
+} from '@/utils/time';
 
 /**
  * Flexibility pills are hidden for now; the field stays in the data model.
@@ -66,6 +73,43 @@ const SAMPLE_PROMPT =
 
 const SPRING = { damping: 22, stiffness: 220, mass: 0.7 };
 
+/**
+ * Geometry for the left timeline rail. Everything in the itinerary list is laid
+ * out around a single continuous vertical line at `center` (measured from the
+ * scroll content's left edge), with cards/text indented to `contentLeft` so the
+ * rail, its glowing progress head, and the travel/free-time nodes live in the
+ * gutter to their left.
+ */
+const RAIL = {
+  /** Distance the active "playhead" sits below the top of the scroll viewport. */
+  focus: 110,
+  edge: 16,
+  center: 24,
+  track: 3,
+  node: 22,
+  head: 12,
+  halo: 24,
+  contentLeft: 44,
+} as const;
+
+/** Matches the card radius (radii.lg) so the active-glow ring hugs the card. */
+const CARD_RADIUS = 18;
+
+/** How dim a past (already-elapsed) block is rendered. */
+const PAST_OPACITY = 0.4;
+
+/**
+ * The minute-of-day a block ends. Falls back to start (+duration) when no
+ * explicit end is given, so the time logic still works for partial entries.
+ */
+function itemEndMin(it: ItineraryItem): number {
+  const e = minutesOfDay(it.endTime);
+  if (e != null) return e;
+  const s = minutesOfDay(it.startTime);
+  if (s != null) return s + (it.durationMinutes ?? 0);
+  return Number.POSITIVE_INFINITY;
+}
+
 const PLANNING_PHASES = [
   'Drafting your day…',
   'Finding the best places…',
@@ -74,6 +118,9 @@ const PLANNING_PHASES = [
 ];
 
 const HOME_ID = '__home__';
+
+// Don't flag tiny slivers as "free time" — only gaps worth noticing.
+const GAP_MIN_MINUTES = 20;
 
 /** Decodes a Google-encoded polyline into lat/lng points for the map line. */
 function decodePolyline(encoded: string): LatLng[] {
@@ -134,8 +181,14 @@ export default function ItineraryScreen() {
   const [showDebug, setShowDebug] = useState(false);
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
   const [activeStopId, setActiveStopId] = useState<string | null>(null);
+  // Current wall-clock time (minutes since midnight). Drives the time-based
+  // progress fill, the glowing "now / next" card, and greying-out of the past.
+  const [nowMin, setNowMin] = useState(() => minutesOfDay(currentHHMM()) ?? 0);
   const [sheetExpanded, setSheetExpanded] = useState(!preloaded);
   const [phase, setPhase] = useState(0);
+  // Keep the home anchor collapsed so the prompt field leads (and isn't pushed
+  // under the keyboard). Auto-expand only when there's no home set yet.
+  const [homeExpanded, setHomeExpanded] = useState(!home);
 
   // Cycle the status copy while planning so the wait feels alive.
   useEffect(() => {
@@ -158,10 +211,27 @@ export default function ItineraryScreen() {
   const sheetTop = useSharedValue(preloaded ? collapsedTop : expandedTop);
   const dragStart = useSharedValue(0);
 
+  // `timeFillY` is the rail's glowing fill height in content coordinates — the
+  // y the current time maps to. `glowPulse` drives the slow neon breathing
+  // applied to the playhead, the active card border, and the active node.
+  const timeFillY = useSharedValue(0);
+  const contentH = useSharedValue(screenH);
+  const glowPulse = useSharedValue(0);
+  const nowRef = useRef(nowMin);
+
+  // A single, ever-running pulse shared by every glowing element so the whole
+  // timeline breathes in sync rather than each piece animating on its own.
+  useEffect(() => {
+    glowPulse.value = withRepeat(withTiming(1, { duration: 1500 }), -1, true);
+  }, [glowPulse]);
+
   const listRef = useRef<ScrollView>(null);
   const tabsRef = useRef<ScrollView>(null);
   const sectionOffsetsRef = useRef<number[]>([]);
   const itemOffsetsRef = useRef<Record<string, number>>({});
+  // Each card's offset/height *within its wrapper* — combined with the wrapper
+  // offset above, this gives the card's absolute top/bottom for time mapping.
+  const cardRawRef = useRef<Record<string, { relY: number; h: number }>>({});
   const tabOffsetsRef = useRef<number[]>([]);
 
   const context: SchedulerContext = { home, endOfDay };
@@ -170,6 +240,88 @@ export default function ItineraryScreen() {
     () => (itinerary ? itinerary.sections.flatMap((s) => s.items) : []),
     [itinerary],
   );
+  const flatItemsRef = useRef(flatItems);
+  flatItemsRef.current = flatItems;
+
+  // The block happening now (or the next one up if we're between blocks): the
+  // first whose end is still in the future. This is the one that glows.
+  const nowItemId = useMemo(() => {
+    for (const it of flatItems) if (itemEndMin(it) > nowMin) return it.id;
+    return null;
+  }, [flatItems, nowMin]);
+
+  const nowSectionIndex = useMemo(() => {
+    if (!itinerary || !nowItemId) return -1;
+    return itinerary.sections.findIndex((s) => s.items.some((it) => it.id === nowItemId));
+  }, [itinerary, nowItemId]);
+
+  // Map the current time onto the rail by interpolating between each card's
+  // measured top/bottom and its start/end time, so the glowing head sits right
+  // on the block that's happening now. Reads refs only (never triggers render).
+  const recomputeTimeFill = useCallback(() => {
+    const anchors: { t: number; y: number }[] = [];
+    for (const it of flatItemsRef.current) {
+      const wrapY = itemOffsetsRef.current[it.id];
+      const raw = cardRawRef.current[it.id];
+      if (wrapY == null || raw == null) continue;
+      const top = wrapY + raw.relY;
+      const s = minutesOfDay(it.startTime);
+      const e = itemEndMin(it);
+      if (s != null) anchors.push({ t: s, y: top });
+      if (Number.isFinite(e) && (s == null || e > s)) anchors.push({ t: e, y: top + raw.h });
+    }
+    if (anchors.length === 0) return;
+    anchors.sort((a, b) => a.t - b.t);
+    const now = nowRef.current;
+    const first = anchors[0];
+    const last = anchors[anchors.length - 1];
+    let y = last.y;
+    if (now <= first.t) y = first.y;
+    else if (now < last.t) {
+      for (let i = 1; i < anchors.length; i++) {
+        const a = anchors[i - 1];
+        const b = anchors[i];
+        if (now <= b.t) {
+          const f = b.t === a.t ? 1 : (now - a.t) / (b.t - a.t);
+          y = a.y + f * (b.y - a.y);
+          break;
+        }
+      }
+    }
+    timeFillY.value = withTiming(y, { duration: 700 });
+  }, [timeFillY]);
+
+  // Tick the clock so the progress advances on its own, in real time.
+  useEffect(() => {
+    if (!itinerary) return;
+    const tick = () => {
+      const m = minutesOfDay(currentHHMM()) ?? 0;
+      nowRef.current = m;
+      setNowMin(m);
+      recomputeTimeFill();
+    };
+    tick();
+    const id = setInterval(tick, 30000);
+    return () => clearInterval(id);
+  }, [itinerary, recomputeTimeFill]);
+
+  // Idle "free time" between two blocks = next.start − prev.end − travel.
+  // Surfacing these gaps tells the user where the day breathes (and shows
+  // when a block could move earlier). Keyed by the item the gap precedes.
+  const gapsById = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (let i = 1; i < flatItems.length; i++) {
+      const prev = flatItems[i - 1];
+      const cur = flatItems[i];
+      const prevEnd = minutesOfDay(prev.endTime) ?? minutesOfDay(prev.startTime);
+      const curStart = minutesOfDay(cur.startTime);
+      if (prevEnd == null || curStart == null) continue;
+      const travel = Number(cur.travelFromPrev?.minutes) || 0;
+      const gap = curStart - prevEnd - travel;
+      if (gap >= GAP_MIN_MINUTES) map[cur.id] = gap;
+    }
+    return map;
+  }, [flatItems]);
 
   // Everything the map draws: the home pin, numbered activity stops, the
   // transit stations along the way (waypoints), and the real route line
@@ -236,9 +388,11 @@ export default function ItineraryScreen() {
   const resetTracking = () => {
     sectionOffsetsRef.current = [];
     itemOffsetsRef.current = {};
+    cardRawRef.current = {};
     tabOffsetsRef.current = [];
     setActiveSectionIndex(0);
     setActiveStopId(null);
+    timeFillY.value = 0;
   };
 
   const planIt = async () => {
@@ -288,7 +442,7 @@ export default function ItineraryScreen() {
 
   const onScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     if (!itinerary) return;
-    const probe = e.nativeEvent.contentOffset.y + 96;
+    const probe = e.nativeEvent.contentOffset.y + RAIL.focus;
 
     let sec = 0;
     for (let i = 0; i < itinerary.sections.length; i++) {
@@ -303,21 +457,15 @@ export default function ItineraryScreen() {
       Haptics.selectionAsync().catch(() => undefined);
     }
 
-    // Default to the home pin while scrolled through the at-home morning
-    // blocks (which have no coords), then switch as each located stop passes.
+    // Track which anchor is in view: a located stop focuses its own pin; any
+    // placeless block (the at-home morning, cooking after the walk, the evening
+    // wind-down, the "Back home" arrival) focuses the home pin — so the map
+    // follows you back home exactly when the cards do.
     let stopId: string | null = home ? HOME_ID : null;
     for (const item of flatItems) {
-      if (!item.place?.coords) continue;
       const off = itemOffsetsRef.current[item.id];
-      if (off != null && off <= probe) stopId = item.id;
-    }
-    // Returning home: once the "Back home" arrival (placeless, but reached by
-    // a travel leg) scrolls into view, snap focus back to the home pin so the
-    // map shows the day ending at home instead of lingering on the last stop.
-    const last = flatItems[flatItems.length - 1];
-    if (home && last && !last.place?.coords && last.travelFromPrev) {
-      const off = itemOffsetsRef.current[last.id];
-      if (off != null && off <= probe) stopId = HOME_ID;
+      if (off == null || off > probe) continue;
+      stopId = item.place?.coords ? item.id : home ? HOME_ID : stopId;
     }
     if (stopId !== activeStopId) setActiveStopId(stopId);
   };
@@ -374,6 +522,10 @@ export default function ItineraryScreen() {
   const sheetStyle = useAnimatedStyle(() => ({ height: screenH - sheetTop.value }));
 
   const sections = itinerary?.sections ?? [];
+
+  // The rail only makes sense once a real plan is on screen (not while the
+  // prompt form or the loading skeleton is showing).
+  const showRail = !!itinerary && !loading;
 
   // Expanded → the general AI trip title; collapsed → the section you're on
   // (so peeking at the drawer tells you where you are as you scroll).
@@ -437,6 +589,7 @@ export default function ItineraryScreen() {
                     weight="bold"
                     uppercase
                     tone={usedAi ? 'accent' : 'secondary'}
+                    style={usedAi ? { color: t.colors.accent } : undefined}
                   >
                     {usedAi ? 'AI' : 'Sample'}
                   </Text>
@@ -471,7 +624,7 @@ export default function ItineraryScreen() {
                       <RNText
                         style={[
                           styles.tabText,
-                          { color: active ? t.colors.accentText : t.colors.textSecondary },
+                          { color: active ? t.colors.accent : t.colors.textSecondary },
                         ]}
                         numberOfLines={1}
                       >
@@ -488,28 +641,60 @@ export default function ItineraryScreen() {
         <ScrollView
           ref={listRef}
           contentContainerStyle={{
-            paddingHorizontal: t.spacing.lg,
+            paddingHorizontal: showRail ? 0 : t.spacing.lg,
             paddingTop: 8,
             paddingBottom: insets.bottom + 80,
           }}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
           onScroll={onScroll}
+          onContentSizeChange={(_w, h) => {
+            contentH.value = h;
+          }}
           scrollEventThrottle={16}
         >
           {loading ? (
             <PlanningSkeleton />
           ) : !itinerary ? (
             <View style={{ gap: 16 }}>
-              <HomePicker title="Home" />
               <Card padded>
-                <Text variant="title3" weight="bold" tight>
-                  Describe your whole day
-                </Text>
-                <Text variant="bodySm" tone="secondary" style={{ marginTop: 6 }}>
-                  One free-form prompt — the AI plans the day, and the app draws the
-                  real route and travel between every stop.
-                </Text>
+                {homeExpanded ? (
+                  <View style={{ gap: 12 }}>
+                    <HomePicker title="Home" flat />
+                    <Button
+                      title="Done"
+                      variant="tonal"
+                      size="md"
+                      onPress={() => setHomeExpanded(false)}
+                    />
+                  </View>
+                ) : (
+                  <Pressable
+                    onPress={() => setHomeExpanded(true)}
+                    style={({ pressed }) => [
+                      styles.homeSummary,
+                      pressed && { opacity: 0.6 },
+                    ]}
+                  >
+                    <Ionicons name="location" size={18} color={t.colors.accent} />
+                    <View style={{ flex: 1 }}>
+                      <Text variant="caption" tone="tertiary" uppercase weight="bold">
+                        Starting from
+                      </Text>
+                      <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                        {home?.label ?? 'Tap to set your home'}
+                      </Text>
+                    </View>
+                    <Ionicons
+                      name="settings-outline"
+                      size={18}
+                      color={t.colors.textSecondary}
+                    />
+                  </Pressable>
+                )}
+              </Card>
+              <Card padded>
+           
                 <TextInput
                   style={[
                     styles.input,
@@ -545,14 +730,24 @@ export default function ItineraryScreen() {
               ) : null}
             </View>
           ) : (
-            <>
+            <View style={styles.timeline}>
+              <TimelineRail timeFillY={timeFillY} contentH={contentH} glow={glowPulse} />
+
               {itinerary.summary ? (
-                <Text variant="bodySm" tone="secondary" style={{ marginBottom: 2 }}>
+                <Text
+                  variant="bodySm"
+                  tone="secondary"
+                  style={[styles.timelineText, { marginBottom: 2 }]}
+                >
                   {itinerary.summary}
                 </Text>
               ) : null}
               {itinerary.origin ? (
-                <Text variant="caption" tone="tertiary" style={{ marginTop: 4 }}>
+                <Text
+                  variant="caption"
+                  tone="tertiary"
+                  style={[styles.timelineText, { marginTop: 4 }]}
+                >
                   From {itinerary.origin}
                 </Text>
               ) : null}
@@ -563,17 +758,31 @@ export default function ItineraryScreen() {
                   section={section}
                   first={si === 0}
                   index={si}
+                  gapsById={gapsById}
+                  glow={glowPulse}
+                  nowItemId={nowItemId}
+                  nowMin={nowMin}
+                  sectionActive={si === nowSectionIndex}
+                  sectionPast={
+                    section.items.length > 0 &&
+                    section.items.every((it) => itemEndMin(it) <= nowMin)
+                  }
                   onSectionLayout={(y) => {
                     sectionOffsetsRef.current[si] = y;
                   }}
                   onItemLayout={(id, y) => {
                     itemOffsetsRef.current[id] = y;
+                    recomputeTimeFill();
+                  }}
+                  onCardLayout={(id, relY, h) => {
+                    cardRawRef.current[id] = { relY, h };
+                    recomputeTimeFill();
                   }}
                 />
               ))}
 
               {debug ? (
-                <Card padded style={{ marginTop: 18 }}>
+                <Card padded style={{ marginTop: 18, marginLeft: RAIL.contentLeft }}>
                   <Pressable
                     onPress={() => setShowDebug((v) => !v)}
                     style={({ pressed }) => [pressed && { opacity: 0.6 }]}
@@ -606,7 +815,7 @@ export default function ItineraryScreen() {
                   ) : null}
                 </Card>
               ) : null}
-            </>
+            </View>
           )}
         </ScrollView>
       </Animated.View>
@@ -651,14 +860,28 @@ function SectionBlock({
   section,
   first,
   index,
+  gapsById,
+  glow,
+  nowItemId,
+  nowMin,
+  sectionActive,
+  sectionPast,
   onSectionLayout,
   onItemLayout,
+  onCardLayout,
 }: {
   section: ItinerarySection;
   first: boolean;
   index: number;
+  gapsById: Record<string, number>;
+  glow: SharedValue<number>;
+  nowItemId: string | null;
+  nowMin: number;
+  sectionActive: boolean;
+  sectionPast: boolean;
   onSectionLayout: (y: number) => void;
   onItemLayout: (id: string, y: number) => void;
+  onCardLayout: (id: string, relY: number, h: number) => void;
 }) {
   const base = Math.min(index * 50, 150);
   return (
@@ -668,19 +891,43 @@ function SectionBlock({
         style={{ marginTop: first ? 12 : 20 }}
         onLayout={(e) => onSectionLayout(e.nativeEvent.layout.y)}
       >
-        <SectionHeader period={section.period} title={section.title} />
+        <View style={styles.sectionRow}>
+          <SectionNode active={sectionActive} past={sectionPast} glow={glow} />
+          <View style={[styles.timelineText, sectionPast && styles.pastDim]}>
+            <SectionHeader period={section.period} title={section.title} active={sectionActive} />
+          </View>
+        </View>
       </Animated.View>
-      {section.items.map((item, i) => (
-        <Animated.View
-          key={item.id}
-          entering={FadeInDown.duration(280).delay(Math.min(base + (i + 1) * 40, 360))}
-          style={{ marginTop: 8 }}
-          onLayout={(e) => onItemLayout(item.id, e.nativeEvent.layout.y)}
-        >
-          {item.travelFromPrev ? <TravelLegRow leg={item.travelFromPrev} /> : null}
-          <ItemCard item={item} />
-        </Animated.View>
-      ))}
+      {section.items.map((item, i) => {
+        const active = item.id === nowItemId;
+        const past = itemEndMin(item) <= nowMin;
+        const leg = item.travelFromPrev;
+        // When you should leave the previous stop to arrive on time.
+        const leaveBy =
+          leg && item.startTime ? addMinutes(item.startTime, -leg.minutes) : undefined;
+        return (
+          <Animated.View
+            key={item.id}
+            entering={FadeInDown.duration(280).delay(Math.min(base + (i + 1) * 40, 360))}
+            style={{ marginTop: 8 }}
+            onLayout={(e) => onItemLayout(item.id, e.nativeEvent.layout.y)}
+          >
+            <View style={past && styles.pastDim}>
+              {gapsById[item.id] ? <GapRow minutes={gapsById[item.id]} /> : null}
+              {leg ? <TravelLegRow leg={leg} leaveBy={leaveBy} /> : null}
+              <View
+                style={styles.cardWrap}
+                onLayout={(e) =>
+                  onCardLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
+                }
+              >
+                <ItemCard item={item} />
+                {active ? <CardGlow glow={glow} /> : null}
+              </View>
+            </View>
+          </Animated.View>
+        );
+      })}
     </>
   );
 }
@@ -732,11 +979,26 @@ function PlanningSkeleton() {
   );
 }
 
-function SectionHeader({ period, title }: { period?: string; title: string }) {
+function SectionHeader({
+  period,
+  title,
+  active,
+}: {
+  period?: string;
+  title: string;
+  active?: boolean;
+}) {
+  const t = useTheme();
   return (
     <View style={styles.sectionHeader}>
       {period ? (
-        <Text variant="micro" tone="tertiary" uppercase weight="bold">
+        <Text
+          variant="micro"
+          tone={active ? 'accent' : 'tertiary'}
+          uppercase
+          weight="bold"
+          style={active ? { color: t.colors.accent } : undefined}
+        >
           {period}
         </Text>
       ) : null}
@@ -744,6 +1006,123 @@ function SectionHeader({ period, title }: { period?: string; title: string }) {
         {title}
       </Text>
     </View>
+  );
+}
+
+/**
+ * The continuous, glowing progress line down the left of the itinerary.
+ *
+ * A dim full-height `track` shows the whole day; a neon `fill` grows from the
+ * top down to wherever the *current time* maps onto the timeline, capped by a
+ * glowing `head` (the "playhead" = now). It's anchored to the content, so the
+ * marker stays glued to its time-spot as the day scrolls — and it creeps down
+ * on its own as real time passes.
+ */
+function TimelineRail({
+  timeFillY,
+  contentH,
+  glow,
+}: {
+  timeFillY: SharedValue<number>;
+  contentH: SharedValue<number>;
+  glow: SharedValue<number>;
+}) {
+  const t = useTheme();
+  const trackStyle = useAnimatedStyle(() => ({ height: Math.max(contentH.value, 0) }));
+  const fillStyle = useAnimatedStyle(() => {
+    const h = Math.max(0, Math.min(timeFillY.value, contentH.value));
+    return { height: h, shadowOpacity: 0.35 + glow.value * 0.4 };
+  });
+  const headStyle = useAnimatedStyle(() => ({
+    opacity: 0.85 + glow.value * 0.15,
+    shadowOpacity: 0.5 + glow.value * 0.5,
+    transform: [{ scale: 0.92 + glow.value * 0.22 }],
+  }));
+  const haloStyle = useAnimatedStyle(() => ({
+    opacity: 0.1 + glow.value * 0.22,
+    transform: [{ scale: 0.7 + glow.value * 0.6 }],
+  }));
+  return (
+    <View pointerEvents="none" style={styles.railContainer}>
+      <Animated.View
+        style={[styles.railTrack, { backgroundColor: t.colors.separator }, trackStyle]}
+      />
+      <Animated.View
+        style={[
+          styles.railFill,
+          { backgroundColor: t.colors.accent, shadowColor: t.colors.accent },
+          fillStyle,
+        ]}
+      >
+        <Animated.View
+          style={[styles.railHalo, { backgroundColor: t.colors.accent }, haloStyle]}
+        />
+        <Animated.View
+          style={[
+            styles.railHead,
+            { backgroundColor: t.colors.accent, shadowColor: t.colors.accent },
+            headStyle,
+          ]}
+        />
+      </Animated.View>
+    </View>
+  );
+}
+
+/**
+ * A ring node on the rail marking a section. Lights up (glowing accent ring)
+ * while it's the current section, shows a filled accent dot once it's behind
+ * us, and sits as a quiet hollow ring for sections still ahead.
+ */
+function SectionNode({
+  active,
+  past,
+  glow,
+}: {
+  active: boolean;
+  past?: boolean;
+  glow: SharedValue<number>;
+}) {
+  const t = useTheme();
+  const aStyle = useAnimatedStyle(() =>
+    active
+      ? { shadowOpacity: 0.4 + glow.value * 0.5, transform: [{ scale: 1 + glow.value * 0.1 }] }
+      : { shadowOpacity: 0, transform: [{ scale: 1 }] },
+  );
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[
+        styles.sectionNode,
+        {
+          backgroundColor: past && !active ? t.colors.accent : t.colors.surface1,
+          borderColor: active || past ? t.colors.accent : t.colors.separator,
+          shadowColor: t.colors.accent,
+          opacity: past && !active ? 0.6 : 1,
+        },
+        aStyle,
+      ]}
+    />
+  );
+}
+
+/** Pulsing neon ring drawn over the card the playhead is currently on. */
+function CardGlow({ glow }: { glow: SharedValue<number> }) {
+  const t = useTheme();
+  const aStyle = useAnimatedStyle(() => ({
+    opacity: 0.7 + glow.value * 0.3,
+    shadowOpacity: 0.3 + glow.value * 0.45,
+  }));
+  return (
+    <Animated.View
+      pointerEvents="none"
+      entering={FadeIn.duration(200)}
+      style={[
+        styles.cardGlow,
+        { borderColor: t.colors.accent, shadowColor: t.colors.accent },
+        aStyle,
+      ]}
+    />
   );
 }
 
@@ -851,40 +1230,74 @@ function travelStepText(step: TravelStep): string {
   return step.durationMinutes ? `${head}  ·  ${step.durationMinutes} min` : head || 'Transit';
 }
 
+/** A light connector marking idle/free time the user has between two blocks. */
+function GapRow({ minutes }: { minutes: number }) {
+  const t = useTheme();
+  return (
+    <View style={[styles.connRow, styles.connRowCenter]}>
+      <View style={styles.connRail} accessibilityElementsHidden>
+        <View
+          style={[
+            styles.connDotSm,
+            { backgroundColor: t.colors.surface1, borderColor: t.colors.separator },
+          ]}
+        >
+          <RNText style={styles.connDotEmojiSm}>⏳</RNText>
+        </View>
+      </View>
+      <View style={styles.connBody}>
+        <RNText style={[styles.gapText, { color: t.colors.textTertiary }]}>
+          {`${formatDuration(minutes)} free`}
+        </RNText>
+      </View>
+    </View>
+  );
+}
+
 /**
  * Connector that sits BETWEEN two place cards and shows how you get from one
- * to the next — a simple hop on one line, or a full journey broken into its
- * transit legs (🚶 → 🚌 → 🚇 → 🚆), maps-app style.
+ * to the next — when to leave, a simple hop on one line, or a full journey
+ * broken into its transit legs (🚶 → 🚌 → 🚇 → 🚆), maps-app style.
  */
-function TravelLegRow({ leg }: { leg: TravelLeg }) {
+function TravelLegRow({ leg, leaveBy }: { leg: TravelLeg; leaveBy?: string }) {
   const t = useTheme();
   const steps = leg.steps ? mergeWalkSteps(leg.steps) : [];
   const hasSteps = steps.length > 0;
   const bubbleEmoji = TRAVEL_MODE_EMOJI[leg.mode] ?? '➡️';
   const label = TRAVEL_MODE_LABEL[leg.mode] ?? 'travel';
   return (
-    <View style={styles.legWrap}>
-      <View style={styles.legRail} accessibilityElementsHidden>
-        <View style={[styles.legLine, { backgroundColor: t.colors.separator }]} />
+    <View style={styles.connRow}>
+      <View style={styles.connRail} accessibilityElementsHidden>
         <View
           style={[
-            styles.legDot,
+            styles.connDot,
             { backgroundColor: t.colors.surface1, borderColor: t.colors.separator },
           ]}
         >
-          <RNText style={styles.legDotEmoji}>{bubbleEmoji}</RNText>
+          <RNText style={styles.connDotEmoji}>{bubbleEmoji}</RNText>
         </View>
-        <View style={[styles.legLine, { backgroundColor: t.colors.separator }]} />
       </View>
-      <View style={styles.legBody}>
-        <RNText style={[styles.legHead, { color: t.colors.textSecondary }]}>
-          {`${formatLegMinutes(leg.minutes)} ${label}`}
-          {leg.fromLabel ? (
-            <RNText style={{ color: t.colors.textTertiary, fontWeight: '400' }}>
-              {` from ${leg.fromLabel}`}
+      <View style={styles.connBody}>
+        {leaveBy ? (
+          <View style={styles.leaveRow}>
+            <Ionicons name="walk" size={13} color={t.colors.accent} />
+            <RNText style={[styles.leaveText, { color: t.colors.accent }]}>
+              {`Leave by ${leaveBy}`}
             </RNText>
-          ) : null}
-        </RNText>
+            <RNText style={[styles.leaveMeta, { color: t.colors.textTertiary }]}>
+              {`  ·  ${formatLegMinutes(leg.minutes)} ${label}`}
+            </RNText>
+          </View>
+        ) : (
+          <RNText style={[styles.legHead, { color: t.colors.textSecondary }]}>
+            {`${formatLegMinutes(leg.minutes)} ${label}`}
+          </RNText>
+        )}
+        {leg.fromLabel ? (
+          <RNText style={[styles.legFrom, { color: t.colors.textTertiary }]}>
+            {`from ${leg.fromLabel}`}
+          </RNText>
+        ) : null}
         {hasSteps ? (
           <View style={styles.legSteps}>
             {steps.map((s, i) => (
@@ -920,14 +1333,22 @@ function ItemCard({ item }: { item: ItineraryItem }) {
   return (
     <Card padded>
       <View style={styles.itemTopRow}>
-        <Text variant="caption" tone="secondary" weight="semibold">
-          {timeRange}
-          {item.durationMinutes ? `  ·  ${formatDuration(item.durationMinutes)}` : ''}
+        <Text variant="caption" tone="secondary" weight="semibold" style={styles.timeText}>
+          {timeRange || ' '}
         </Text>
-        {SHOW_FLEX_BADGES ? <FlexBadge flexibility={item.flexibility} /> : null}
+        {item.durationMinutes ? (
+          <View style={[styles.durationPill, { backgroundColor: t.colors.fill1 }]}>
+            <Ionicons name="time-outline" size={12} color={t.colors.textSecondary} />
+            <Text variant="micro" tone="secondary" weight="semibold">
+              {formatDuration(item.durationMinutes)}
+            </Text>
+          </View>
+        ) : SHOW_FLEX_BADGES ? (
+          <FlexBadge flexibility={item.flexibility} />
+        ) : null}
       </View>
 
-      <Text variant="body" weight="semibold" style={{ marginTop: 6 }}>
+      <Text variant="body" weight="semibold" style={{ marginTop: 8 }}>
         {item.title}
       </Text>
 
@@ -1080,6 +1501,11 @@ const styles = StyleSheet.create({
     fontSize: 16,
     minHeight: 110,
   },
+  homeSummary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
   sectionHeader: {
     gap: 2,
   },
@@ -1088,6 +1514,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 8,
+    marginBottom: 2,
+  },
+  timeText: {
+    fontSize: 14,
+    letterSpacing: 0.3,
+  },
+  durationPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 999,
   },
   placeRow: {
     flexDirection: 'row',
@@ -1138,21 +1577,103 @@ const styles = StyleSheet.create({
     paddingVertical: 5,
     borderRadius: 999,
   },
-  legWrap: {
-    flexDirection: 'row',
-    gap: 10,
-    paddingLeft: 4,
+  // ---- Left timeline rail ------------------------------------------------
+  timeline: {
+    position: 'relative',
+    paddingRight: RAIL.edge,
   },
-  legRail: {
-    width: 24,
+  // Everything that isn't a rail node is indented past the gutter.
+  timelineText: {
+    marginLeft: RAIL.contentLeft,
+  },
+  // Blocks whose time has already elapsed are dimmed back.
+  pastDim: {
+    opacity: PAST_OPACITY,
+  },
+  railContainer: {
+    position: 'absolute',
+    top: 0,
+    left: RAIL.center - RAIL.node / 2,
+    width: RAIL.node,
+  },
+  railTrack: {
+    position: 'absolute',
+    top: 0,
+    left: (RAIL.node - RAIL.track) / 2,
+    width: RAIL.track,
+    borderRadius: RAIL.track / 2,
+    opacity: 0.7,
+  },
+  railFill: {
+    position: 'absolute',
+    top: 0,
+    left: (RAIL.node - RAIL.track) / 2,
+    width: RAIL.track,
+    borderRadius: RAIL.track / 2,
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 6,
+  },
+  railHalo: {
+    position: 'absolute',
+    bottom: -(RAIL.halo / 2),
+    left: (RAIL.track - RAIL.halo) / 2,
+    width: RAIL.halo,
+    height: RAIL.halo,
+    borderRadius: RAIL.halo / 2,
+  },
+  railHead: {
+    position: 'absolute',
+    bottom: -(RAIL.head / 2),
+    left: (RAIL.track - RAIL.head) / 2,
+    width: RAIL.head,
+    height: RAIL.head,
+    borderRadius: RAIL.head / 2,
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 8,
+  },
+  // ---- Rail nodes & active glow -----------------------------------------
+  sectionRow: {
+    position: 'relative',
+  },
+  sectionNode: {
+    position: 'absolute',
+    top: 3,
+    left: RAIL.center - 7,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 2,
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 8,
+  },
+  cardWrap: {
+    marginLeft: RAIL.contentLeft,
+    position: 'relative',
+  },
+  cardGlow: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    borderRadius: CARD_RADIUS,
+    borderWidth: 1.5,
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 12,
+  },
+  // ---- Connectors (travel / free time) aligned to the rail ---------------
+  connRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  connRowCenter: {
     alignItems: 'center',
   },
-  legLine: {
-    width: StyleSheet.hairlineWidth * 2,
-    flex: 1,
-    minHeight: 6,
+  connRail: {
+    width: RAIL.contentLeft,
   },
-  legDot: {
+  connDot: {
+    marginLeft: RAIL.center - 12,
     width: 24,
     height: 24,
     borderRadius: 12,
@@ -1161,17 +1682,52 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginVertical: 2,
   },
-  legDotEmoji: {
+  connDotSm: {
+    marginLeft: RAIL.center - 10,
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  connDotEmoji: {
     fontSize: 12,
   },
-  legBody: {
+  connDotEmojiSm: {
+    fontSize: 10,
+  },
+  connBody: {
     flex: 1,
     paddingVertical: 6,
-    gap: 4,
+    gap: 3,
+  },
+  gapText: {
+    fontSize: 12.5,
+    fontWeight: '500',
+  },
+  leaveRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    flexWrap: 'wrap',
+  },
+  leaveText: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    letterSpacing: 0.2,
+  },
+  leaveMeta: {
+    fontSize: 13,
+    fontWeight: '500',
   },
   legHead: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  legFrom: {
+    fontSize: 12.5,
+    fontWeight: '400',
   },
   legSteps: {
     gap: 3,

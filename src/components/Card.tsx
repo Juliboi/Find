@@ -61,6 +61,7 @@ export function Card({
       borderColor: colors.separator,
     },
     padded ? { padding: spacing.lg } : null,
+    
     style,
   ];
 

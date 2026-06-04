@@ -9,6 +9,16 @@ export function formatTime(hhmm?: string): string {
   return `${hour12}:${m.toString().padStart(2, '0')} ${period}`;
 }
 
+/** "HH:MM" -> minutes since midnight, or null if unparseable. */
+export function minutesOfDay(hhmm?: string | null): number | null {
+  if (!hhmm) return null;
+  const [hStr, mStr] = hhmm.split(':');
+  const h = Number(hStr);
+  const m = Number(mStr);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
 export function addMinutes(hhmm: string, minutes: number): string {
   const [hStr, mStr] = hhmm.split(':');
   const total = Number(hStr) * 60 + Number(mStr) + minutes;

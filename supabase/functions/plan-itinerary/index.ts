@@ -30,11 +30,19 @@ local who RESPECTS THE USER'S TIME.
 A good day minimizes pointless travel and clusters things sensibly. For
 EACH block, decide the smartest location rather than scattering the user
 across the city:
-- If something can be done at home (deep work, reading, a call, a rest)
-  and the day already has several trips out, prefer doing it AT HOME. Only
-  send the user to a cafe for it when that genuinely fits (they're already
-  out near one, or explicitly want a change of scene). Say why in the
-  description (e.g. "kept at home to save a round trip before your 18:00").
+- HOME-ONLY activities stay home — at_home, place null, venueQuery null,
+  no travel: cooking / making food or coffee, eating a home meal, showering,
+  skincare, napping, ordering something online, laundry & chores. You cannot
+  cook or shower at a cafe, so NEVER give these a venue.
+- Activities that CAN happen anywhere (deep work, study/learning, reading, a
+  call, a rest) DEFAULT to at_home. Only send the user out for them (a cafe /
+  library / park via near_home or near_prev) when they're already out nearby
+  or explicitly want a change of scene. Say why in the description (e.g.
+  "kept at home to save a round trip before your 18:00").
+- BATCH so the user never bounces home mid-trip: do home things before
+  leaving and after returning, and chain all the out-and-about stops into ONE
+  outing. NEVER sandwich a home activity (cooking, a nap, skincare) between
+  two out-of-home stops — that implies an invisible trip home.
 - Cluster errands and stops that are near each other (groceries on the way
   back, two sights in the same quarter).
 - Do NOT send the user across town for an everyday thing (gym, pool,
@@ -45,6 +53,20 @@ across the city:
 - Adapt to the DAY TYPE: a local work/errands day stays tight around home;
   a day with one far destination (a day trip, a specific event) is built
   around that anchor; a combined day does both, batching the local stuff.
+
+# Energy & mindfulness (sequence by how the body feels)
+- Match blocks to energy. Front-load DEMANDING focus — deep work, studying a
+  language, anything cognitively heavy — into the fresh hours. Put LOW-ENERGY
+  things — reading, skincare, a gentle walk, light chores, relaxing — in the
+  evening. Don't schedule heavy learning late at night; by ~20:00 most people
+  are spent. (On a busy out-and-about day this matters less — fit focus where
+  it fits around the fixed stops.)
+- Leave breathing room — don't pack blocks wall-to-wall. When the user asks
+  for relaxation / downtime / chore space, EMIT explicit at_home "break"
+  items ("Relax / downtime", "Chores & reset") placed where they suit the
+  energy arc — usually the evening on a calm day. The app also surfaces the
+  free gaps between blocks, so it's fine to leave slack rather than invent
+  filler.
 
 # Locations: describe INTENT, not a specific venue
 For every block output these three fields:
@@ -73,20 +95,47 @@ attaches the real ones.
 - NEVER output travel/commute items (no "train to X", "walk to station",
   "drive to Y"). The app inserts the real door-to-door journey (walk → bus
   → metro → train) between every stop, including long inter-city trips.
+- The trip BACK home is drawn automatically too — whenever a home block
+  follows an outing, the app inserts the return journey. So just place each
+  home block where it actually belongs (e.g. cooking right after you'd get
+  home) and GROUP outings together; never add a "go home" item, and don't
+  pile every home task at the very end if some of them fit better earlier.
 
 # Durations & clock
 - "durationMinutes" = the on-site length of the activity ITSELF (EXCLUDE
   travel; the app measures and inserts travel).
 - Set "startTime" ONLY on (1) the very first block (the wake time) and
-  (2) any "fixed" commitment at a set hour. Leave startTime/endTime null
-  everywhere else; order blocks sensibly and the app cascades real times.
+  (2) a "fixed" commitment with a HARD START hour. Leave startTime/endTime
+  null everywhere else; order blocks sensibly and the app cascades times.
 
-# Time flexibility (REQUIRED on every item)
-  - "fixed":    pinned to startTime — a person to meet, an event/show
-                start, a booked reservation. The day bends around these.
-  - "window":   must fall within [windowStart, windowEnd] but floats.
-  - "flexible": free to slide/reorder — deep work, errands, a walk, drinks.
-Default to "flexible" unless the user implied a real constraint.
+# Time flexibility (REQUIRED) — and SCHEDULE EARLY
+  - "fixed":    a HARD START time — "meet at 18:00", a show at 20:00, a
+                booked table. Put that hour in startTime. Use ONLY for a real
+                start time, NEVER for a deadline.
+  - "window":   a deadline or earliest-time constraint; the slot still floats
+                and the app places it AS EARLY as possible within the window.
+                "no later than / by / max till 15:30" -> window, windowEnd
+                "15:30" (do NOT make it fixed at 15:30!). "not before 14:00"
+                -> window, windowStart "14:00". So "gym, can go early but no
+                later than 15:30" lands right after the morning, not at 15:30.
+  - "flexible": free to slide/reorder — deep work, a walk, errands, drinks.
+Default to "flexible". A deadline or earliest-time is "window"; only a hard
+start hour is "fixed". Never park a block at its deadline to fill time —
+schedule it early and let the free time show.
+
+# Relative-time constraints -> compute windows
+Turn "X after/before Y" phrases into windowStart/windowEnd in clock time:
+  - "eat lunch at most 3h after breakfast" (breakfast ~12:00-12:25) ->
+    lunch windowEnd "15:25".
+  - "can only start 2h after I order" (order ~12:55) -> windowStart "14:55".
+  - A deadline applies to the OUTCOME, not the block's start. If cooking lunch
+    takes ~1h and lunch must be EATEN within 3h of breakfast (by ~15:25), the
+    cook+eat block must START by ~14:25 (deadline minus its own duration).
+Then ORDER the day so those windows are actually met. If the user's
+constraints CONFLICT or cannot all fit (e.g. a 1h lunch that must be both
+>2h after a 12:55 order AND <3h after a 12:00 breakfast — only ~30 min
+overlap), satisfy the most important / health-related one, do your best on
+the rest, and SAY SO plainly in that item's description.
 
 # Concreteness
 One activity per item. Don't lump a sightseeing list into one block — emit
@@ -166,7 +215,7 @@ const LOCATION_STRATEGIES = new Set([
 ]);
 
 const EVERYDAY_QUERY_RE =
-  /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|caf\u00e9|coffee|bar|pub|bistro|grocer|groceries|supermarket|market|pharmacy|chemist|bakery|eat|drink|takeout|takeaway|deli)\b/i;
+  /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|caf\u00e9|coffee|bar|pub|bistro|grocer|groceries|supermarket|market|pharmacy|chemist|bakery|eat|drink|takeout|takeaway|deli|walk|stroll|park|promenade|trail|riverside)\b/i;
 
 function isEverydayQuery(q: string): boolean {
   return EVERYDAY_QUERY_RE.test(q || '');
@@ -792,7 +841,20 @@ async function routeAndSchedule(
       ? { latitude: context.home.latitude, longitude: context.home.longitude }
       : null;
 
-    const located = flattenItems(parsed).filter((it: any) => it?.place?.coords);
+    // Build a routing sequence over ALL blocks. Located blocks use their venue
+    // coords; at-home blocks use HOME coords so the trip home is computed
+    // naturally the moment the day goes from an outing back to a home block
+    // (no teleporting into "cook lunch", and no "Head Home" bolted on when the
+    // day actually ends at home). Other placeless blocks (an unresolved venue)
+    // simply don't participate — they don't break the chain.
+    type RouteNode = { item: any; coords: Coords; isHome: boolean };
+    const seq: RouteNode[] = [];
+    for (const item of flattenItems(parsed)) {
+      const placeCoords: Coords | undefined = item?.place?.coords;
+      if (placeCoords) seq.push({ item, coords: placeCoords, isHome: false });
+      else if (homeCoords && item?.locationStrategy === 'at_home')
+        seq.push({ item, coords: homeCoords, isHome: true });
+    }
 
     const hops: {
       item: any;
@@ -801,41 +863,40 @@ async function routeAndSchedule(
       fromLabel?: string;
     }[] = [];
 
-    let prevCoords: Coords | null = homeCoords;
-    let outOfHome = true; // the first leg starts at the user's home
-    for (const item of located) {
-      const coords: Coords = item.place.coords;
-      if (prevCoords) {
-        // Label the origin only for the leg out of home; inter-venue hops
-        // start at the card directly above, so naming it would be noise.
+    // Walk the sequence; a leg is the move between two consecutive anchors that
+    // are genuinely in different places (home→home is 0m → no leg).
+    let prev: RouteNode | null = homeCoords
+      ? { item: null, coords: homeCoords, isHome: true }
+      : null;
+    for (const node of seq) {
+      if (prev && haversineMeters(prev.coords, node.coords) > 25) {
         hops.push({
-          item,
-          origin: prevCoords,
-          dest: coords,
-          fromLabel: outOfHome ? context.home?.label : undefined,
+          item: node.item,
+          origin: prev.coords,
+          dest: node.coords,
+          // Name the origin only when leaving home; an inter-stop hop starts at
+          // the card directly above, so naming it would be noise.
+          fromLabel: prev.isHome ? context.home?.label : undefined,
         });
-        outOfHome = false;
       }
-      prevCoords = coords;
+      prev = node;
     }
 
-    const lastCoords: Coords | null = located.length
-      ? located[located.length - 1].place.coords
-      : null;
-
-    // Trip back home, when the day ends meaningfully away from it. Appended
-    // as a synthetic item and routed in the same parallel batch.
+    // An explicit trip back is only needed when the day ENDS meaningfully away
+    // from home; otherwise the return is already a leg on the first home block
+    // after the last outing.
     let backHomeItem: any = null;
-    if (homeCoords && lastCoords && haversineMeters(lastCoords, homeCoords) > 400) {
+    if (homeCoords && prev && !prev.isHome && haversineMeters(prev.coords, homeCoords) > 400) {
       backHomeItem = {
         title: 'Back home',
         kind: 'travel',
         flexibility: 'flexible',
         durationMinutes: 0,
         place: null,
+        arrival: true,
         travelFromPrev: null,
       };
-      hops.push({ item: backHomeItem, origin: lastCoords, dest: homeCoords });
+      hops.push({ item: backHomeItem, origin: prev.coords, dest: homeCoords });
     }
 
     await Promise.all(
@@ -867,10 +928,18 @@ async function routeAndSchedule(
       // Arrive early → wait for the fixed time. Arrive late → we can't go
       // back in time, so keep the real (late) arrival; the user sees the slip.
       if (fixed != null && fixed >= start) start = fixed;
+    } else if (item?.flexibility === 'window') {
+      // A window floats but opens at windowStart (e.g. "cook only 2h after I
+      // order"). Wait for it to open if we'd otherwise begin too early.
+      // windowEnd is a soft deadline — we already place ASAP, so honouring it
+      // is just about ordering, not pushing the block later here.
+      const ws = parseHHMM(item.windowStart);
+      if (ws != null && ws > start) start = ws;
     }
-    // A placeless block reached by a travel leg is a pure arrival (e.g.
-    // "Back home") — zero length, just stamp the arrival time.
-    const isArrival = !item?.place && !!item?.travelFromPrev;
+    // Only the synthetic "Back home" is a pure arrival (zero length). At-home
+    // blocks are placeless too but real activities now carry a travel leg (the
+    // trip home), so key off the explicit flag instead of "placeless + leg".
+    const isArrival = item?.arrival === true;
     const dur = isArrival ? 0 : itemDuration(item);
     item.startTime = fmtHHMM(start);
     if (dur > 0) {
@@ -1113,8 +1182,15 @@ Deno.serve(async (req: Request) => {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.5,
+      model: 'gpt-5.4-mini',
+      // Reasoning model: it "thinks" before answering, which is what this
+      // multi-constraint day planning needs (windows, clustering, energy arc).
+      // `temperature` is not accepted on reasoning models, so it's omitted.
+      reasoning_effort: 'medium',
+      // Reasoning tokens are billed as output and consume this budget BEFORE
+      // the JSON is written — set it generously or a long think truncates the
+      // answer into empty/invalid JSON.
+      max_completion_tokens: 16000,
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
