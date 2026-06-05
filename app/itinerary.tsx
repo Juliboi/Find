@@ -17,6 +17,7 @@ import {
 import Animated, {
   FadeIn,
   FadeInDown,
+  FadeOut,
   runOnJS,
   type SharedValue,
   useAnimatedStyle,
@@ -39,6 +40,7 @@ import { Text } from '@/components/Text';
 import { Button } from '@/components/Button';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
 import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
+import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
 import {
   Itinerary,
   ItineraryItem,
@@ -108,6 +110,24 @@ function itemEndMin(it: ItineraryItem): number {
   const s = minutesOfDay(it.startTime);
   if (s != null) return s + (it.durationMinutes ?? 0);
   return Number.POSITIVE_INFINITY;
+}
+
+/**
+ * The router appends a synthetic "Back home" block when the day ends away from
+ * home. Its `startTime` is the ARRIVAL time, not a departure — the opposite of
+ * a real `travel` block (a train ride where startTime is when you board). We
+ * key off the explicit `arrival` flag on fresh plans, and fall back to the
+ * shape (a travel item carrying a leg but no end/duration) so trips saved
+ * before the flag existed still render correctly on reload.
+ */
+function isArrivalMarker(it: ItineraryItem): boolean {
+  if (it.arrival) return true;
+  return (
+    it.kind === 'travel' &&
+    !!it.travelFromPrev &&
+    !it.endTime &&
+    !it.durationMinutes
+  );
 }
 
 const PLANNING_PHASES = [
@@ -222,6 +242,7 @@ export default function ItineraryScreen() {
   const home = useHomeStore((s) => s.home);
   const endOfDay = useHomeStore((s) => selectEndOfDay(s));
   const saveItinerary = useSavedItineraries((s) => s.save);
+  const updateSavedItinerary = useSavedItineraries((s) => s.update);
 
   // Opening a saved plan from the homepage: hydrate it (once) so the screen
   // shows the preview straight away with the drawer already collapsed.
@@ -242,7 +263,22 @@ export default function ItineraryScreen() {
   const [input, setInput] = useState(SAMPLE_PROMPT);
   const [itinerary, setItinerary] = useState<Itinerary | null>(preloaded);
   const [usedAi, setUsedAi] = useState(!!preloaded);
+  // `loading` covers the BLOCKING planning call only — while it's true the
+  // screen shows the planning skeleton. `routesRefining` is for the silent
+  // routing pass that happens AFTER the plan lands or when an existing
+  // saved trip auto-heals: the day is already visible, and we only flash a
+  // subtle pill to hint that times may shift in a beat.
   const [loading, setLoading] = useState(false);
+  const [routesRefining, setRoutesRefining] = useState(false);
+  // Tracks the saved-store id for the currently-shown itinerary. Populated
+  // when opening a saved trip OR when a fresh plan lands. The recompute call
+  // uses it to overwrite the same saved entry with the routed version instead
+  // of spawning a duplicate.
+  const [savedId, setSavedId] = useState<string | null>(params.id ?? null);
+  // Monotonic plan/refresh sequence. Bumped on every fresh plan and on
+  // reset(); a routing recompute that resolves AFTER a newer plan was kicked
+  // off is dropped, so a slow refresh can't overwrite a newer itinerary.
+  const planSeqRef = useRef(0);
   const [debug, setDebug] = useState<ItineraryDebug | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
@@ -301,7 +337,78 @@ export default function ItineraryScreen() {
   const cardRawRef = useRef<Record<string, { relY: number; h: number }>>({});
   const tabOffsetsRef = useRef<number[]>([]);
 
-  const context: SchedulerContext = { home, endOfDay };
+  // Memoised so it's stable across renders — effects that depend on `context`
+  // (auto-refresh, log dumper) only re-fire when the underlying pins actually
+  // change, not on every parent re-render.
+  const context = useMemo<SchedulerContext>(
+    () => ({ home, endOfDay }),
+    [home, endOfDay],
+  );
+
+  // Saved trips planned BEFORE real routing existed (everything in the body
+  // is `estimated: true` with no polylines) get one auto-refresh per session
+  // the first time the user opens them. Heals existing broken trips like the
+  // one with Petřiny ⇄ Pekařova nonsense without forcing a delete+regenerate
+  // dance. Keyed by saved id so it only fires once per trip per session.
+  const autoRefreshedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const id = params.id;
+    if (!id || !preloaded || !home) return;
+    if (autoRefreshedRef.current.has(id)) return;
+    const legs: TravelLeg[] = [];
+    for (const s of preloaded.sections) {
+      for (const it of s.items) {
+        if (it.travelFromPrev) legs.push(it.travelFromPrev);
+      }
+    }
+    if (legs.length === 0) return;
+    const allEstimated = legs.every(
+      (leg) => leg.estimated === true && !leg.polyline,
+    );
+    if (!allEstimated) return;
+
+    autoRefreshedRef.current.add(id);
+    const seq = ++planSeqRef.current;
+    // `routesRefining` instead of `loading` — the saved day is already on
+    // screen and we don't want a full planning skeleton to flash over it.
+    setRoutesRefining(true);
+    recomputeItinerary(preloaded, context)
+      .then((result) => {
+        if (planSeqRef.current !== seq) return;
+        if (result.refreshed) {
+          setItinerary(result.itinerary);
+          updateSavedItinerary(id, result.itinerary);
+        }
+      })
+      .finally(() => {
+        if (planSeqRef.current === seq) setRoutesRefining(false);
+      });
+  }, [params.id, preloaded, home, context, updateSavedItinerary]);
+
+  // Dev-only snapshot dumper. Fires whenever the day loads or any edit
+  // reshapes the itinerary, so you can copy the structured JSON from Metro
+  // and share it instead of taking screenshots when reporting a bug. Includes
+  // every piece of state that influences how the day renders: the full
+  // itinerary, the resolved context (home / end-of-day), the saved-store id
+  // (if opened from the homepage), the AI vs heuristic flag, and the planner's
+  // debug envelope when one came back with the plan.
+  useEffect(() => {
+    if (!__DEV__ || !itinerary) return;
+    const snapshot = {
+      savedId: params.id ?? null,
+      usedAi,
+      context: { home, endOfDay },
+      itinerary,
+      debug,
+    };
+    const stamp = new Date().toISOString();
+    // Sentinel lines either side make it trivial to copy a single snapshot
+    // out of a noisy log; the prefix makes filtering with `metro | grep`
+    // straightforward too.
+    console.log(`══════════ [day-snapshot] ${stamp} ══════════`);
+    console.log(JSON.stringify(snapshot, null, 2));
+    console.log(`══════════ [day-snapshot/end] ${stamp} ══════════`);
+  }, [itinerary, debug, usedAi, home, endOfDay, params.id]);
 
   const flatItems = useMemo(
     () => (itinerary ? itinerary.sections.flatMap((s) => s.items) : []),
@@ -500,8 +607,13 @@ export default function ItineraryScreen() {
     const text = input.trim();
     if (!text || loading) return;
     Haptics.selectionAsync().catch(() => undefined);
+    // Anything that was already in flight is no longer relevant; bump the seq
+    // so a slow recompute from a previous plan can't slot itself in after
+    // this one has rendered.
+    const seq = ++planSeqRef.current;
     setLoading(true);
     setErrorMsg(null);
+    setSavedId(null);
     resetTracking();
     snapTo(expandedTop); // show the skeleton full-height while we work
     try {
@@ -510,34 +622,63 @@ export default function ItineraryScreen() {
         date: todayISO(),
         debug: true,
       });
+      if (planSeqRef.current !== seq) return; // user reset / planned again
       const itin = result.itinerary;
-      setItinerary(itin);
       setUsedAi(result.usedAi);
       setDebug(result.debug ?? null);
       if (!itin) {
+        setItinerary(null);
         setErrorMsg('No itinerary was produced. Check the debug section.');
-      } else {
-        // Keep it for later — it'll surface on the homepage's "Day trips".
-        saveItinerary(itin);
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-          () => undefined,
-        );
-        // Let the day fade in expanded for a beat, then ease the drawer down
-        // to reveal the mapped route — a small reveal beats a hard cut.
-        setTimeout(() => snapTo(collapsedTop), 520);
+        return;
       }
+
+      // OPTIMISTIC SHOW. Save and render the model output the instant Gemini
+      // returns, so the user sees their day 2-5 seconds sooner. Routing then
+      // runs in the BACKGROUND (no await on this code path — see below) and
+      // swaps real Google Routes data into the same itinerary id when it's
+      // done. The cards may shift slightly when that happens (travel stubs
+      // strip, clock re-cascades) — the `routesRefining` pill hints at that.
+      const id = saveItinerary(itin);
+      setSavedId(id);
+      setItinerary(itin);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => undefined,
+      );
+      // Let the day fade in expanded for a beat, then ease the drawer down
+      // to reveal the mapped route — a small reveal beats a hard cut.
+      setTimeout(() => snapTo(collapsedTop), 520);
+
+      // Drop the blocking spinner now — the rest is silent. Anyone watching
+      // the seq guard knows to bail if a newer plan started while we wait.
+      setLoading(false);
+      setRoutesRefining(true);
+      void recomputeItinerary(itin, context)
+        .then((refreshed) => {
+          if (planSeqRef.current !== seq) return;
+          if (!refreshed.refreshed) return;
+          setItinerary(refreshed.itinerary);
+          updateSavedItinerary(id, refreshed.itinerary);
+        })
+        .finally(() => {
+          if (planSeqRef.current === seq) setRoutesRefining(false);
+        });
     } catch (e: any) {
+      if (planSeqRef.current !== seq) return;
       setErrorMsg(String(e?.message ?? e));
-    } finally {
       setLoading(false);
     }
   };
 
   const reset = () => {
+    // Invalidate any background routing/plan jobs in flight so their
+    // resolutions are dropped instead of repopulating the cleared screen.
+    planSeqRef.current += 1;
     setItinerary(null);
     setDebug(null);
     setErrorMsg(null);
     setUsedAi(false);
+    setSavedId(null);
+    setRoutesRefining(false);
     resetTracking();
     snapTo(expandedTop);
   };
@@ -679,6 +820,21 @@ export default function ItineraryScreen() {
               </View>
               {loading ? (
                 <ActivityIndicator color={t.colors.accent} />
+              ) : routesRefining && itinerary ? (
+                // Background routing is in flight — the day is already on
+                // screen but real travel legs will swap in any second. Pill
+                // is intentionally subtle (matches the accent badge style)
+                // so it reads as a status hint, not a blocker.
+                <Animated.View
+                  entering={FadeIn.duration(180)}
+                  exiting={FadeOut.duration(220)}
+                  style={[styles.refiningPill, { backgroundColor: t.colors.accentSoft }]}
+                >
+                  <ActivityIndicator size="small" color={t.colors.accent} />
+                  <RNText style={[styles.refiningText, { color: t.colors.accent }]}>
+                    Refining routes…
+                  </RNText>
+                </Animated.View>
               ) : itinerary ? (
                 <View
                   style={[
@@ -1011,14 +1167,17 @@ function SectionBlock({
         // is feeding:
         //   - Normal item (meal, work, meetup, …): item.startTime is when
         //     you ARRIVE on-site, so leaveBy = startTime − leg.minutes.
-        //   - kind="travel" item (the walk-to-station card, the train
-        //     ride): item.startTime is when you DEPART (board the train,
-        //     start the walk), so leaveBy ≡ startTime. Subtracting the
-        //     journey length from boarding time is what produced the
-        //     "Leave by 06:25" for a 08:45 train.
+        //   - Arrival marker ("Back home"): item.startTime is the ARRIVAL
+        //     time too, so leaveBy = startTime − leg.minutes. Treating it as
+        //     a departure (below) showed "Leave by 19:30" for a trip you
+        //     actually start at 18:55 — the bug this branch fixes.
+        //   - Real kind="travel" block (the train ride): item.startTime is
+        //     when you DEPART (board the train), so leaveBy ≡ startTime.
+        //     Subtracting the journey length from boarding time is what
+        //     produced the "Leave by 06:25" for a 08:45 train.
         const leaveBy =
           leg && item.startTime
-            ? item.kind === 'travel'
+            ? item.kind === 'travel' && !isArrivalMarker(item)
               ? item.startTime
               : addMinutes(item.startTime, -leg.minutes)
             : undefined;
@@ -1451,10 +1610,15 @@ function ItemCard({
   const t = useTheme();
   const place = isContinuation ? undefined : item.place;
   const emoji = place?.emoji ?? KIND_EMOJI[item.kind];
-  const timeRange =
-    item.startTime && item.endTime
-      ? `${item.startTime} – ${item.endTime}`
-      : item.startTime ?? '';
+  // Arrival markers ("Back home") carry a single time that is when you GET
+  // there — prefix it so a lone "19:30" doesn't read as a departure.
+  const timeRange = isArrivalMarker(item)
+    ? item.startTime
+      ? `Arrive ${item.startTime}`
+      : ''
+    : item.startTime && item.endTime
+    ? `${item.startTime} – ${item.endTime}`
+    : item.startTime ?? '';
   const rating = typeof place?.rating === 'number' ? place.rating : undefined;
 
   return (
@@ -1582,6 +1746,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 999,
+  },
+  refiningPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+  },
+  refiningText: {
+    fontSize: 11,
+    fontWeight: '600',
+    letterSpacing: 0.3,
   },
   tabs: {
     gap: 8,

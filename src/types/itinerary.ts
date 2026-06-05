@@ -197,6 +197,14 @@ export interface ItineraryItem {
   description?: string;
   /** Optional short highlight bullets (things to see / order / do). */
   highlights?: string[];
+  /**
+   * True for the synthetic "Back home" marker the router appends when the day
+   * ends away from home. Unlike a normal `travel` block (a train ride, where
+   * startTime is the DEPARTURE), an arrival marker's `startTime` is when you
+   * ARRIVE — so the UI computes "leave by" as startTime − leg.minutes and
+   * labels the card "Arrive HH:MM".
+   */
+  arrival?: boolean;
   /** 0-based position in the day. Kept dense + contiguous. */
   orderIndex: number;
 }

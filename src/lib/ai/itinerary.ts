@@ -219,6 +219,7 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
     travelFromPrev: sanitizeTravelLeg(raw.travelFromPrev),
     description: asString(raw.description),
     highlights: highlights && highlights.length > 0 ? highlights : undefined,
+    arrival: raw.arrival === true ? true : undefined,
     orderIndex: index,
   };
 }
@@ -250,7 +251,7 @@ function sanitizeSection(
   };
 }
 
-function sanitizeItinerary(data: any): Itinerary | null {
+export function sanitizeItinerary(data: any): Itinerary | null {
   if (!data || typeof data !== 'object') return null;
   if (!Array.isArray(data.sections)) return null;
   const sections: ItinerarySection[] = [];

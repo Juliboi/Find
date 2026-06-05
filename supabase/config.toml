@@ -11,3 +11,6 @@ verify_jwt = false
 
 [functions.plan-itinerary]
 verify_jwt = false
+
+[functions.recompute-itinerary]
+verify_jwt = false

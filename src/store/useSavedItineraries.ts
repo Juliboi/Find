@@ -28,6 +28,13 @@ interface SavedState {
   items: SavedItinerary[];
   /** Persist a freshly planned itinerary; returns its saved id. */
   save: (itinerary: Itinerary) => string;
+  /**
+   * Replace the itinerary on an existing saved entry in-place. Used after a
+   * route recompute so the homepage card swaps to the routed version without
+   * spawning a duplicate save (and without bumping createdAt — this is the
+   * same trip, just refreshed).
+   */
+  update: (id: string, itinerary: Itinerary) => void;
   remove: (id: string) => void;
 }
 
@@ -75,6 +82,18 @@ export const useSavedItineraries = create<SavedState>()(
         set((state) => ({ items: [entry, ...state.items].slice(0, MAX_SAVED) }));
         return id;
       },
+      update: (id, itinerary) =>
+        set((state) => ({
+          items: state.items.map((entry) =>
+            entry.id === id
+              ? {
+                  ...entry,
+                  itinerary,
+                  ...summarize(itinerary),
+                }
+              : entry,
+          ),
+        })),
       remove: (id) =>
         set((state) => ({ items: state.items.filter((i) => i.id !== id) })),
     }),

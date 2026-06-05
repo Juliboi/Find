@@ -29,7 +29,158 @@
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
-const GEMINI_MODEL = 'gemini-2.5-flash';
+// The planner needs Google Search grounding AND a large strict-JSON output in
+// one call. Gemini 2.5 Flash handles that combo reliably; lighter models do
+// not — gemini-2.5-flash-lite consistently returns an EMPTY response for this
+// grounded JSON prompt (it drifts into conversational mode and emits nothing).
+// So Flash is the safe default.
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
+// Optional override via Supabase secrets (e.g. to try a new model):
+//   supabase secrets set GEMINI_MODEL=gemini-2.5-pro
+// If the configured model fails or returns junk, the handler retries once on
+// DEFAULT_GEMINI_MODEL, so a bad override degrades to "slower" — never to the
+// offline sample. Revert with: supabase secrets unset GEMINI_MODEL.
+const CONFIGURED_GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') ?? DEFAULT_GEMINI_MODEL;
+
+// Planning has two mutually-exclusive modes (Gemini forbids combining the
+// google_search tool with a JSON responseSchema):
+//
+//   grounded (default): google_search picks REAL venues via live search.
+//     Best venue realism; only Flash-class models follow the "emit one big
+//     JSON" instruction reliably. ~8-15s.
+//
+//   schema (GEMINI_GROUNDING=off): no search, but a strict responseSchema
+//     GUARANTEES parseable JSON from ANY model — including flash-lite (~3s).
+//     Venues come from the model's training knowledge and are then validated
+//     / geocoded by the Google Places enrichment pass below, so they still
+//     resolve to real coords, photos and ratings. Slightly weaker on niche
+//     venue specificity and post-cutoff places.
+//
+// Enable fast mode with:
+//   supabase secrets set GEMINI_GROUNDING=off
+//   supabase secrets set GEMINI_MODEL=gemini-2.5-flash-lite
+const GROUNDING_ENABLED =
+  (Deno.env.get('GEMINI_GROUNDING') ?? 'on').toLowerCase() !== 'off';
+
+// responseSchema used in schema mode. A subset of OpenAPI types (the shape
+// Gemini structured-output accepts). Mirrors the Itinerary the client expects;
+// `sanitizeItinerary` on the client is still the final validator. travelFromPrev
+// is intentionally lightweight — the routing layer (recompute-itinerary)
+// replaces these estimates with real Google Routes legs.
+const PLANNER_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  propertyOrdering: ['title', 'summary', 'date', 'origin', 'city', 'sections'],
+  required: ['title', 'city', 'sections'],
+  properties: {
+    title: { type: 'string' },
+    summary: { type: 'string' },
+    date: { type: 'string' },
+    origin: { type: 'string' },
+    city: { type: 'string' },
+    sections: {
+      type: 'array',
+      items: {
+        type: 'object',
+        propertyOrdering: ['title', 'period', 'items'],
+        required: ['title', 'items'],
+        properties: {
+          title: { type: 'string' },
+          period: { type: 'string', enum: ['Morning', 'Afternoon', 'Evening'] },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              propertyOrdering: [
+                'title',
+                'kind',
+                'flexibility',
+                'startTime',
+                'endTime',
+                'durationMinutes',
+                'place',
+                'travelFromPrev',
+                'description',
+                'highlights',
+              ],
+              required: ['title', 'kind', 'flexibility', 'startTime', 'endTime', 'durationMinutes'],
+              properties: {
+                title: { type: 'string' },
+                kind: {
+                  type: 'string',
+                  enum: [
+                    'travel',
+                    'work',
+                    'sightseeing',
+                    'meal',
+                    'event',
+                    'meetup',
+                    'drinks',
+                    'activity',
+                    'break',
+                    'other',
+                  ],
+                },
+                flexibility: { type: 'string', enum: ['fixed', 'window', 'flexible'] },
+                startTime: { type: 'string' },
+                endTime: { type: 'string' },
+                durationMinutes: { type: 'integer' },
+                place: {
+                  type: 'object',
+                  nullable: true,
+                  propertyOrdering: ['name', 'category', 'emoji', 'address', 'coords'],
+                  properties: {
+                    name: { type: 'string' },
+                    category: { type: 'string' },
+                    emoji: { type: 'string' },
+                    address: { type: 'string' },
+                    coords: {
+                      type: 'object',
+                      nullable: true,
+                      properties: {
+                        latitude: { type: 'number' },
+                        longitude: { type: 'number' },
+                      },
+                    },
+                  },
+                },
+                travelFromPrev: {
+                  type: 'object',
+                  nullable: true,
+                  propertyOrdering: ['mode', 'minutes', 'fromLabel', 'estimated', 'steps'],
+                  properties: {
+                    mode: { type: 'string', enum: ['walk', 'bike', 'transit', 'drive'] },
+                    minutes: { type: 'integer' },
+                    fromLabel: { type: 'string' },
+                    estimated: { type: 'boolean' },
+                    steps: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        propertyOrdering: ['mode', 'line', 'from', 'to', 'durationMinutes'],
+                        properties: {
+                          mode: {
+                            type: 'string',
+                            enum: ['walk', 'bus', 'tram', 'subway', 'train', 'ferry', 'transit'],
+                          },
+                          line: { type: 'string' },
+                          from: { type: 'string' },
+                          to: { type: 'string' },
+                          durationMinutes: { type: 'integer' },
+                        },
+                      },
+                    },
+                  },
+                },
+                description: { type: 'string' },
+                highlights: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
 
 interface Coords {
   latitude: number;
@@ -146,12 +297,19 @@ function buildPlannerPrompt(args: {
   userText: string;
   home: HomePin | null;
   date: string;
+  grounded: boolean;
 }): string {
   const home = args.home;
   const homeBlock = home
     ? `- Home: "${home.label}" at latitude ${home.latitude}, longitude ${home.longitude}.`
     : '- The user has not pinned a home location. Keep venue picks generic and assume the day happens close to wherever they start.';
   const originDefault = home?.label ?? 'home';
+  // Venue-sourcing instruction differs by mode: grounded mode has live Google
+  // Search; schema mode relies on the model's own knowledge + a downstream
+  // Google Places validation pass, so we ask for approximate coords.
+  const venueRule = args.grounded
+    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. If the user NAMED a venue (e.g. "OC Krakov Max Fitness"), honour that exact venue regardless of distance.'
+    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. If the user NAMED a venue, honour that exact venue regardless of distance.';
 
   return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
 
@@ -168,7 +326,7 @@ REQUIREMENTS
 1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
 2. Cover the WHOLE day continuously. No invisible gaps. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. The only allowed gaps are explicit relax/buffer/chores items the user asked for (use kind="break").
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
-4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it's well-known. Return real name, address, rating (0–5), and an opening-status hint when known. If the user NAMED a venue (e.g. "OC Krakov Max Fitness"), honour that exact venue regardless of distance.
+${venueRule}
 5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
 6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
@@ -228,6 +386,8 @@ Output ONLY a single JSON object, no prose, no markdown fences. Match this schem
 async function callGeminiPlanner(args: {
   prompt: string;
   apiKey: string;
+  model: string;
+  grounded: boolean;
 }): Promise<
   | {
       ok: true;
@@ -235,15 +395,25 @@ async function callGeminiPlanner(args: {
       rawText: string;
       elapsedMs: number;
       sources: string[];
+      model: string;
     }
   | { ok: false; status: number; detail: string }
 > {
-  const body = {
+  // Grounded mode: attach the search tool, no schema (the two are mutually
+  // exclusive). Schema mode: enforce JSON output via responseSchema so even
+  // lighter models can't drift into prose / empty responses.
+  const body: Record<string, unknown> = {
     contents: [{ role: 'user', parts: [{ text: args.prompt }] }],
-    tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0.4 },
+    generationConfig: args.grounded
+      ? { temperature: 0.4 }
+      : {
+          temperature: 0.4,
+          responseMimeType: 'application/json',
+          responseSchema: PLANNER_SCHEMA,
+        },
   };
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${args.apiKey}`;
+  if (args.grounded) body.tools = [{ google_search: {} }];
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${args.model}:generateContent?key=${args.apiKey}`;
 
   const t0 = Date.now();
   let res: Response;
@@ -269,16 +439,17 @@ async function callGeminiPlanner(args: {
     .trim();
   const parsed = extractJsonObject(rawText);
   if (!parsed) {
+    const reason = candidate?.finishReason ? ` finishReason=${candidate.finishReason}` : '';
     return {
       ok: false,
       status: 502,
-      detail: `Model returned unparseable JSON. Raw: ${rawText.slice(0, 500)}`,
+      detail: `Model ${args.model} returned unparseable JSON.${reason} Raw: ${rawText.slice(0, 500)}`,
     };
   }
   const sources: string[] = (candidate?.groundingMetadata?.groundingChunks ?? [])
     .map((c: any) => c?.web?.title || c?.web?.uri)
     .filter((s: unknown): s is string => typeof s === 'string');
-  return { ok: true, parsed, rawText, elapsedMs, sources };
+  return { ok: true, parsed, rawText, elapsedMs, sources, model: args.model };
 }
 
 // ----------------------------------------------------------- Google enrichment
@@ -547,13 +718,35 @@ Deno.serve(async (req: Request) => {
   const date = typeof payload.date === 'string' ? payload.date : todayISO();
   const context = normalizeContext(payload.context);
 
-  // 1) Single grounded Gemini call that produces the whole itinerary.
+  // 1) Single Gemini call that produces the whole itinerary (grounded with
+  //    live search, or schema-constrained — see GROUNDING_ENABLED).
   const prompt = buildPlannerPrompt({
     userText: request,
     home: context.home ?? null,
     date,
+    grounded: GROUNDING_ENABLED,
   });
-  const gem = await callGeminiPlanner({ prompt, apiKey: geminiKey });
+  let gem = await callGeminiPlanner({
+    prompt,
+    apiKey: geminiKey,
+    model: CONFIGURED_GEMINI_MODEL,
+    grounded: GROUNDING_ENABLED,
+  });
+  // Self-heal a bad GEMINI_MODEL override: if the configured model fails or
+  // returns junk (flash-lite, e.g., emits an empty GROUNDED response), retry
+  // once on the known-reliable default rather than failing the whole request
+  // (which would drop the client to its offline sample itinerary).
+  if (!gem.ok && CONFIGURED_GEMINI_MODEL !== DEFAULT_GEMINI_MODEL) {
+    console.warn(
+      `plan-itinerary: model "${CONFIGURED_GEMINI_MODEL}" failed (${gem.detail}); retrying with "${DEFAULT_GEMINI_MODEL}".`,
+    );
+    gem = await callGeminiPlanner({
+      prompt,
+      apiKey: geminiKey,
+      model: DEFAULT_GEMINI_MODEL,
+      grounded: GROUNDING_ENABLED,
+    });
+  }
   if (!gem.ok) {
     return jsonResponse({ error: 'Planner failed', detail: gem.detail }, gem.status);
   }
