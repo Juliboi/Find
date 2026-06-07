@@ -2228,7 +2228,7 @@ function SectionBlock({
     <>
       <Animated.View
         entering={FadeInDown.duration(280).delay(base)}
-        style={{ marginTop: first ? 12 : 20 }}
+        style={{ marginTop: first ? 16 : 30 }}
         onLayout={(e) => onSectionLayout(e.nativeEvent.layout.y)}
       >
         <View style={styles.sectionRow}>
@@ -2274,13 +2274,14 @@ function SectionBlock({
           <Animated.View
             key={item.id}
             entering={FadeInDown.duration(280).delay(Math.min(base + (i + 1) * 40, 360))}
-            style={{ marginTop: 8 }}
+            style={{ marginTop: 12 }}
             onLayout={(e) => onItemLayout(item.id, e.nativeEvent.layout.y)}
           >
-            <View style={past && styles.pastDim}>
+            <View>
               {!isGapItem && gapsById[item.id] ? (
                 <GapRow
                   minutes={gapsById[item.id]}
+                  past={past}
                   onPress={
                     rearrangeMode ? undefined : () => onAddGap(item.id, gapsById[item.id])
                   }
@@ -2296,6 +2297,7 @@ function SectionBlock({
                     leg={leg}
                     leaveBy={leaveBy}
                     active={legActive && !rearrangeMode}
+                    past={past}
                     glow={glow}
                     nowAbs={nowAbs}
                     legStartAbs={legStartAbs}
@@ -2307,7 +2309,7 @@ function SectionBlock({
               <Pressable
                 onLongPress={rearrangeMode ? undefined : onEnterRearrange}
                 delayLongPress={350}
-                style={styles.cardWrap}
+                style={[styles.cardWrap, past && styles.pastDim]}
                 onLayout={(e) =>
                   onCardLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
                 }
@@ -2502,7 +2504,6 @@ function SectionNode({
           backgroundColor: past && !active ? t.colors.accent : t.colors.surface1,
           borderColor: active || past ? t.colors.accent : t.colors.separator,
           shadowColor: t.colors.accent,
-          opacity: past && !active ? 0.6 : 1,
         },
         aStyle,
       ]}
@@ -2688,7 +2689,15 @@ function mergeWalkSteps(steps: TravelStep[]): TravelStep[] {
 }
 
 /** A light connector marking idle/free time the user has between two blocks. */
-function GapRow({ minutes, onPress }: { minutes: number; onPress?: () => void }) {
+function GapRow({
+  minutes,
+  past,
+  onPress,
+}: {
+  minutes: number;
+  past?: boolean;
+  onPress?: () => void;
+}) {
   const t = useTheme();
   return (
     <Pressable
@@ -2710,7 +2719,7 @@ function GapRow({ minutes, onPress }: { minutes: number; onPress?: () => void })
           <RNText style={styles.connDotEmojiSm}>⏳</RNText>
         </View>
       </View>
-      <View style={[styles.connBody, styles.gapRowBody]}>
+      <View style={[styles.connBody, styles.gapRowBody, past && styles.pastDim]}>
         <RNText style={[styles.gapText, { color: t.colors.textTertiary }]}>
           {`${formatDuration(minutes)} free`}
         </RNText>
@@ -2743,6 +2752,10 @@ function GapCard({
     item.startTime && item.endTime
       ? `${item.startTime} – ${item.endTime}`
       : item.startTime ?? '';
+  const base = timeRange ? `Free · ${timeRange}` : 'Free time';
+  const timeLabel = item.durationMinutes
+    ? `${base}  ·  ${formatDuration(item.durationMinutes)}`
+    : base;
   return (
     <View
       style={[
@@ -2753,16 +2766,9 @@ function GapCard({
       <View style={styles.itemTopRow}>
         <View style={styles.timeWrap}>
           <Text variant="caption" tone="tertiary" weight="semibold" style={styles.timeText}>
-            {timeRange ? `Free · ${timeRange}` : 'Free time'}
+            {timeLabel}
           </Text>
         </View>
-        {item.durationMinutes ? (
-          <View style={[styles.durationPill, { backgroundColor: t.colors.surface1 }]}>
-            <Text variant="micro" tone="secondary" weight="semibold">
-              {formatDuration(item.durationMinutes)}
-            </Text>
-          </View>
-        ) : null}
         {onOpenMenu ? (
           <Pressable
             onPress={onOpenMenu}
@@ -2778,7 +2784,7 @@ function GapCard({
           </Pressable>
         ) : null}
       </View>
-      <Text variant="body" weight="semibold" style={{ marginTop: 6 }}>
+      <Text variant="body" weight="semibold" style={styles.gapTitle}>
         {item.title}
       </Text>
     </View>
@@ -2919,6 +2925,7 @@ function TravelLegRow({
   leg,
   leaveBy,
   active,
+  past,
   glow,
   nowAbs,
   legStartAbs,
@@ -2929,6 +2936,8 @@ function TravelLegRow({
   leaveBy?: string;
   /** True while you're currently traveling this leg (gates the step highlight). */
   active?: boolean;
+  /** True once the leg is behind us — crisp blue-ringed dot + dimmed panel. */
+  past?: boolean;
   /** Shared breathing pulse, so the active step glows in sync with cards. */
   glow?: SharedValue<number>;
   /** Wall clock on the unwrapped (midnight-aware) axis, to pick the live hop. */
@@ -3086,18 +3095,22 @@ function TravelLegRow({
         <View
           style={[
             styles.connDot,
-            { backgroundColor: c.surface1, borderColor: c.separator },
+            {
+              backgroundColor: c.surface1,
+              borderColor: past ? c.accent : c.separator,
+              borderWidth: past ? 1.5 : StyleSheet.hairlineWidth,
+            },
           ]}
         >
           <Ionicons
             name={TRAVEL_MODE_ICON[leg.mode] ?? 'navigate'}
             size={13}
-            color={c.textSecondary}
+            color={past ? c.accent : c.textSecondary}
           />
         </View>
       </View>
       <View
-        style={styles.commutePanel}
+        style={[styles.commutePanel, past && styles.pastDim]}
         onLayout={(e) => {
           panelYRef.current = e.nativeEvent.layout.y;
           reportGeometry();
@@ -3255,7 +3268,6 @@ function ItemCard({
 }) {
   const t = useTheme();
   const place = isContinuation ? undefined : item.place;
-  const emoji = place?.emoji ?? KIND_EMOJI[item.kind];
   // Arrival markers ("Back home") carry a single time that is when you GET
   // there — prefix it so a lone "19:30" doesn't read as a departure.
   const timeRange = isArrivalMarker(item)
@@ -3265,7 +3277,14 @@ function ItemCard({
     : item.startTime && item.endTime
     ? `${item.startTime} – ${item.endTime}`
     : item.startTime ?? '';
+  // Fold the duration into the time kicker ("13:10 – 15:10 · 2h") so the top
+  // row is a single quiet line, not a time plus a competing pill.
+  const timeLabel = [timeRange, item.durationMinutes ? formatDuration(item.durationMinutes) : '']
+    .filter(Boolean)
+    .join('  ·  ');
   const rating = typeof place?.rating === 'number' ? place.rating : undefined;
+  // Condense price + category onto one muted line under the venue name.
+  const metaBits = [place?.priceLevel, place?.category].filter(Boolean) as string[];
 
   return (
     <Card padded>
@@ -3274,18 +3293,16 @@ function ItemCard({
           {hasConflict ? (
             <Ionicons name="warning" size={13} color={t.colors.warning} />
           ) : null}
-          <Text variant="caption" tone={hasConflict ? 'danger' : 'secondary'} weight="semibold" style={styles.timeText}>
-            {timeRange || ' '}
+          <Text
+            variant="caption"
+            tone={hasConflict ? 'danger' : 'secondary'}
+            weight="semibold"
+            style={styles.timeText}
+          >
+            {timeLabel || ' '}
           </Text>
         </View>
         {SHOW_FLEX_BADGES ? <FlexBadge flexibility={item.flexibility} /> : null}
-        {item.durationMinutes ? (
-          <View style={[styles.durationPill, { backgroundColor: t.colors.fill1 }]}>
-            <Text variant="micro" tone="secondary" weight="semibold">
-              {formatDuration(item.durationMinutes)}
-            </Text>
-          </View>
-        ) : null}
         {onOpenMenu ? (
           <Pressable
             onPress={onOpenMenu}
@@ -3302,9 +3319,15 @@ function ItemCard({
         ) : null}
       </View>
 
-      <Text variant="body" weight="semibold" style={{ marginTop: 8 }}>
+      <Text variant="subhead" weight="bold" tight style={styles.itemTitle}>
         {item.title}
       </Text>
+
+      {item.description ? (
+        <Text variant="bodySm" tone="secondary" numberOfLines={3} style={styles.itemDesc}>
+          {item.description}
+        </Text>
+      ) : null}
 
       {place ? (
         <Pressable
@@ -3318,44 +3341,38 @@ function ItemCard({
               style={[styles.thumb, { backgroundColor: t.colors.fill1 }]}
             />
           ) : null}
-          <View style={{ flex: 1, gap: 3 }}>
-            <Text variant="bodySm" weight="semibold">
+          <View style={styles.placeBody}>
+            <Text variant="bodySm" weight="semibold" numberOfLines={1}>
               {place.name}
             </Text>
-            {rating !== undefined ? (
-              <View style={styles.ratingRow}>
-                <Text variant="caption" tone="secondary" weight="medium">
-                  {rating.toFixed(1)}
-                </Text>
-                <Ionicons name="star" size={12} color={t.colors.highlightYellow} />
-                {place.priceLevel ? (
-                  <Text variant="caption" tone="secondary">{`·  ${place.priceLevel}`}</Text>
+            {rating !== undefined || metaBits.length ? (
+              <View style={styles.metaRow}>
+                {rating !== undefined ? (
+                  <>
+                    <Text variant="caption" tone="secondary" weight="medium">
+                      {rating.toFixed(1)}
+                    </Text>
+                    <Ionicons name="star" size={12} color={t.colors.highlightYellow} />
+                  </>
+                ) : null}
+                {metaBits.length ? (
+                  <Text variant="caption" tone="tertiary" numberOfLines={1} style={styles.metaText}>
+                    {`${rating !== undefined ? '·  ' : ''}${metaBits.join('  ·  ')}`}
+                  </Text>
                 ) : null}
               </View>
-            ) : place.priceLevel ? (
-              <Text variant="caption" tone="secondary">
-                {place.priceLevel}
-              </Text>
-            ) : null}
-            {place.category ? (
-              <RNText style={[styles.categoryText, { color: t.colors.textSecondary }]}>
-                {`${emoji}  ${place.category}`}
-              </RNText>
             ) : null}
             {place.openStatus ? <OpenStatus status={place.openStatus} /> : null}
           </View>
           {onPressPlace ? (
-            <View style={[styles.swapHint, { backgroundColor: t.colors.fill1 }]}>
-              <Ionicons name="swap-horizontal" size={15} color={t.colors.accent} />
-            </View>
+            <Ionicons
+              name="chevron-forward"
+              size={18}
+              color={t.colors.textTertiary}
+              style={styles.placeChevron}
+            />
           ) : null}
         </Pressable>
-      ) : null}
-
-      {item.description ? (
-        <Text variant="bodySm" tone="secondary" style={{ marginTop: 10 }}>
-          {item.description}
-        </Text>
       ) : null}
     </Card>
   );
@@ -3496,33 +3513,40 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  durationPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 999,
+  itemTitle: {
+    marginTop: 4,
+  },
+  itemDesc: {
+    marginTop: 6,
+  },
+  gapTitle: {
+    marginTop: 6,
   },
   placeRow: {
     flexDirection: 'row',
-    alignItems: 'flex-start',
+    alignItems: 'center',
     gap: 12,
-    marginTop: 10,
+    marginTop: 12,
+  },
+  placeBody: {
+    flex: 1,
+    gap: 3,
   },
   thumb: {
-    width: 72,
-    height: 72,
+    width: 60,
+    height: 60,
     borderRadius: 12,
   },
-  ratingRow: {
+  metaRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
   },
-  categoryText: {
-    fontSize: 13,
-    fontWeight: '400',
+  metaText: {
+    flexShrink: 1,
+  },
+  placeChevron: {
+    alignSelf: 'center',
   },
   openStatus: {
     fontSize: 13,
@@ -3618,14 +3642,6 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     shadowOffset: { width: 0, height: 0 },
     shadowRadius: 12,
-  },
-  swapHint: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    alignItems: 'center',
-    justifyContent: 'center',
-    alignSelf: 'center',
   },
   rearrangeBanner: {
     position: 'absolute',
