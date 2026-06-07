@@ -797,6 +797,58 @@ export function reorderItems(itin: Itinerary, orderedIds: string[]): CascadeResu
 }
 
 /**
+ * What committing a sequence change will cost, mirroring the real edit pipeline
+ * (optimistic cascade → backend re-route → fixed-anchor escalation). Lets the
+ * reorder UI tell the user, BEFORE they drop, whether a move is safe.
+ *
+ *   - 'free'    : the order of DISTINCT venues is unchanged, so no commute can
+ *                 change — times just reflow locally, no backend call.
+ *   - 'reroute' : the venue sequence changed, so the affected commutes must be
+ *                 re-priced by the backend. The day usually still fits, but the
+ *                 real new leg lengths aren't known until that returns — so this
+ *                 is also the honest ceiling for a travel-driven clash.
+ *   - 'replan'  : even after shrinking every elastic gap a hard anchor is still
+ *                 overrun (fixed or window), so only a Gemini rebalance can fit
+ *                 it.
+ */
+export type ReorderImpact = 'free' | 'reroute' | 'replan';
+
+/** Stable key for a LOCATED stop (name + coarse coords); null for blocks that
+ *  don't move you (no coords) and so never generate a commute. */
+function venueKeyOf(item: ItineraryItem): string | null {
+  const c = item.place?.coords;
+  if (!c) return null;
+  const name = (item.place?.name ?? '').trim().toLowerCase();
+  return `${name}|${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`;
+}
+
+/** The day's distinct venues in visit order. Two reorders that leave this
+ *  identical cannot change any commute. */
+export function locatedSequence(itin: Itinerary): string[] {
+  const out: string[] = [];
+  for (const it of flatten(itin)) {
+    const k = venueKeyOf(it);
+    if (k && out[out.length - 1] !== k) out.push(k);
+  }
+  return out;
+}
+
+/** Predicts the cost of applying `orderedIds`. Pure + synchronous so the drag
+ *  layer can score every candidate drop-slot up front. */
+export function classifyReorder(base: Itinerary, orderedIds: string[]): ReorderImpact {
+  const beforeSeq = locatedSequence(base);
+  const { itinerary: reordered } = reorderItems(base, orderedIds);
+  // Re-time + absorb gaps exactly as the post-route step does; any conflict that
+  // survives is one the day genuinely can't fit without a structural rebalance.
+  const { conflicts } = fitGapsToAnchors(reordered);
+  if (conflicts.length > 0) return 'replan';
+  const afterSeq = locatedSequence(reordered);
+  const venuesChanged =
+    beforeSeq.length !== afterSeq.length || beforeSeq.some((k, i) => k !== afterSeq[i]);
+  return venuesChanged ? 'reroute' : 'free';
+}
+
+/**
  * Inserts a new free-time gap block, anchored either AFTER `afterId` or BEFORE
  * `beforeId` (exactly one should be set; `afterId` wins if both are). The gap
  * lands in the same section as its anchor so it reads as "between these two

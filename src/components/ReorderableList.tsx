@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo } from 'react';
 import { StyleSheet, View } from 'react-native';
 import Animated, {
+  interpolateColor,
   runOnJS,
   scrollTo,
   type SharedValue,
@@ -16,6 +17,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from '@/components/Text';
+import type { ReorderImpact } from '@/lib/itinerary/edits';
 
 export type ReorderRow = {
   id: string;
@@ -23,7 +25,17 @@ export type ReorderRow = {
   title: string;
   subtitle?: string;
   isGap?: boolean;
+  /** Travel INTO this stop from the previous located stop, when any — lets the
+   *  rearrange view show WHERE commutes sit and how long they are. */
+  commute?: { icon: keyof typeof Ionicons.glyphMap; label: string; estimated?: boolean };
+  /** True for a pinned `fixed` anchor; surfaced with a lock since dragging one
+   *  unpins it (a reorder softens a moved fixed block to flexible). */
+  fixed?: boolean;
 };
+
+/** 0/1/2 ↔ free/reroute/replan, so the worklet layer can carry the score in a
+ *  plain numeric shared value and the JS layer can talk in names. */
+const IMPACTS: ReorderImpact[] = ['free', 'reroute', 'replan'];
 
 /** One fixed slot height (card + the breathing gap below it). Uniform heights
  *  are what make the drag math exact and the auto-scroll smooth on a long day. */
@@ -64,6 +76,10 @@ type Shared = {
   scrollY: SharedValue<number>;
   viewportH: SharedValue<number>;
   count: SharedValue<number>;
+  /** Impact (0/1/2) of dropping at the slot the finger is currently over. */
+  currentImpact: SharedValue<number>;
+  /** Precomputed impact per candidate drop-slot, scored once on lift. */
+  impactBySlot: SharedValue<Record<number, number>>;
 };
 
 /**
@@ -75,11 +91,19 @@ type Shared = {
 export function ReorderableList({
   rows,
   onReorder,
+  classify,
+  onImpact,
   topInset = 0,
   bottomInset = 0,
 }: {
   rows: ReorderRow[];
   onReorder: (orderedIds: string[]) => void;
+  /** Pure predictor: given a candidate order, what will committing it cost?
+   *  Scored for every drop-slot the moment a row is lifted. */
+  classify?: (orderedIds: string[]) => ReorderImpact;
+  /** Fires as the lifted row crosses an impact boundary (and null on drop), so
+   *  the host can reflect "free / re-route / replan" live. */
+  onImpact?: (impact: ReorderImpact | null) => void;
   topInset?: number;
   bottomInset?: number;
 }) {
@@ -96,6 +120,8 @@ export function ReorderableList({
   const startScroll = useSharedValue(0);
   const tx = useSharedValue(0);
   const autoDir = useSharedValue(0);
+  const currentImpact = useSharedValue(0);
+  const impactBySlot = useSharedValue<Record<number, number>>({});
 
   const ids = useMemo(() => rows.map((r) => r.id), [rows]);
   const rowsKey = ids.join('|');
@@ -124,6 +150,8 @@ export function ReorderableList({
     scrollY,
     viewportH,
     count,
+    currentImpact,
+    impactBySlot,
   };
 
   // Continuous auto-scroll: while a row is held near an edge, slide the list and
@@ -161,7 +189,15 @@ export function ReorderableList({
       }}
     >
       {rows.map((row) => (
-        <DragRow key={row.id} row={row} ids={ids} shared={shared} onCommit={commit} />
+        <DragRow
+          key={row.id}
+          row={row}
+          ids={ids}
+          shared={shared}
+          onCommit={commit}
+          classify={classify}
+          onImpact={onImpact}
+        />
       ))}
     </Animated.ScrollView>
   );
@@ -172,11 +208,15 @@ function DragRow({
   ids,
   shared,
   onCommit,
+  classify,
+  onImpact,
 }: {
   row: ReorderRow;
   ids: string[];
   shared: Shared;
   onCommit: (orderedIds: string[]) => void;
+  classify?: (orderedIds: string[]) => ReorderImpact;
+  onImpact?: (impact: ReorderImpact | null) => void;
 }) {
   const t = useTheme();
   const {
@@ -189,11 +229,35 @@ function DragRow({
     scrollY,
     viewportH,
     count,
+    currentImpact,
+    impactBySlot,
   } = shared;
 
   const pick = () =>
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
   const drop = () => Haptics.selectionAsync().catch(() => undefined);
+  const emitImpact = (n: number) => onImpact?.(IMPACTS[n] ?? 'free');
+  const clearImpact = () => onImpact?.(null);
+
+  // Score every candidate drop-slot ONCE, the moment the row lifts, so the
+  // live readout during the drag is a shared-value lookup (no per-frame JS).
+  const scoreSlots = (draggedId: string) => {
+    if (!classify) return;
+    const from = ids.indexOf(draggedId);
+    if (from < 0) return;
+    const map: Record<number, number> = {};
+    for (let to = 0; to < ids.length; to += 1) {
+      const ord = [...ids];
+      const [moved] = ord.splice(from, 1);
+      ord.splice(to, 0, moved);
+      const imp = classify(ord);
+      map[to] = imp === 'replan' ? 2 : imp === 'reroute' ? 1 : 0;
+    }
+    impactBySlot.value = map;
+    const here = map[from] ?? 0;
+    currentImpact.value = here;
+    onImpact?.(IMPACTS[here] ?? 'free');
+  };
 
   const pan = useMemo(
     () =>
@@ -205,7 +269,10 @@ function DragRow({
           startIndex.value = positions.value[row.id] ?? 0;
           startScroll.value = scrollY.value;
           tx.value = 0;
+          impactBySlot.value = {};
+          currentImpact.value = 0;
           runOnJS(pick)();
+          runOnJS(scoreSlots)(row.id);
         })
         .onUpdate((e) => {
           tx.value = e.translationY;
@@ -213,6 +280,13 @@ function DragRow({
           const ti = clampW(Math.round(top / ROW_H), 0, count.value - 1);
           const ci = positions.value[row.id];
           if (ti !== ci) positions.value = moveSlots(positions.value, ci, ti);
+          // Reflect the impact of dropping at the slot under the finger. Only
+          // notify JS when the LEVEL flips (free↔reroute↔replan), not per slot.
+          const imp = impactBySlot.value[ti] ?? 0;
+          if (imp !== currentImpact.value) {
+            currentImpact.value = imp;
+            runOnJS(emitImpact)(imp);
+          }
           // Edge-proportional auto-scroll direction (-1 up … +1 down).
           const screenY = top - scrollY.value;
           const bottomZone = viewportH.value - ROW_H - EDGE;
@@ -233,10 +307,13 @@ function DragRow({
         .onFinalize(() => {
           activeId.value = null;
           autoDir.value = 0;
+          currentImpact.value = 0;
+          runOnJS(clearImpact)();
         }),
-    // Shared values are stable refs; only the row identity / id set matter.
+    // Shared values are stable refs; rebuild when the row, id set, or the
+    // (itinerary-bound) classifier identity changes so scoring stays fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [row.id, ids],
+    [row.id, ids, classify, onImpact],
   );
 
   const posStyle = useAnimatedStyle(() => {
@@ -260,6 +337,23 @@ function DragRow({
     };
   });
 
+  // While lifted, the card's border tracks the impact of the slot it's over:
+  // green = reflows freely, amber = re-routes the commute, red = needs a replan.
+  const impactStyle = useAnimatedStyle(() => {
+    const isActive = activeId.value === row.id;
+    if (!isActive || !classify) {
+      return { borderColor: t.colors.separator, borderWidth: StyleSheet.hairlineWidth };
+    }
+    return {
+      borderColor: interpolateColor(
+        currentImpact.value,
+        [0, 1, 2],
+        [t.colors.success, t.colors.warning, t.colors.danger],
+      ),
+      borderWidth: 1.5,
+    };
+  });
+
   return (
     <Animated.View style={[styles.slot, posStyle]}>
       <GestureDetector gesture={pan}>
@@ -267,10 +361,8 @@ function DragRow({
           style={[
             styles.card,
             liftStyle,
-            {
-              backgroundColor: row.isGap ? t.colors.fill1 : t.colors.surface2,
-              borderColor: t.colors.separator,
-            },
+            impactStyle,
+            { backgroundColor: row.isGap ? t.colors.fill1 : t.colors.surface2 },
           ]}
         >
           <View
@@ -282,15 +374,29 @@ function DragRow({
             <Text style={styles.emoji}>{row.emoji}</Text>
           </View>
           <View style={styles.body}>
-            <Text variant="bodySm" weight="semibold" numberOfLines={1}>
-              {row.title}
-            </Text>
+            <View style={styles.titleRow}>
+              {row.fixed ? (
+                <Ionicons name="lock-closed" size={12} color={t.colors.warning} />
+              ) : null}
+              <Text variant="bodySm" weight="semibold" numberOfLines={1} style={styles.title}>
+                {row.title}
+              </Text>
+            </View>
             {row.subtitle ? (
               <Text variant="caption" tone="tertiary" numberOfLines={1}>
                 {row.subtitle}
               </Text>
             ) : null}
           </View>
+          {row.commute ? (
+            <View style={[styles.commuteChip, { backgroundColor: t.colors.fill1 }]}>
+              <Ionicons name={row.commute.icon} size={12} color={t.colors.textSecondary} />
+              <Text variant="micro" weight="semibold" tone="secondary">
+                {row.commute.label}
+                {row.commute.estimated ? '~' : ''}
+              </Text>
+            </View>
+          ) : null}
           <Ionicons name="reorder-three" size={24} color={t.colors.textTertiary} />
         </Animated.View>
       </GestureDetector>
@@ -329,4 +435,14 @@ const styles = StyleSheet.create({
   },
   emoji: { fontSize: 18 },
   body: { flex: 1, gap: 1 },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  title: { flexShrink: 1 },
+  commuteChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
 });
