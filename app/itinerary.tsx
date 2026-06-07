@@ -2752,14 +2752,12 @@ function GapCard({
     >
       <View style={styles.itemTopRow}>
         <View style={styles.timeWrap}>
-          <RNText style={styles.gapCardEmoji}>{KIND_EMOJI.gap}</RNText>
           <Text variant="caption" tone="tertiary" weight="semibold" style={styles.timeText}>
             {timeRange ? `Free · ${timeRange}` : 'Free time'}
           </Text>
         </View>
         {item.durationMinutes ? (
           <View style={[styles.durationPill, { backgroundColor: t.colors.surface1 }]}>
-            <Ionicons name="time-outline" size={12} color={t.colors.textSecondary} />
             <Text variant="micro" tone="secondary" weight="semibold">
               {formatDuration(item.durationMinutes)}
             </Text>
@@ -3099,7 +3097,7 @@ function TravelLegRow({
         </View>
       </View>
       <View
-        style={[styles.commutePanel, { backgroundColor: c.fill1 }]}
+        style={styles.commutePanel}
         onLayout={(e) => {
           panelYRef.current = e.nativeEvent.layout.y;
           reportGeometry();
@@ -3283,7 +3281,6 @@ function ItemCard({
         {SHOW_FLEX_BADGES ? <FlexBadge flexibility={item.flexibility} /> : null}
         {item.durationMinutes ? (
           <View style={[styles.durationPill, { backgroundColor: t.colors.fill1 }]}>
-            <Ionicons name="time-outline" size={12} color={t.colors.textSecondary} />
             <Text variant="micro" tone="secondary" weight="semibold">
               {formatDuration(item.durationMinutes)}
             </Text>
@@ -3488,8 +3485,9 @@ const styles = StyleSheet.create({
     flexGrow: 1,
   },
   timeText: {
-    fontSize: 14,
-    letterSpacing: 0.3,
+    fontSize: 13,
+    letterSpacing: 0.2,
+    fontVariant: ['tabular-nums'],
   },
   menuBtn: {
     width: 26,
@@ -3502,8 +3500,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    paddingHorizontal: 9,
-    paddingVertical: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
     borderRadius: 999,
   },
   placeRow: {
@@ -3523,7 +3521,7 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   categoryText: {
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '400',
   },
   openStatus: {
@@ -3737,7 +3735,7 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   gapText: {
-    fontSize: 12.5,
+    fontSize: 13,
     fontWeight: '500',
   },
   gapRowBody: {
@@ -3755,40 +3753,36 @@ const styles = StyleSheet.create({
     paddingHorizontal: 7,
   },
   gapAddText: {
-    fontSize: 11.5,
+    fontSize: 11,
     fontWeight: '700',
   },
   gapCard: {
     borderWidth: 1,
     borderStyle: 'dashed',
-    borderRadius: 16,
+    borderRadius: 18,
     paddingVertical: 12,
     paddingHorizontal: 14,
-  },
-  gapCardEmoji: {
-    fontSize: 13,
   },
   // ---- Commute panel (redesigned travel leg) ----------------------------
   commutePanel: {
     flex: 1,
-    borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    gap: 12,
-    marginVertical: 3,
+    paddingVertical: 4,
+    gap: 10,
+    marginVertical: 2,
   },
   commuteHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
+    gap: 5,
   },
   commuteLeave: {
     fontSize: 13,
-    fontWeight: '700',
+    fontWeight: '600',
     letterSpacing: 0.2,
+    fontVariant: ['tabular-nums'],
   },
   commuteMeta: {
-    fontSize: 12.5,
+    fontSize: 13,
     fontWeight: '500',
   },
   commuteChevron: {
@@ -3798,26 +3792,26 @@ const styles = StyleSheet.create({
   stepBlock: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    gap: 11,
+    gap: 10,
   },
   stepBlockCenter: {
     alignItems: 'center',
   },
   stepGlow: {
     position: 'absolute',
-    top: -7,
-    bottom: -7,
+    top: -6,
+    bottom: -6,
     left: -8,
     right: -8,
-    borderRadius: 11,
+    borderRadius: 10,
     borderWidth: 1.5,
     shadowOffset: { width: 0, height: 0 },
     shadowRadius: 10,
   },
   stepBadge: {
-    width: 34,
-    height: 34,
-    borderRadius: 9,
+    width: 30,
+    height: 30,
+    borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -3842,7 +3836,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0,
   },
   stepMeta: {
-    fontSize: 12.5,
+    fontSize: 13,
     fontWeight: '600',
   },
   stepStops: {
@@ -3865,11 +3859,11 @@ const styles = StyleSheet.create({
   },
   stopName: {
     flex: 1,
-    fontSize: 13.5,
+    fontSize: 13,
     fontWeight: '500',
   },
   stopTime: {
-    fontSize: 13.5,
+    fontSize: 13,
     fontWeight: '600',
     fontVariant: ['tabular-nums'],
   },

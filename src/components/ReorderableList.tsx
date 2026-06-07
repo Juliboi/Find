@@ -420,7 +420,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    borderRadius: 16,
+    borderRadius: 18,
     borderWidth: StyleSheet.hairlineWidth,
     paddingHorizontal: 12,
     shadowColor: '#000',
