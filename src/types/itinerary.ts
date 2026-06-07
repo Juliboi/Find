@@ -84,6 +84,15 @@ export interface TravelStep {
   to?: string;
   /** Minutes spent on this step. */
   durationMinutes?: number;
+  /**
+   * Google's REAL scheduled board time for a transit step, "HH:MM" 24h (e.g.
+   * the bus's "12:40"). Absent for walks and the haversine fallback. The UI
+   * shows this verbatim instead of stacking durations from the leave-by, which
+   * drifted a few minutes early and ignored platform waits.
+   */
+  departAt?: string;
+  /** Google's REAL scheduled alight time for a transit step, "HH:MM" 24h. */
+  arriveAt?: string;
   /** Number of stops ridden on a transit step, when known. */
   numStops?: number;
   /** Geo of the boarding stop, so the journey's stations can be mapped. */
@@ -206,8 +215,6 @@ export interface ItineraryItem {
   gapBeforeMin?: number;
   /** Prose explanation — the Gemini-style "what / why" paragraph. */
   description?: string;
-  /** Optional short highlight bullets (things to see / order / do). */
-  highlights?: string[];
   /**
    * True for the synthetic "Back home" marker the router appends when the day
    * ends away from home. Unlike a normal `travel` block (a train ride, where

@@ -162,6 +162,11 @@ function sanitizeTravelStep(raw: any): TravelStep | undefined {
       durationMinutes !== undefined && durationMinutes > 0
         ? Math.round(durationMinutes)
         : undefined,
+    // Google's REAL scheduled board/alight times ("HH:MM"). Must be preserved
+    // here or the UI silently falls back to its stack-durations guess (the
+    // "152 at 12:37" bug, when the real departure is 12:40).
+    departAt: asHHMM(raw.departAt),
+    arriveAt: asHHMM(raw.arriveAt),
     numStops:
       numStops !== undefined && numStops >= 0 ? Math.round(numStops) : undefined,
     fromCoords: asCoords(raw.fromCoords),
@@ -197,11 +202,6 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
   if (!raw || typeof raw !== 'object') return null;
   const title = asString(raw.title);
   if (!title) return null;
-  const highlights: string[] | undefined = Array.isArray(raw.highlights)
-    ? (raw.highlights as unknown[])
-        .map((h) => asString(h))
-        .filter((h): h is string => Boolean(h))
-    : undefined;
   const kind = sanitizeKind(raw.kind);
   // A gap IS open free time — it must always stay flexible so the elastic
   // scheduler can grow/shrink it and the user can drag it freely. A "fixed"
@@ -228,7 +228,6 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
       return n !== undefined && n >= 0 ? Math.round(n) : undefined;
     })(),
     description: asString(raw.description),
-    highlights: highlights && highlights.length > 0 ? highlights : undefined,
     arrival: raw.arrival === true ? true : undefined,
     orderIndex: index,
   };
@@ -411,7 +410,6 @@ export function sampleItinerary(originLabel?: string): Itinerary {
           },
           description:
             '1–2h of high-focus work in a premium coworking space 5 min from the station. Grab a day pass at reception.',
-          highlights: ['Fast Wi-Fi', 'Phone booths', 'Great coffee'],
         }),
       ],
     },
@@ -483,7 +481,6 @@ export function sampleItinerary(originLabel?: string): Itinerary {
           },
           description:
             'Hearty traditional Moravian cooking right by the square — try the local Olomoucké tvarůžky.',
-          highlights: ['Traditional dishes', 'Local cheese'],
         }),
       ],
     },
@@ -535,7 +532,6 @@ export function sampleItinerary(originLabel?: string): Itinerary {
           },
           description:
             'One of the best bars in the country — 250+ whiskies and perfect Guinness. Cozy spot to catch up before the train home.',
-          highlights: ['250+ whiskies', 'On the way to the station'],
         }),
       ],
     },

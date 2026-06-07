@@ -111,11 +111,11 @@ export function AdjustBar({ visible, busy, bottomInset, onSubmit }: Props) {
           />
         </Pressable>
       </View>
-      {busy ? null : (
+      {/* {busy ? null : (
         <Text variant="micro" tone="tertiary" style={styles.hint}>
           e.g. “lunch 30 min longer”, “skip the column”, “make the evening relaxed”
         </Text>
-      )}
+      )} */}
     </Animated.View>
   );
 }

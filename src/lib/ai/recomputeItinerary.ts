@@ -91,6 +91,16 @@ export async function recomputeItinerary(
     if (error || !data || typeof data !== 'object' || !Array.isArray((data as any).sections)) {
       return { itinerary, refreshed: false };
     }
+    // ROUTE_DEBUG echo: the backend attaches a per-leg ground-truth trace (exact
+    // departure sent to Google, returned duration, and Google's REAL scheduled
+    // board/alight times). Surface it in Metro, then it's dropped by sanitize.
+    if (__DEV__) {
+      const dbg = (data as any).__routeDebug;
+      if (Array.isArray(dbg) && dbg.length) {
+        console.log(`[route-debug] recompute legs (${dbg.length}):`);
+        for (const line of dbg) console.log(`  ${String(line)}`);
+      }
+    }
     // The edge function strips stray AI-emitted travel cards and appends a
     // synthetic "Back home" item without an id. Run the same sanitiser the
     // planner uses so every new section/item gets a stable id, types are

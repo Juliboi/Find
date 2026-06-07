@@ -80,6 +80,10 @@ export interface TravelStep {
   from?: string;
   to?: string;
   durationMinutes?: number;
+  /** Google's REAL scheduled board time, "HH:MM" in the day's tz (transit only). */
+  departAt?: string;
+  /** Google's REAL scheduled alight time, "HH:MM" in the day's tz (transit only). */
+  arriveAt?: string;
   numStops?: number;
   fromCoords?: Coords;
   toCoords?: Coords;
@@ -138,17 +142,63 @@ function latLngOf(loc: any): Coords | undefined {
     : undefined;
 }
 
-/** Pulls a readable walk -> bus -> metro -> train breakdown out of a route. */
-function parseSteps(route: any): TravelStep[] {
+/** DIAGNOSTIC: compact one-line summary of a route's transit spine (duration,
+ *  final arrival, and each vehicle with real board/alight times) — used to log
+ *  every alternative Google returns so we can see if routes[0] is suboptimal. */
+function summarizeRouteTransit(route: any, tz?: string): string {
+  const s = parseInt(String(route?.duration ?? '').replace(/s$/, ''), 10);
+  const m = Number.isFinite(s) ? Math.max(1, Math.round(s / 60)) : 0;
+  const legsArr = Array.isArray(route?.legs) ? route.legs : [];
+  const lines: string[] = [];
+  let lastArr: string | undefined;
+  for (const lg of legsArr) {
+    for (const st of Array.isArray(lg?.steps) ? lg.steps : []) {
+      if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
+        const td = st.transitDetails;
+        const ln = td?.transitLine?.nameShort || td?.transitLine?.name || '?';
+        const dep = td?.stopDetails?.departureTime;
+        const arr = td?.stopDetails?.arrivalTime;
+        if (arr) lastArr = arr;
+        lines.push(
+          `${ln} ${fmtClock(dep, tz)}→${fmtClock(arr, tz)} ` +
+            `(${td?.stopDetails?.departureStop?.name ?? '?'}→${td?.stopDetails?.arrivalStop?.name ?? '?'})`,
+        );
+      }
+    }
+  }
+  return `${m}m | arrive ${fmtClock(lastArr, tz)} | ${lines.join('  ·  ') || '(no transit)'}`;
+}
+
+/** Pulls a readable walk -> bus -> metro -> train breakdown out of a route.
+ *  When `tz` is given, transit steps carry Google's REAL scheduled board/alight
+ *  times (HH:MM) so the UI can show the true "152 at 12:40" instead of a clock
+ *  it reconstructs by stacking durations. */
+function parseSteps(route: any, tz?: string): TravelStep[] {
   const legs = Array.isArray(route?.legs) ? route.legs : [];
   const out: TravelStep[] = [];
+  // Google splits one continuous walk into many turn-by-turn sub-steps. Sum them
+  // in raw SECONDS and round ONCE on flush — rounding each tiny piece and
+  // dropping the <2min ones (as we used to) badly under-counted: a real 10-min
+  // walk to the stop showed as 7. Summing seconds matches Google's "About 10 min".
+  let walkSecs = 0;
+  const flushWalk = () => {
+    const min = Math.round(walkSecs / 60);
+    if (min >= 1) out.push({ mode: 'walk', durationMinutes: min });
+    walkSecs = 0;
+  };
   for (const leg of legs) {
     const steps = Array.isArray(leg?.steps) ? leg.steps : [];
     for (const st of steps) {
       if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
+        flushWalk();
         const td = st.transitDetails;
         const line: string | undefined =
           td?.transitLine?.nameShort || td?.transitLine?.name || undefined;
+        // Real scheduled times only when we can localise them; otherwise leave
+        // unset so the UI falls back to duration-cascade rather than show a
+        // server-tz (UTC) clock.
+        const departAt = tz ? fmtClock(td?.stopDetails?.departureTime, tz) : undefined;
+        const arriveAt = tz ? fmtClock(td?.stopDetails?.arrivalTime, tz) : undefined;
         out.push({
           mode: vehicleToStepMode(td?.transitLine?.vehicle?.type),
           line: typeof line === 'string' ? line : undefined,
@@ -159,18 +209,62 @@ function parseSteps(route: any): TravelStep[] {
             ? td.stopDetails.arrivalStop.name
             : undefined,
           durationMinutes: secsToMin(st?.staticDuration),
+          departAt: departAt && departAt !== '--:--' ? departAt : undefined,
+          arriveAt: arriveAt && arriveAt !== '--:--' ? arriveAt : undefined,
           numStops: typeof td?.stopCount === 'number' ? td.stopCount : undefined,
           fromCoords: latLngOf(td?.stopDetails?.departureStop?.location),
           toCoords: latLngOf(td?.stopDetails?.arrivalStop?.location),
         });
       } else if (st?.travelMode === 'WALK') {
-        const dmin = secsToMin(st?.staticDuration);
-        // Skip trivial in-station shuffles; keep walks that matter.
-        if (dmin && dmin >= 2) out.push({ mode: 'walk', durationMinutes: dmin });
+        const s =
+          typeof st?.staticDuration === 'string'
+            ? parseInt(st.staticDuration.replace(/s$/, ''), 10)
+            : Number(st?.staticDuration);
+        if (Number.isFinite(s) && s > 0) walkSecs += s;
       }
     }
   }
+  flushWalk();
   return out;
+}
+
+/** Raw seconds from a Routes API "123s" duration string (or number). */
+function rawSecondsOf(v: unknown): number {
+  const s = typeof v === 'string' ? parseInt(v.replace(/s$/, ''), 10) : Number(v);
+  return Number.isFinite(s) ? s : 0;
+}
+
+/**
+ * Real wall-clock arrival at the destination for one returned route: the last
+ * transit alight + any trailing walk to the door. This is the right basis for
+ * "which alternative is best" — NOT route.duration, which excludes the initial
+ * wait at the origin (an alt that leaves 30 min later can show a smaller
+ * duration yet arrive much later). Pure-walk routes use departure + total walk.
+ * Returns null when arrival can't be determined (caller keeps routes[0]).
+ */
+function routeArrivalMs(route: any, departureTime?: Date): number | null {
+  const legs = Array.isArray(route?.legs) ? route.legs : [];
+  let lastTransitArrMs: number | null = null;
+  let trailingWalkSecs = 0;
+  let totalWalkSecs = 0;
+  for (const lg of legs) {
+    for (const st of Array.isArray(lg?.steps) ? lg.steps : []) {
+      if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
+        const ms = Date.parse(st.transitDetails?.stopDetails?.arrivalTime ?? '');
+        if (Number.isFinite(ms)) {
+          lastTransitArrMs = ms;
+          trailingWalkSecs = 0; // walks after this hop count toward arrival
+        }
+      } else if (st?.travelMode === 'WALK') {
+        const s = rawSecondsOf(st?.staticDuration);
+        trailingWalkSecs += s;
+        totalWalkSecs += s;
+      }
+    }
+  }
+  if (lastTransitArrMs != null) return lastTransitArrMs + trailingWalkSecs * 1000;
+  if (departureTime) return departureTime.getTime() + totalWalkSecs * 1000;
+  return null;
 }
 
 /**
@@ -184,6 +278,8 @@ async function computeRoute(
   mode: TravelMode,
   apiKey: string,
   departureTime?: Date,
+  tz?: string,
+  dbg?: { label: string; planned: string; tz?: string; sink?: string[] },
 ): Promise<RouteResult | null> {
   try {
     const body: Record<string, unknown> = {
@@ -199,6 +295,11 @@ async function computeRoute(
       body.departureTime = departureTime.toISOString();
       if (mode === 'drive') body.routingPreference = 'TRAFFIC_AWARE';
     }
+    // For transit, ask Google for every alternative and pick the earliest-arriving
+    // one ourselves (below). Without this, computeRoutes returns a SINGLE default
+    // route that isn't always the soonest — that's why "Back home" kept choosing
+    // 152/Ládví (arrive 18:25) over 145/Kobylisy (arrive 18:20, what Maps shows).
+    if (mode === 'transit') body.computeAlternativeRoutes = true;
     const res = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
       method: 'POST',
       headers: {
@@ -211,20 +312,102 @@ async function computeRoute(
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const route = Array.isArray(data?.routes) ? data.routes[0] : null;
-    if (!route) return null;
+    const routes = Array.isArray(data?.routes) ? data.routes : [];
+    if (routes.length === 0) return null;
+    // Pick the route that ARRIVES soonest (matches how Maps ranks), not just
+    // routes[0]. Google's default single route isn't always the earliest.
+    let route = routes[0];
+    if (routes.length > 1) {
+      let bestMs = routeArrivalMs(route, departureTime);
+      for (let i = 1; i < routes.length; i++) {
+        const ms = routeArrivalMs(routes[i], departureTime);
+        if (ms != null && (bestMs == null || ms < bestMs)) {
+          bestMs = ms;
+          route = routes[i];
+        }
+      }
+    }
     const secs =
       typeof route.duration === 'string'
         ? parseInt(route.duration.replace(/s$/, ''), 10)
         : Number(route.duration);
     if (!Number.isFinite(secs)) return null;
-    const steps = parseSteps(route);
+    const steps = parseSteps(route, tz);
     const polyline =
       typeof route?.polyline?.encodedPolyline === 'string'
         ? route.polyline.encodedPolyline
         : undefined;
+    const googleMin = Math.max(1, Math.round(secs / 60));
+    // Google's transit `duration` is measured from the OPTIMAL departure — it
+    // assumes you leave just in time to board the first vehicle, so it EXCLUDES
+    // the slack between the planned leave and that first board. Scheduling the
+    // next item as `leaveBy + duration` therefore lands EARLY (the "arrive 18:21
+    // but the 145 + final walk really gets you home 18:25" bug). When we know the
+    // real arrival (last alight + trailing walk) and the departure we sent, use
+    // that TRUE door-to-door span so every following item cascades off the real
+    // time you're back, not Google's slack-trimmed figure.
+    let minutes = googleMin;
+    if (mode === 'transit' && departureTime) {
+      const arrivalMs = routeArrivalMs(route, departureTime);
+      if (arrivalMs != null) {
+        const spanMin = Math.round((arrivalMs - departureTime.getTime()) / 60000);
+        if (spanMin >= 1) minutes = spanMin;
+      }
+    }
+
+    // Ground-truth trace: compare the REAL scheduled board/alight times Google
+    // returned against the single duration we keep (and the synthetic step times
+    // the UI reconstructs). This is what disambiguates "stale/worse route" from
+    // "right route, wrong wall-clock".
+    if (dbg) {
+      const legsArr = Array.isArray(route?.legs) ? route.legs : [];
+      const parts: string[] = [];
+      let firstDep: string | undefined;
+      let lastArr: string | undefined;
+      for (const lg of legsArr) {
+        for (const st of Array.isArray(lg?.steps) ? lg.steps : []) {
+          if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
+            const td = st.transitDetails;
+            const line = td?.transitLine?.nameShort || td?.transitLine?.name || '?';
+            const dep = td?.stopDetails?.departureTime;
+            const arr = td?.stopDetails?.arrivalTime;
+            if (!firstDep) firstDep = dep;
+            if (arr) lastArr = arr;
+            parts.push(
+              `${line} ${fmtClock(dep, dbg.tz)}→${fmtClock(arr, dbg.tz)} ` +
+                `(${td?.stopDetails?.departureStop?.name ?? '?'}→${td?.stopDetails?.arrivalStop?.name ?? '?'})`,
+            );
+          } else if (st?.travelMode === 'WALK') {
+            const w = secsToMin(st?.staticDuration);
+            if (w) parts.push(`walk ${w}m`);
+          }
+        }
+      }
+      const o = `${origin.latitude.toFixed(5)},${origin.longitude.toFixed(5)}`;
+      const d = `${dest.latitude.toFixed(5)},${dest.longitude.toFixed(5)}`;
+      const line =
+        `[route] ${dbg.label} | planned ${dbg.planned} | sent ` +
+        `${departureTime ? departureTime.toISOString() : 'NOW (no time-aware)'} | ` +
+        `from ${o} → ${d} | ` +
+        `${mode} google=${googleMin}m${minutes !== googleMin ? ` →span ${minutes}m (incl. pre-board slack)` : ''} | ` +
+        `real ${fmtClock(firstDep, dbg.tz)}→${fmtClock(lastArr, dbg.tz)} | ` +
+        (parts.length ? parts.join('  ·  ') : '(no transit steps)');
+      console.log(line);
+      dbg.sink?.push(line);
+
+      // Every alternative Google offered, ranked as returned. "(chosen)" now marks
+      // the earliest-arriving route we actually selected — which may NOT be alt#0.
+      if (routes.length > 1) {
+        routes.forEach((rt: any, i: number) => {
+          const altLine = `[route]   alt#${i}${rt === route ? ' (chosen)' : ''}: ${summarizeRouteTransit(rt, dbg.tz)}`;
+          console.log(altLine);
+          dbg.sink?.push(altLine);
+        });
+      }
+    }
+
     return {
-      minutes: Math.max(1, Math.round(secs / 60)),
+      minutes,
       distanceMeters: typeof route.distanceMeters === 'number' ? route.distanceMeters : undefined,
       steps: steps.length > 1 ? steps : undefined,
       polyline,
@@ -251,11 +434,33 @@ export function fmtHHMM(totalMin: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+/** Formats an RFC3339 instant as local HH:MM in `tz` — debug only, used to show
+ *  Google's REAL transit board/alight times next to what we schedule. */
+function fmtClock(iso: string | undefined, tz?: string): string {
+  if (!iso) return '--:--';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '--:--';
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(d);
+  } catch {
+    return d.toISOString().slice(11, 16);
+  }
+}
+
 export interface RouteTiming {
   /** IANA zone of the day (e.g. "Europe/Prague"), from the client device. */
   timezone?: string;
   /** "Now" per the client, so a stale departure in the past is dropped. */
   now?: Date;
+  /** ROUTE_DEBUG sink: when present, each leg's ground-truth `[route]` trace is
+   *  pushed here (in addition to console.log) so the caller can echo it back to
+   *  the client and read it in Metro instead of the dashboard. */
+  debugSink?: string[];
 }
 
 /**
@@ -391,11 +596,20 @@ async function computeLeg(
   apiKey: string,
   fromLabel?: string,
   departureTime?: Date,
+  tz?: string,
+  dbg?: { label: string; planned: string; tz?: string; sink?: string[] },
 ): Promise<any> {
   const straight = haversineMeters(origin, dest);
   const distanceM = Math.round(straight * DETOUR_FACTOR);
   const mode = pickMode(distanceM);
-  const routed = await computeRoute(origin, dest, mode, apiKey, departureTime);
+  const routed = await computeRoute(origin, dest, mode, apiKey, departureTime, tz, dbg);
+  if (dbg && !routed) {
+    const line =
+      `[route] ${dbg.label} | planned ${dbg.planned} | real route UNAVAILABLE → ` +
+      `haversine ${estimateMinutes(distanceM, mode)}m (${mode}, est)`;
+    console.log(line);
+    dbg.sink?.push(line);
+  }
   const leg: any = routed
     ? {
         mode,
@@ -524,26 +738,33 @@ export async function routeAndSchedule(
       });
     }
 
+    // Enable with the ROUTE_DEBUG=1 secret and read via the dashboard or
+    // `supabase functions logs recompute-itinerary`. Each leg prints the exact
+    // departure we sent, the duration Google returned, AND Google's real
+    // scheduled board/alight times — so "off by a few minutes" vs "wrong route
+    // entirely" is one reproduction away.
     const routeDebug = !!Deno?.env?.get?.('ROUTE_DEBUG');
     await Promise.all(
       hops.map(async (h) => {
         const departureTime = buildDeparture(parsed?.date, h.departureMin, timing);
-        const leg = await computeLeg(h.origin, h.dest, apiKey, h.fromLabel, departureTime);
-        h.item.travelFromPrev = leg;
-        // Ground-truth trace of the time-aware decision (enable with ROUTE_DEBUG=1
-        // and read via `supabase functions logs recompute-itinerary`). Shows the
-        // exact departure sent to Google — or that it fell back to "now" — so a
-        // "the commute didn't reflect my planned time" report is one log away.
-        if (routeDebug) {
-          const planned =
-            h.departureMin != null && h.departureMin >= 0 ? fmtHHMM(h.departureMin) : '--:--';
-          console.log(
-            `[route] -> ${h.item?.title ?? 'Back home'}: planned ${planned} | depart ` +
-              `${departureTime ? departureTime.toISOString() : 'NOW (past/unresolved → fallback)'}` +
-              ` => ${leg?.mode ?? '?'} ${Math.round(leg?.minutes ?? 0)}m` +
-              `${leg?.estimated ? ' (estimated)' : ''}`,
-          );
-        }
+        const dbg = routeDebug
+          ? {
+              label: h.item?.title ?? 'Back home',
+              planned:
+                h.departureMin != null && h.departureMin >= 0 ? fmtHHMM(h.departureMin) : '--:--',
+              tz: timing.timezone,
+              sink: timing.debugSink,
+            }
+          : undefined;
+        h.item.travelFromPrev = await computeLeg(
+          h.origin,
+          h.dest,
+          apiKey,
+          h.fromLabel,
+          departureTime,
+          timing.timezone,
+          dbg,
+        );
       }),
     );
 

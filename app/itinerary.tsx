@@ -136,15 +136,100 @@ const CARD_RADIUS = 18;
 const PAST_OPACITY = 0.4;
 
 /**
- * The minute-of-day a block ends. Falls back to start (+duration) when no
- * explicit end is given, so the time logic still works for partial entries.
+ * Absolute (midnight-unwrapped) start/end for one block, in minutes measured
+ * from the plan's first morning. Times after midnight keep climbing past 1440
+ * so a late-night plan that rolls over (22:20 → 01:00) stays monotonic instead
+ * of wrapping the after-midnight blocks back to tiny morning minutes.
  */
-function itemEndMin(it: ItineraryItem): number {
-  const e = minutesOfDay(it.endTime);
-  if (e != null) return e;
-  const s = minutesOfDay(it.startTime);
-  if (s != null) return s + (it.durationMinutes ?? 0);
-  return Number.POSITIVE_INFINITY;
+interface AbsSpan {
+  start: number | null;
+  end: number;
+}
+
+interface AbsTimeline {
+  byId: Record<string, AbsSpan>;
+  /** Absolute minute the day starts (first block's start); null if untimed. */
+  dayStart: number | null;
+  /** Absolute minute the day ends (latest block end); equals dayStart if empty. */
+  dayEnd: number;
+}
+
+/**
+ * Lift a plan's "HH:MM" times onto one continuous timeline so a day that
+ * crosses midnight stays ordered. Walking blocks in order, any start that
+ * reads EARLIER than the previous one means the clock rolled past midnight, so
+ * every time from there on gains a full day (+1440). A same-day plan never
+ * trips the rollover, so its absolute minutes equal its raw minutes — behaviour
+ * is unchanged for the common case.
+ */
+function buildAbsoluteTimeline(items: ItineraryItem[]): AbsTimeline {
+  const byId: Record<string, AbsSpan> = {};
+  let prevStart: number | null = null;
+  let dayStart: number | null = null;
+  let dayEnd = Number.NEGATIVE_INFINITY;
+  for (const it of items) {
+    const rawStart = minutesOfDay(it.startTime);
+    let start: number | null = null;
+    if (rawStart != null) {
+      let s = rawStart;
+      while (prevStart != null && s < prevStart) s += 1440;
+      start = s;
+      prevStart = s;
+      if (dayStart == null) dayStart = s;
+    }
+    const rawEnd = minutesOfDay(it.endTime);
+    let end: number;
+    if (rawEnd != null) {
+      let e = rawEnd;
+      // Anchor the end to its own start so a block that itself spans midnight
+      // (23:50 → 00:10) reads as 10 minutes, not a day backwards.
+      const base = start ?? prevStart;
+      while (base != null && e < base) e += 1440;
+      end = e;
+    } else if (start != null) {
+      end = start + (it.durationMinutes ?? 0);
+    } else {
+      end = Number.POSITIVE_INFINITY;
+    }
+    if (Number.isFinite(end)) dayEnd = Math.max(dayEnd, end);
+    byId[it.id] = { start, end };
+  }
+  return {
+    byId,
+    dayStart,
+    dayEnd: Number.isFinite(dayEnd) ? dayEnd : dayStart ?? 0,
+  };
+}
+
+/**
+ * Place the live wall clock on the same unwrapped axis as `buildAbsoluteTimeline`.
+ *
+ * A plan stored as bare "HH:MM" carries no date, so a time like "01:00" is
+ * ambiguous: it could be the small hours of a night that's still unfolding, or
+ * roughly a day away. We resolve it by snapping `now` to whichever 24h cycle
+ * sits CLOSEST to the plan's [dayStart, dayEnd] window — if the clock already
+ * falls inside the plan we take it verbatim, otherwise we try ±a day and keep
+ * the nearest. Two cases this gets right that a naive raw compare didn't:
+ *   - A plan living ENTIRELY after midnight (a 00:30 → 03:00 night out) reads as
+ *     UPCOMING while it's still 22:xx the evening before, instead of 22:xx >
+ *     03:00 wrongly marking the whole thing finished (→ every block greyed).
+ *   - It still flips to "done" once the clock genuinely passes the plan.
+ */
+function toAbsoluteNow(rawNow: number, dayStart: number | null, dayEnd: number): number {
+  if (dayStart == null) return rawNow;
+  const distToPlan = (x: number) =>
+    x < dayStart ? dayStart - x : x > dayEnd ? x - dayEnd : 0;
+  let best = rawNow;
+  let bestDist = distToPlan(rawNow);
+  // A plan never spans more than a day, so the right cycle is at most ±1 away.
+  for (const shift of [-1440, 1440]) {
+    const d = distToPlan(rawNow + shift);
+    if (d < bestDist) {
+      best = rawNow + shift;
+      bestDist = d;
+    }
+  }
+  return best;
 }
 
 /**
@@ -164,6 +249,42 @@ function isArrivalMarker(it: ItineraryItem): boolean {
     !it.durationMinutes
   );
 }
+
+/**
+ * The window you are actually IN TRANSIT on the leg feeding `item`, in ABSOLUTE
+ * (midnight-unwrapped) minutes `[depart, arrive]`. This is what lets the
+ * progress head track the commute and the active hop glow while you're en
+ * route, exactly like a normal block does — and it stays correct across
+ * midnight because `arrive` comes from the unwrapped timeline.
+ *
+ * Returns null when the item has no incoming leg, no known start, or IS itself
+ * the journey (a real `kind: 'travel'` ride) — there the card, not the
+ * connector, represents the trip. Arrival markers ("Back home") keep a window
+ * because their leg home is a connector and their `startTime` is the arrival.
+ */
+function absCommuteWindow(
+  item: ItineraryItem,
+  byId: Record<string, AbsSpan>,
+): { depart: number; arrive: number } | null {
+  const leg = item.travelFromPrev;
+  if (!leg) return null;
+  if (item.kind === 'travel' && !isArrivalMarker(item)) return null;
+  const arrive = byId[item.id]?.start;
+  if (arrive == null) return null;
+  const depart = arrive - leg.minutes;
+  if (!(depart < arrive)) return null;
+  return { depart, arrive };
+}
+
+/**
+ * One measured hop of a commute: its real clock window (`t0`→`t1`, minutes of
+ * day) paired with the pixel band (`top`→`bottom`) of its row, measured
+ * relative to the top of the leg's wrapper. The rail maps each hop's OWN time
+ * interval onto its OWN row, so the playhead sits on the exact leg you're
+ * riding (the 12-min bus, not an averaged-out blob across the whole panel)
+ * while the trip as a whole still flows top-to-bottom continuously.
+ */
+type StepRect = { t0: number; t1: number; top: number; bottom: number };
 
 const PLANNING_PHASES = [
   'Drafting your day…',
@@ -405,6 +526,8 @@ export default function ItineraryScreen() {
   const timeFillY = useSharedValue(0);
   const contentH = useSharedValue(screenH);
   const glowPulse = useSharedValue(0);
+  // Holds the wall clock on the UNWRAPPED axis (see `nowAbs`), so the rail's
+  // off-render recompute compares like-for-like with the absolute anchors.
   const nowRef = useRef(nowMin);
 
   // A single, ever-running pulse shared by every glowing element so the whole
@@ -420,6 +543,14 @@ export default function ItineraryScreen() {
   // Each card's offset/height *within its wrapper* — combined with the wrapper
   // offset above, this gives the card's absolute top/bottom for time mapping.
   const cardRawRef = useRef<Record<string, { relY: number; h: number }>>({});
+  // Each commute (travel) row's offset/height *within its wrapper*, mirroring
+  // `cardRawRef`. Lets the rail map the commute's time window onto its own band
+  // so the playhead tracks "you're on the bus" instead of jumping card-to-card.
+  const legRawRef = useRef<Record<string, { relY: number; h: number }>>({});
+  // Per-commute step geometry (each hop's time window + pixel band relative to
+  // the leg top), reported up by `TravelLegRow`. Drives the fine-grained,
+  // per-hop progress so the head lands on the exact step (walk / bus 200).
+  const legStepsRef = useRef<Record<string, StepRect[]>>({});
   const tabOffsetsRef = useRef<number[]>([]);
 
   // Memoised so it's stable across renders — effects that depend on `context`
@@ -516,6 +647,26 @@ export default function ItineraryScreen() {
   const flatItemsRef = useRef(flatItems);
   flatItemsRef.current = flatItems;
 
+  // Unwrapped time axis so a plan that crosses midnight (a 22:20 → 01:30 night)
+  // stays ordered: blocks after midnight climb past 1440 instead of wrapping to
+  // tiny morning minutes (which made them read as "already over" → greyed out,
+  // and broke the now/progress logic). Same-day plans get raw==absolute minutes.
+  const { byId: absById, dayStart: dayStartMin, dayEnd: dayEndMin } = useMemo(
+    () => buildAbsoluteTimeline(flatItems),
+    [flatItems],
+  );
+  const absByIdRef = useRef(absById);
+  absByIdRef.current = absById;
+  const dayBoundsRef = useRef({ start: dayStartMin, end: dayEndMin });
+  dayBoundsRef.current = { start: dayStartMin, end: dayEndMin };
+  // The wall clock on that same axis (rolls past midnight while a night plan is
+  // still running). Drives every "now / past / progress" comparison below.
+  const nowAbs = useMemo(
+    () => toAbsoluteNow(nowMin, dayStartMin, dayEndMin),
+    [nowMin, dayStartMin, dayEndMin],
+  );
+  nowRef.current = nowAbs;
+
   // Compact rows for the long-press drag-and-drop rearrange view. Each row also
   // carries the commute INTO it (so you can see where travel sits + how long)
   // and whether it's a pinned anchor (dragging it unpins it).
@@ -607,9 +758,28 @@ export default function ItineraryScreen() {
   // The block happening now (or the next one up if we're between blocks): the
   // first whose end is still in the future. This is the one that glows.
   const nowItemId = useMemo(() => {
-    for (const it of flatItems) if (itemEndMin(it) > nowMin) return it.id;
+    for (const it of flatItems) if ((absById[it.id]?.end ?? Infinity) > nowAbs) return it.id;
     return null;
-  }, [flatItems, nowMin]);
+  }, [flatItems, absById, nowAbs]);
+
+  // The commute happening now: the item whose incoming leg's [depart, arrive]
+  // window contains the clock — i.e. you're mid-journey TO it. While set, that
+  // connector glows instead of the destination card (you haven't arrived yet).
+  const nowLegId = useMemo(() => {
+    for (const it of flatItems) {
+      const w = absCommuteWindow(it, absById);
+      if (w && nowAbs >= w.depart && nowAbs < w.arrive) return it.id;
+    }
+    return null;
+  }, [flatItems, absById, nowAbs]);
+
+  // Blocks already finished (dimmed). Keyed off the unwrapped end so a plan that
+  // runs past midnight isn't wrongly greyed because "01:00" < the evening clock.
+  const pastIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const it of flatItems) if ((absById[it.id]?.end ?? Infinity) <= nowAbs) s.add(it.id);
+    return s;
+  }, [flatItems, absById, nowAbs]);
 
   // Lookups keyed on the latest conflict set / open menus, so the renderer
   // doesn't have to walk the array per card.
@@ -638,11 +808,38 @@ export default function ItineraryScreen() {
     const anchors: { t: number; y: number }[] = [];
     for (const it of flatItemsRef.current) {
       const wrapY = itemOffsetsRef.current[it.id];
+      if (wrapY == null) continue;
+      // Commute band: map the journey onto the measured travel row so the head
+      // creeps down the bus/train while you ride it. Pushed before the card
+      // anchors so it lands just above this card's start.
+      const legRaw = legRawRef.current[it.id];
+      if (legRaw) {
+        const legTop = wrapY + legRaw.relY;
+        const stepRects = legStepsRef.current[it.id];
+        if (stepRects && stepRects.length > 0) {
+          // Per-hop: each step maps its OWN real clock interval onto its OWN
+          // row, so 22:25 lands partway down the "bus 200" row, not at the 50%
+          // mark of an averaged whole-leg band.
+          for (const r of stepRects) {
+            anchors.push({ t: r.t0, y: legTop + r.top });
+            anchors.push({ t: r.t1, y: legTop + r.bottom });
+          }
+        } else {
+          // Fallback (haversine leg, no measured steps): one linear band across
+          // the whole panel.
+          const w = absCommuteWindow(it, absByIdRef.current);
+          if (w) {
+            anchors.push({ t: w.depart, y: legTop });
+            anchors.push({ t: w.arrive, y: legTop + legRaw.h });
+          }
+        }
+      }
       const raw = cardRawRef.current[it.id];
-      if (wrapY == null || raw == null) continue;
+      if (raw == null) continue;
       const top = wrapY + raw.relY;
-      const s = minutesOfDay(it.startTime);
-      const e = itemEndMin(it);
+      const span = absByIdRef.current[it.id];
+      const s = span?.start ?? null;
+      const e = span?.end ?? Number.POSITIVE_INFINITY;
       if (s != null) anchors.push({ t: s, y: top });
       if (Number.isFinite(e) && (s == null || e > s)) anchors.push({ t: e, y: top + raw.h });
     }
@@ -672,7 +869,8 @@ export default function ItineraryScreen() {
     if (!itinerary) return;
     const tick = () => {
       const m = minutesOfDay(currentHHMM()) ?? 0;
-      nowRef.current = m;
+      const { start, end } = dayBoundsRef.current;
+      nowRef.current = toAbsoluteNow(m, start, end);
       setNowMin(m);
       recomputeTimeFill();
     };
@@ -689,15 +887,15 @@ export default function ItineraryScreen() {
     for (let i = 1; i < flatItems.length; i++) {
       const prev = flatItems[i - 1];
       const cur = flatItems[i];
-      const prevEnd = minutesOfDay(prev.endTime) ?? minutesOfDay(prev.startTime);
-      const curStart = minutesOfDay(cur.startTime);
-      if (prevEnd == null || curStart == null) continue;
+      const prevEnd = absById[prev.id]?.end ?? null;
+      const curStart = absById[cur.id]?.start ?? null;
+      if (prevEnd == null || !Number.isFinite(prevEnd) || curStart == null) continue;
       const travel = Number(cur.travelFromPrev?.minutes) || 0;
       const gap = curStart - prevEnd - travel;
       if (gap >= GAP_MIN_MINUTES) map[cur.id] = gap;
     }
     return map;
-  }, [flatItems]);
+  }, [flatItems, absById]);
 
   // Everything the map draws: the home pin, numbered activity stops, the
   // transit stations along the way (waypoints), and the real route line
@@ -775,6 +973,8 @@ export default function ItineraryScreen() {
     sectionOffsetsRef.current = [];
     itemOffsetsRef.current = {};
     cardRawRef.current = {};
+    legRawRef.current = {};
+    legStepsRef.current = {};
     tabOffsetsRef.current = [];
     setActiveSectionIndex(0);
     setActiveStopId(null);
@@ -1551,11 +1751,14 @@ export default function ItineraryScreen() {
                   conflictIds={conflictIds}
                   glow={glowPulse}
                   nowItemId={nowItemId}
-                  nowMin={nowMin}
+                  nowLegId={nowLegId}
+                  nowAbs={nowAbs}
+                  absById={absById}
+                  pastIds={pastIds}
                   sectionActive={si === nowSectionIndex}
                   sectionPast={
                     section.items.length > 0 &&
-                    section.items.every((it) => itemEndMin(it) <= nowMin)
+                    section.items.every((it) => (absById[it.id]?.end ?? Infinity) <= nowAbs)
                   }
                   rearrangeMode={rearrangeMode}
                   onEnterRearrange={enterRearrange}
@@ -1572,6 +1775,14 @@ export default function ItineraryScreen() {
                   }}
                   onCardLayout={(id, relY, h) => {
                     cardRawRef.current[id] = { relY, h };
+                    recomputeTimeFill();
+                  }}
+                  onLegLayout={(id, relY, h) => {
+                    legRawRef.current[id] = { relY, h };
+                    recomputeTimeFill();
+                  }}
+                  onLegStepsGeometry={(id, rects) => {
+                    legStepsRef.current[id] = rects;
                     recomputeTimeFill();
                   }}
                 />
@@ -1954,7 +2165,10 @@ function SectionBlock({
   conflictIds,
   glow,
   nowItemId,
-  nowMin,
+  nowLegId,
+  nowAbs,
+  absById,
+  pastIds,
   sectionActive,
   sectionPast,
   rearrangeMode,
@@ -1966,6 +2180,8 @@ function SectionBlock({
   onSectionLayout,
   onItemLayout,
   onCardLayout,
+  onLegLayout,
+  onLegStepsGeometry,
 }: {
   section: ItinerarySection;
   first: boolean;
@@ -1976,7 +2192,14 @@ function SectionBlock({
   conflictIds: Set<string>;
   glow: SharedValue<number>;
   nowItemId: string | null;
-  nowMin: number;
+  /** Item whose incoming commute is happening right now (glows the connector). */
+  nowLegId: string | null;
+  /** Wall clock on the unwrapped (midnight-aware) axis. */
+  nowAbs: number;
+  /** Unwrapped start/end per item id — used for the active hop's depart anchor. */
+  absById: Record<string, AbsSpan>;
+  /** Item ids whose block has already finished (dimmed). */
+  pastIds: Set<string>;
   sectionActive: boolean;
   sectionPast: boolean;
   /** True only in rearrange mode; here it just suppresses card taps (the drag
@@ -1994,6 +2217,10 @@ function SectionBlock({
   onSectionLayout: (y: number) => void;
   onItemLayout: (id: string, y: number) => void;
   onCardLayout: (id: string, relY: number, h: number) => void;
+  /** Reports the commute row's offset/height within the item wrapper. */
+  onLegLayout: (id: string, relY: number, h: number) => void;
+  /** Reports each commute step's time window + pixel band (relative to leg top). */
+  onLegStepsGeometry: (id: string, rects: StepRect[]) => void;
 }) {
   const t = useTheme();
   const base = Math.min(index * 50, 150);
@@ -2013,9 +2240,18 @@ function SectionBlock({
       </Animated.View>
       {section.items.map((item, i) => {
         const active = item.id === nowItemId;
-        const past = itemEndMin(item) <= nowMin;
+        // True while you're mid-commute TO this item: the connector glows and
+        // the (not-yet-reached) destination card's glow is held back.
+        const legActive = item.id === nowLegId;
+        const past = pastIds.has(item.id);
         const leg = item.travelFromPrev;
         const isGapItem = item.kind === 'gap';
+        // Absolute departure for this item's incoming leg, so the commute's hops
+        // can be unwrapped onto the same midnight-aware axis as the rail.
+        const legStartAbs =
+          leg && absById[item.id]?.start != null
+            ? (absById[item.id]!.start as number) - leg.minutes
+            : undefined;
         // "Leave by HH:MM" semantics depend on what kind of item the leg
         // is feeding:
         //   - Normal item (meal, work, meetup, …): item.startTime is when
@@ -2051,11 +2287,22 @@ function SectionBlock({
                 />
               ) : null}
               {leg ? (
-                <TravelLegRow
-                  leg={leg}
-                  leaveBy={leaveBy}
-                  onPress={rearrangeMode ? undefined : () => onPressLeg(item)}
-                />
+                <View
+                  onLayout={(e) =>
+                    onLegLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
+                  }
+                >
+                  <TravelLegRow
+                    leg={leg}
+                    leaveBy={leaveBy}
+                    active={legActive && !rearrangeMode}
+                    glow={glow}
+                    nowAbs={nowAbs}
+                    legStartAbs={legStartAbs}
+                    onStepsGeometry={(rects) => onLegStepsGeometry(item.id, rects)}
+                    onPress={rearrangeMode ? undefined : () => onPressLeg(item)}
+                  />
+                </View>
               ) : null}
               <Pressable
                 onLongPress={rearrangeMode ? undefined : onEnterRearrange}
@@ -2079,7 +2326,7 @@ function SectionBlock({
                     hasConflict={conflictIds.has(item.id)}
                   />
                 )}
-                {active && !rearrangeMode ? <CardGlow glow={glow} /> : null}
+                {active && !rearrangeMode && !legActive ? <CardGlow glow={glow} /> : null}
               </Pressable>
             </View>
           </Animated.View>
@@ -2283,26 +2530,42 @@ function CardGlow({ glow }: { glow: SharedValue<number> }) {
   );
 }
 
+/**
+ * Pulsing highlight over the single commute hop you're riding right now (the
+ * walk, or "bus 200"). A soft accent fill + glowing border, inset slightly
+ * beyond the row via negative margins so it reads as a highlighted section
+ * without nudging the surrounding layout (it's absolutely positioned).
+ */
+function StepGlow({ glow, colors }: { glow: SharedValue<number>; colors: ThemeColors }) {
+  const aStyle = useAnimatedStyle(() => ({
+    opacity: 0.85 + glow.value * 0.15,
+    shadowOpacity: 0.25 + glow.value * 0.4,
+  }));
+  return (
+    <Animated.View
+      pointerEvents="none"
+      entering={FadeIn.duration(200)}
+      style={[
+        styles.stepGlow,
+        {
+          backgroundColor: colors.accentSoft,
+          borderColor: colors.accent,
+          shadowColor: colors.accent,
+        },
+        aStyle,
+      ]}
+    />
+  );
+}
+
 function FlexBadge({ flexibility }: { flexibility: TimeFlexibility }) {
   const t = useTheme();
-  const map: Record<
-    TimeFlexibility,
-    { label: string; bg: string; color: string; icon: keyof typeof Ionicons.glyphMap }
-  > = {
-    fixed: { label: 'Fixed', bg: t.colors.warningSoft, color: t.colors.warning, icon: 'lock-closed' },
-    window: { label: 'Window', bg: t.colors.infoSoft, color: t.colors.info, icon: 'time-outline' },
-    flexible: {
-      label: 'Flexible',
-      bg: t.colors.successSoft,
-      color: t.colors.success,
-      icon: 'swap-vertical',
-    },
-  };
-  const cfg = map[flexibility];
+  // Only "fixed" items carry a marker now, and it's just the lock icon — no
+  // text label. "window" and "flexible" render nothing so cards stay clean.
+  if (flexibility !== 'fixed') return null;
   return (
-    <View style={[styles.flexBadge, { backgroundColor: cfg.bg }]}>
-      <Ionicons name={cfg.icon} size={11} color={cfg.color} />
-      <RNText style={[styles.flexBadgeText, { color: cfg.color }]}>{cfg.label}</RNText>
+    <View style={[styles.flexBadge, { backgroundColor: t.colors.warningSoft }]}>
+      <Ionicons name="lock-closed" size={11} color={t.colors.warning} />
     </View>
   );
 }
@@ -2535,6 +2798,8 @@ function CommuteStep({
   endTime,
   fromLabel,
   colors,
+  active,
+  glow,
 }: {
   step: TravelStep;
   /** Cascaded boarding clock, "HH:MM", when the leg's leave-by is known. */
@@ -2544,6 +2809,10 @@ function CommuteStep({
   /** Origin label, only for the very first (walk-from-home) step. */
   fromLabel?: string;
   colors: ThemeColors;
+  /** True for the single hop you're currently on — draws the glowing highlight. */
+  active?: boolean;
+  /** Shared breathing pulse for the active highlight. */
+  glow?: SharedValue<number>;
 }) {
   const isWalk = step.mode === 'walk';
   const sc = stepStyle(step.mode, colors);
@@ -2571,6 +2840,7 @@ function CommuteStep({
 
   return (
     <View style={[styles.stepBlock, !hasStops && styles.stepBlockCenter]}>
+      {active && glow ? <StepGlow glow={glow} colors={colors} /> : null}
       <View style={[styles.stepBadge, { backgroundColor: sc.badge }]}>
         <Ionicons name={icon} size={17} color={sc.color} />
       </View>
@@ -2650,10 +2920,25 @@ function CommuteStop({
 function TravelLegRow({
   leg,
   leaveBy,
+  active,
+  glow,
+  nowAbs,
+  legStartAbs,
+  onStepsGeometry,
   onPress,
 }: {
   leg: TravelLeg;
   leaveBy?: string;
+  /** True while you're currently traveling this leg (gates the step highlight). */
+  active?: boolean;
+  /** Shared breathing pulse, so the active step glows in sync with cards. */
+  glow?: SharedValue<number>;
+  /** Wall clock on the unwrapped (midnight-aware) axis, to pick the live hop. */
+  nowAbs?: number;
+  /** This leg's absolute departure minute, used to unwrap the hops past midnight. */
+  legStartAbs?: number;
+  /** Reports each hop's time window + pixel band so the rail can track it. */
+  onStepsGeometry?: (rects: StepRect[]) => void;
   onPress?: () => void;
 }) {
   const t = useTheme();
@@ -2662,17 +2947,133 @@ function TravelLegRow({
   const hasSteps = steps.length > 0;
   const label = TRAVEL_MODE_LABEL[leg.mode] ?? 'travel';
 
-  // Cascade a clock across the steps from the leave-by time so every hop can
-  // show realistic board/alight times. Durations don't include platform waits,
-  // so these land a touch early — fine for planning, and only shown when we
-  // actually have a leave-by anchor to count from.
-  let clock = leaveBy;
-  const stepTimes = steps.map((s) => {
-    const start = clock;
-    const end = clock && s.durationMinutes ? addMinutes(clock, s.durationMinutes) : clock;
-    if (clock && s.durationMinutes) clock = addMinutes(clock, s.durationMinutes);
-    return { start, end };
+  // Per-hop clock, REBASED so the journey starts at the leg's actual `leaveBy`.
+  //
+  // Transit steps carry Google's REAL board/alight times (`departAt`/`arriveAt`),
+  // but those are ABSOLUTE and tied to WHEN the route was queried (usually
+  // "depart now"). On a leg the planner later slots elsewhere in the day they
+  // read hours off — a 01:15 trip showing 23:52 buses — which also stranded the
+  // live highlight, since the hops then fell outside the leg's own window. So we
+  // keep the journey's real SHAPE (ride lengths AND the platform waits between
+  // hops) but slide the whole sequence onto the leg's departure.
+  const leaveByMin = minutesOfDay(leaveBy);
+  const firstTimed = steps.findIndex((s) => minutesOfDay(s.departAt) != null);
+  // 1) Lay every hop on Google's own unwrapped axis: scheduled hops pin to their
+  //    times (rolling past midnight when alight < board), walks chain forward by
+  //    their duration. A LEADING walk has nothing before it, so it's back-filled
+  //    afterwards to END exactly when the first ride departs.
+  const gFrame = steps.map(() => ({ g0: 0, g1: 0 }));
+  let gRun: number | null = null;
+  steps.forEach((s, i) => {
+    const dep = minutesOfDay(s.departAt);
+    const dur = s.durationMinutes ?? 0;
+    if (dep != null) {
+      let g0 = dep;
+      while (gRun != null && g0 < gRun) g0 += 1440;
+      const arr = minutesOfDay(s.arriveAt);
+      let g1 = arr ?? g0 + dur;
+      while (g1 < g0) g1 += 1440;
+      gFrame[i] = { g0, g1 };
+      gRun = g1;
+    } else {
+      const g0 = gRun ?? 0;
+      gFrame[i] = { g0, g1: g0 + dur };
+      gRun = g0 + dur;
+    }
   });
+  for (let i = firstTimed - 1; i >= 0; i--) {
+    const g1 = gFrame[i + 1].g0;
+    gFrame[i] = { g0: g1 - (steps[i].durationMinutes ?? 0), g1 };
+  }
+  // 2) Shift so the first hop lands on `leaveBy`. With no scheduled hop to anchor
+  //    against (a trivial all-walk leg) this still chains from leaveBy; with no
+  //    leaveBy at all we leave Google's frame untouched.
+  const anchorTo = leaveByMin ?? (gFrame.length ? gFrame[0].g0 : 0);
+  const shift = anchorTo - (gFrame.length ? gFrame[0].g0 : 0);
+  const stepTimes = gFrame.map((gf) => ({
+    start: addMinutes('00:00', gf.g0 + shift),
+    end: addMinutes('00:00', gf.g1 + shift),
+  }));
+
+  // Hop times on the rail's ABSOLUTE (midnight-unwrapped) axis. First unwrap the
+  // hops among themselves (a journey can roll past midnight: alight 00:32 after
+  // board 23:50), then snap the whole sequence onto the rail axis with a single
+  // whole-day offset from `legStartAbs` — snapping to a multiple of 1440 keeps
+  // minor rounding from nudging a hop a full day off.
+  const rawStepMins = stepTimes.map((st) => ({
+    t0: minutesOfDay(st.start),
+    t1: minutesOfDay(st.end),
+  }));
+  let unwrapRun: number | null = null;
+  const relStepMins = rawStepMins.map(({ t0, t1 }) => {
+    let a0 = t0;
+    let a1 = t1;
+    if (a0 != null) {
+      while (unwrapRun != null && a0 < unwrapRun) a0 += 1440;
+      unwrapRun = a0;
+    }
+    if (a1 != null) {
+      while (unwrapRun != null && a1 < unwrapRun) a1 += 1440;
+      unwrapRun = a1;
+    }
+    return { t0: a0, t1: a1 };
+  });
+  const firstRel = relStepMins.find((s) => s.t0 != null)?.t0 ?? null;
+  const dayOffset =
+    legStartAbs != null && firstRel != null
+      ? Math.round((legStartAbs - firstRel) / 1440) * 1440
+      : 0;
+  const stepMins = relStepMins.map(({ t0, t1 }) => ({
+    t0: t0 == null ? null : t0 + dayOffset,
+    t1: t1 == null ? null : t1 + dayOffset,
+  }));
+
+  // The hop you're physically on right now: the one whose [start, end) window
+  // holds the clock. Only consulted while the leg is active, so it lights up a
+  // single row — the walk, or "bus 200" — instead of the whole panel. Clamps to
+  // the first/last hop at the very edges so rounding can't leave a gap.
+  let activeStepIndex = -1;
+  if (active && nowAbs != null && stepMins.length > 0) {
+    for (let i = 0; i < stepMins.length; i++) {
+      const { t0, t1 } = stepMins[i];
+      if (t0 != null && t1 != null && nowAbs >= t0 && nowAbs < t1) {
+        activeStepIndex = i;
+        break;
+      }
+    }
+    if (activeStepIndex === -1) {
+      const first = stepMins[0];
+      const last = stepMins[stepMins.length - 1];
+      if (first.t0 != null && nowAbs < first.t0) activeStepIndex = 0;
+      else if (last.t1 != null && nowAbs >= last.t1) activeStepIndex = stepMins.length - 1;
+    }
+  }
+
+  // Measure the panel's offset within the row and each hop's band within the
+  // panel, then report `top/bottom` relative to the leg's top (panelY + stepY)
+  // so the parent rail can anchor each hop's clock window to its own pixels.
+  const panelYRef = useRef(0);
+  const stepGeomRef = useRef<Record<number, { y: number; h: number }>>({});
+  const reportGeometry = () => {
+    if (!onStepsGeometry) return;
+    const rects: StepRect[] = [];
+    for (let i = 0; i < stepMins.length; i++) {
+      const g = stepGeomRef.current[i];
+      const { t0, t1 } = stepMins[i];
+      if (!g || t0 == null || t1 == null || !(t1 > t0)) continue;
+      rects.push({
+        t0,
+        t1,
+        top: panelYRef.current + g.y,
+        bottom: panelYRef.current + g.y + g.h,
+      });
+    }
+    if (rects.length > 0) onStepsGeometry(rects);
+  };
+
+  // First real vehicle on the journey (for the header's "leave 12:30 · 152 at
+  // 12:40" context, making the head walk + platform wait explicit).
+  const firstRide = steps.find((s) => s.mode !== 'walk' && !!s.departAt);
 
   return (
     <Pressable
@@ -2697,7 +3098,13 @@ function TravelLegRow({
           />
         </View>
       </View>
-      <View style={[styles.commutePanel, { backgroundColor: c.fill1 }]}>
+      <View
+        style={[styles.commutePanel, { backgroundColor: c.fill1 }]}
+        onLayout={(e) => {
+          panelYRef.current = e.nativeEvent.layout.y;
+          reportGeometry();
+        }}
+      >
         <View style={styles.commuteHeader}>
           {leaveBy ? (
             <>
@@ -2725,17 +3132,35 @@ function TravelLegRow({
         </View>
         {hasSteps ? (
           steps.map((s, i) => (
-            <CommuteStep
+            <View
               key={`${i}-${s.mode}`}
-              step={s}
-              startTime={stepTimes[i]?.start}
-              endTime={stepTimes[i]?.end}
-              fromLabel={i === 0 ? leg.fromLabel : undefined}
-              colors={c}
-            />
+              onLayout={(e) => {
+                stepGeomRef.current[i] = {
+                  y: e.nativeEvent.layout.y,
+                  h: e.nativeEvent.layout.height,
+                };
+                reportGeometry();
+              }}
+            >
+              <CommuteStep
+                step={s}
+                startTime={stepTimes[i]?.start}
+                endTime={stepTimes[i]?.end}
+                fromLabel={i === 0 ? leg.fromLabel : undefined}
+                colors={c}
+                active={i === activeStepIndex}
+                glow={glow}
+              />
+            </View>
           ))
         ) : (
-          <CommuteFallbackStep leg={leg} label={label} colors={c} />
+          <CommuteFallbackStep
+            leg={leg}
+            label={label}
+            colors={c}
+            active={!!active}
+            glow={glow}
+          />
         )}
       </View>
     </Pressable>
@@ -2751,10 +3176,16 @@ function CommuteFallbackStep({
   leg,
   label,
   colors,
+  active,
+  glow,
 }: {
   leg: TravelLeg;
   label: string;
   colors: ThemeColors;
+  /** True while you're on this (single-hop) leg — draws the glowing highlight. */
+  active?: boolean;
+  /** Shared breathing pulse for the active highlight. */
+  glow?: SharedValue<number>;
 }) {
   const lc = legStyle(leg.mode, colors);
   const isWalk = leg.mode === 'walk';
@@ -2765,6 +3196,7 @@ function CommuteFallbackStep({
     : `${label.charAt(0).toUpperCase()}${label.slice(1)}`;
   return (
     <View style={[styles.stepBlock, styles.stepBlockCenter]}>
+      {active && glow ? <StepGlow glow={glow} colors={colors} /> : null}
       <View style={[styles.stepBadge, { backgroundColor: lc.badge }]}>
         <Ionicons
           name={TRAVEL_MODE_ICON[leg.mode] ?? 'navigate'}
@@ -2927,21 +3359,6 @@ function ItemCard({
         <Text variant="bodySm" tone="secondary" style={{ marginTop: 10 }}>
           {item.description}
         </Text>
-      ) : null}
-
-      {item.highlights && item.highlights.length > 0 ? (
-        <View style={styles.highlights}>
-          {item.highlights.map((h, i) => (
-            <View
-              key={`${item.id}-h-${i}`}
-              style={[styles.chip, { backgroundColor: t.colors.fill1 }]}
-            >
-              <Text variant="micro" tone="secondary" weight="medium">
-                {h}
-              </Text>
-            </View>
-          ))}
-        </View>
       ) : null}
     </Card>
   );
@@ -3114,28 +3531,10 @@ const styles = StyleSheet.create({
     fontWeight: '400',
   },
   flexBadge: {
-    flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 999,
-  },
-  flexBadgeText: {
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-  },
-  highlights: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 10,
-  },
-  chip: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 4,
     borderRadius: 999,
   },
   // ---- Left timeline rail ------------------------------------------------
@@ -3403,6 +3802,17 @@ const styles = StyleSheet.create({
   },
   stepBlockCenter: {
     alignItems: 'center',
+  },
+  stepGlow: {
+    position: 'absolute',
+    top: -7,
+    bottom: -7,
+    left: -8,
+    right: -8,
+    borderRadius: 11,
+    borderWidth: 1.5,
+    shadowOffset: { width: 0, height: 0 },
+    shadowRadius: 10,
   },
   stepBadge: {
     width: 34,

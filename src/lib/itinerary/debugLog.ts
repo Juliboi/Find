@@ -8,7 +8,7 @@
  * didn't update after a reorder, a gap that grew where it shouldn't — you need
  * to see the OP that ran, the resulting ordered blocks, and the precise DELTA
  * (who moved, who got re-timed, whose travel changed) without scrolling past
- * descriptions, highlights, photos and polylines.
+ * descriptions, photos and polylines.
  *
  * So every edit prints two things, sentinel-wrapped for easy copy/grep:
  *   1. `changes` — a compact diff of before → after (moved / retimed /

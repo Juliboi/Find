@@ -100,7 +100,6 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                 'place',
                 'travelFromPrev',
                 'description',
-                'highlights',
               ],
               required: ['title', 'kind', 'flexibility', 'startTime', 'endTime', 'durationMinutes'],
               properties: {
@@ -173,7 +172,6 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                   },
                 },
                 description: { type: 'string' },
-                highlights: { type: 'array', items: { type: 'string' } },
               },
             },
           },
@@ -331,7 +329,7 @@ ${venueRule}
 5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
 6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
-8. Each item needs realistic startTime / endTime / durationMinutes. Include a 1–2 sentence description, and up to 4 "highlights" for items with concrete to-dos (e.g. ["Eggs", "Toast", "Phone on silent"]).
+8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
 9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
 10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.
 
@@ -374,8 +372,7 @@ Output ONLY a single JSON object, no prose, no markdown fences. Match this schem
               { "mode": "walk", "durationMinutes": 3 }
             ]
           },
-          "description": "Strength session at the OC Krakov gym — the Max Fitness spot the user named.",
-          "highlights": ["Warm-up 10 min", "Main lift 60 min", "Sauna after"]
+          "description": "Strength session at the OC Krakov gym — the Max Fitness spot the user named."
         }
       ]
     }

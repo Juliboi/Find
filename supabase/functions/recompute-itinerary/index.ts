@@ -92,9 +92,13 @@ Deno.serve(async (req: Request) => {
   // moment the request happens to fire.
   const timezone = typeof payload.timezone === 'string' ? payload.timezone : undefined;
   const nowDate = typeof payload.now === 'string' ? new Date(payload.now) : undefined;
+  // ROUTE_DEBUG: collect each leg's ground-truth trace so we can echo it back in
+  // the response (read in Metro) instead of only the dashboard logs.
+  const debugSink: string[] = [];
   const timing = {
     timezone,
     now: nowDate && !Number.isNaN(nowDate.getTime()) ? nowDate : undefined,
+    debugSink,
   };
 
   // Re-route every hop against the (possibly changed) coordinates and cascade
@@ -113,5 +117,8 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Recompute failed', detail: String(e) }, 500);
   }
 
+  // Attach the ROUTE_DEBUG trace (when enabled) on a throwaway field; the client
+  // logs it then drops it via sanitizeItinerary, so it never persists.
+  if (debugSink.length) (itinerary as any).__routeDebug = debugSink;
   return jsonResponse(itinerary);
 });
