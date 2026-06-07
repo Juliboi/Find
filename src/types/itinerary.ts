@@ -28,6 +28,7 @@ export type ItineraryItemKind =
   | 'drinks' // bar / pub / cafe social
   | 'activity' // generic doing-something block
   | 'break' // rest / buffer
+  | 'gap' // elastic free time the user can name, split, resize, or fill
   | 'other';
 
 /**
@@ -193,6 +194,16 @@ export interface ItineraryItem {
    * for personal at-home blocks (wake, breakfast) that don't move you.
    */
   travelFromPrev?: TravelLeg;
+  /**
+   * Intended free time BEFORE this item, on top of any travel leg. Captured
+   * on the first cascade from the planner's original start times so the day's
+   * natural breathing room (coffee gap before lunch, buffer before a fixed
+   * meeting) is PRESERVED across subsequent edits. Re-cascades simply add
+   * `travel + gap` between blocks instead of collapsing everything back-to-back.
+   * Set to 0 (not undefined) once captured to distinguish "no gap" from "not
+   * yet measured".
+   */
+  gapBeforeMin?: number;
   /** Prose explanation — the Gemini-style "what / why" paragraph. */
   description?: string;
   /** Optional short highlight bullets (things to see / order / do). */
@@ -259,6 +270,7 @@ export const ITINERARY_KINDS: ItineraryItemKind[] = [
   'drinks',
   'activity',
   'break',
+  'gap',
   'other',
 ];
 
@@ -279,5 +291,6 @@ export const KIND_EMOJI: Record<ItineraryItemKind, string> = {
   drinks: '🍺',
   activity: '✨',
   break: '☕',
+  gap: '⏳',
   other: '📍',
 };

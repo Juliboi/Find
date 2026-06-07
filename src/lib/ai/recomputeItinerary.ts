@@ -75,6 +75,16 @@ export async function recomputeItinerary(
     const body: Record<string, unknown> = { itinerary };
     const ctx = buildContextPayload(context);
     if (ctx) body.context = ctx;
+    // Let the backend price transit/driving legs for their real departure slot.
+    // The device zone is the right one for a "today" plan; guard in case a
+    // runtime lacks full Intl tz support.
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz) body.timezone = tz;
+    } catch {
+      // no tz available — backend falls back to time-agnostic routing
+    }
+    body.now = new Date().toISOString();
     const { data, error } = await supabase.functions.invoke('recompute-itinerary', {
       body,
     });

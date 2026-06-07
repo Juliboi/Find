@@ -117,6 +117,7 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                     'drinks',
                     'activity',
                     'break',
+                    'gap',
                     'other',
                   ],
                 },
@@ -324,7 +325,7 @@ ${args.userText}
 
 REQUIREMENTS
 1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
-2. Cover the WHOLE day continuously. No invisible gaps. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. The only allowed gaps are explicit relax/buffer/chores items the user asked for (use kind="break").
+2. Cover the WHOLE day continuously — never leave invisible holes in the clock. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. When the day has genuine breathing room (time to relax, recharge, or do whatever they feel like), emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place — give 20+ minutes of slack its own gap block rather than padding other activities. Reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry); use "gap" for open, unstructured time the user can later name or fill themselves.
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
 ${venueRule}
 5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
@@ -332,6 +333,7 @@ ${venueRule}
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes. Include a 1–2 sentence description, and up to 4 "highlights" for items with concrete to-dos (e.g. ["Eggs", "Toast", "Phone on silent"]).
 9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
+10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.
 
 Output ONLY a single JSON object, no prose, no markdown fences. Match this schema. OMIT optional fields you don't have rather than inventing. Use null for unknown ratings; do not make up transit line numbers.
 
@@ -348,7 +350,7 @@ Output ONLY a single JSON object, no prose, no markdown fences. Match this schem
       "items": [
         {
           "title": "<short action title>",
-          "kind": "travel" | "work" | "sightseeing" | "meal" | "event" | "meetup" | "drinks" | "activity" | "break" | "other",
+          "kind": "travel" | "work" | "sightseeing" | "meal" | "event" | "meetup" | "drinks" | "activity" | "break" | "gap" | "other",
           "flexibility": "fixed" | "window" | "flexible",
           "startTime": "HH:MM",
           "endTime": "HH:MM",

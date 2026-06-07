@@ -183,8 +183,22 @@ async function computeRoute(
   dest: Coords,
   mode: TravelMode,
   apiKey: string,
+  departureTime?: Date,
 ): Promise<RouteResult | null> {
   try {
+    const body: Record<string, unknown> = {
+      origin: { location: { latLng: { latitude: origin.latitude, longitude: origin.longitude } } },
+      destination: { location: { latLng: { latitude: dest.latitude, longitude: dest.longitude } } },
+      travelMode: ROUTES_TRAVEL_MODE[mode],
+    };
+    // Only TRANSIT and DRIVE are time-dependent (schedules / traffic). Google
+    // rejects a departureTime in the past, so callers only ever pass a future
+    // instant; walk/bike ignore time entirely. DRIVE additionally needs an
+    // explicit routing preference to actually use live/predicted traffic.
+    if (departureTime && (mode === 'transit' || mode === 'drive')) {
+      body.departureTime = departureTime.toISOString();
+      if (mode === 'drive') body.routingPreference = 'TRAFFIC_AWARE';
+    }
     const res = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
       method: 'POST',
       headers: {
@@ -193,11 +207,7 @@ async function computeRoute(
         'X-Goog-FieldMask':
           'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.steps.travelMode,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails',
       },
-      body: JSON.stringify({
-        origin: { location: { latLng: { latitude: origin.latitude, longitude: origin.longitude } } },
-        destination: { location: { latLng: { latitude: dest.latitude, longitude: dest.longitude } } },
-        travelMode: ROUTES_TRAVEL_MODE[mode],
-      }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -241,6 +251,107 @@ export function fmtHHMM(totalMin: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+export interface RouteTiming {
+  /** IANA zone of the day (e.g. "Europe/Prague"), from the client device. */
+  timezone?: string;
+  /** "Now" per the client, so a stale departure in the past is dropped. */
+  now?: Date;
+}
+
+/**
+ * Minutes that `tz`'s wall clock is AHEAD of UTC at instant `at` (local = utc +
+ * offset). Derived from `Intl` so DST is handled without a tz database.
+ */
+function tzOffsetMinutes(at: Date, tz: string): number {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+  const m: Record<string, string> = {};
+  for (const p of dtf.formatToParts(at)) if (p.type !== 'literal') m[p.type] = p.value;
+  const asUTC = Date.UTC(+m.year, +m.month - 1, +m.day, +m.hour, +m.minute, +m.second);
+  return (asUTC - at.getTime()) / 60000;
+}
+
+/**
+ * Resolves a wall-clock `YYYY-MM-DD` + minutes-of-day in zone `tz` to the true
+ * UTC instant. One offset correction is enough except inside the ~1h DST jump,
+ * which never matters for picking a transit departure. Returns null on bad
+ * input / unknown zone so the caller simply omits the departure time.
+ */
+function zonedToUtc(dateStr: string, totalMin: number, tz: string): Date | null {
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const h = Math.floor(totalMin / 60);
+  const mi = ((Math.round(totalMin) % 60) + 60) % 60;
+  try {
+    const guessMs = Date.UTC(+m[1], +m[2] - 1, +m[3], h, mi, 0);
+    if (!Number.isFinite(guessMs)) return null;
+    const off = tzOffsetMinutes(new Date(guessMs), tz);
+    return new Date(guessMs - off * 60000);
+  } catch {
+    return null; // invalid IANA zone, etc.
+  }
+}
+
+/** `YYYY-MM-DD` advanced by `n` whole days (UTC math; safe across months). */
+function addDaysISO(dateStr: string, n: number): string {
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return dateStr;
+  const dt = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  const y = dt.getUTCFullYear();
+  const mo = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(dt.getUTCDate()).padStart(2, '0');
+  return `${y}-${mo}-${d}`;
+}
+
+/**
+ * The future UTC instant a hop departs, for time-aware transit/traffic routing.
+ *
+ * Google rejects departure times in the past, which would otherwise make this
+ * inert for the most common case: editing TODAY's plan in the afternoon, where
+ * the morning legs have already elapsed. So when the planned instant is in the
+ * past we roll it forward in whole WEEKS — same weekday, same time-of-day — so
+ * transit is still priced against the service pattern the user actually planned
+ * for (a Sunday plan stays priced on a Sunday) instead of collapsing to "now".
+ *
+ * Returns undefined (routing falls back to "now") only when we genuinely can't
+ * resolve a departure: missing zone/date, bad input, or no future instant found.
+ */
+function buildDeparture(
+  dateStr: string | undefined,
+  depMin: number | null | undefined,
+  timing: RouteTiming,
+): Date | undefined {
+  if (depMin == null || depMin < 0 || !timing.timezone || typeof dateStr !== 'string') {
+    return undefined;
+  }
+  const now = timing.now instanceof Date ? timing.now.getTime() : Date.now();
+  // Small buffer: a departure within a minute of "now" is effectively now.
+  const floor = now + 60_000;
+  let date = dateStr;
+  let d = zonedToUtc(date, depMin, timing.timezone);
+  if (!d) return undefined;
+  // Advance by 7-day steps (cap ~6 weeks) until the planned time-of-day lands in
+  // the future; recomputed via zonedToUtc each step so the wall clock stays exact
+  // across any DST transition in between.
+  for (let i = 0; i < 6 && d.getTime() <= floor; i += 1) {
+    date = addDaysISO(date, 7);
+    const next = zonedToUtc(date, depMin, timing.timezone);
+    if (!next) return undefined;
+    d = next;
+  }
+  if (d.getTime() <= floor) return undefined;
+  return d;
+}
+
 function itemDuration(item: any): number {
   const d = Number(item?.durationMinutes);
   if (Number.isFinite(d) && d > 0) return Math.round(d);
@@ -279,11 +390,12 @@ async function computeLeg(
   dest: Coords,
   apiKey: string,
   fromLabel?: string,
+  departureTime?: Date,
 ): Promise<any> {
   const straight = haversineMeters(origin, dest);
   const distanceM = Math.round(straight * DETOUR_FACTOR);
   const mode = pickMode(distanceM);
-  const routed = await computeRoute(origin, dest, mode, apiKey);
+  const routed = await computeRoute(origin, dest, mode, apiKey, departureTime);
   const leg: any = routed
     ? {
         mode,
@@ -318,6 +430,7 @@ export async function routeAndSchedule(
   context: Context,
   apiKey: string | undefined,
   opts: { stripTravel?: boolean; appendBackHome?: boolean } = {},
+  timing: RouteTiming = {},
 ): Promise<void> {
   if (!parsed || !Array.isArray(parsed.sections)) return;
 
@@ -349,6 +462,8 @@ export async function routeAndSchedule(
       origin: Coords;
       dest: Coords;
       fromLabel?: string;
+      /** Provisional minutes-of-day this hop departs, for time-aware routing. */
+      departureMin?: number | null;
     }[] = [];
 
     let prev: RouteNode | null = homeCoords
@@ -356,11 +471,20 @@ export async function routeAndSchedule(
       : null;
     for (const node of seq) {
       if (prev && haversineMeters(prev.coords, node.coords) > 25) {
+        // The client already cascaded provisional start times onto the day, so
+        // "depart the previous stop" ≈ this block's start minus its current
+        // leg. Good enough to pick the right transit run; the final cascade
+        // below re-times everything against the freshly routed minutes.
+        const startMin = parseHHMM(node.item?.startTime);
+        const legMin = Number(node.item?.travelFromPrev?.minutes);
+        const departureMin =
+          startMin != null ? startMin - (Number.isFinite(legMin) ? legMin : 0) : null;
         hops.push({
           item: node.item,
           origin: prev.coords,
           dest: node.coords,
           fromLabel: prev.isHome ? context.home?.label : undefined,
+          departureMin,
         });
       } else {
         // Same spot as the previous anchor: no travel between them.
@@ -386,12 +510,40 @@ export async function routeAndSchedule(
         arrival: true,
         travelFromPrev: null,
       };
-      hops.push({ item: backHomeItem, origin: prev.coords, dest: homeCoords });
+      // The trip home departs when the last real stop ends.
+      const lastEnd =
+        parseHHMM(prev.item?.endTime) ??
+        (parseHHMM(prev.item?.startTime) != null
+          ? (parseHHMM(prev.item?.startTime) as number) + itemDuration(prev.item)
+          : null);
+      hops.push({
+        item: backHomeItem,
+        origin: prev.coords,
+        dest: homeCoords,
+        departureMin: lastEnd,
+      });
     }
 
+    const routeDebug = !!Deno?.env?.get?.('ROUTE_DEBUG');
     await Promise.all(
       hops.map(async (h) => {
-        h.item.travelFromPrev = await computeLeg(h.origin, h.dest, apiKey, h.fromLabel);
+        const departureTime = buildDeparture(parsed?.date, h.departureMin, timing);
+        const leg = await computeLeg(h.origin, h.dest, apiKey, h.fromLabel, departureTime);
+        h.item.travelFromPrev = leg;
+        // Ground-truth trace of the time-aware decision (enable with ROUTE_DEBUG=1
+        // and read via `supabase functions logs recompute-itinerary`). Shows the
+        // exact departure sent to Google — or that it fell back to "now" — so a
+        // "the commute didn't reflect my planned time" report is one log away.
+        if (routeDebug) {
+          const planned =
+            h.departureMin != null && h.departureMin >= 0 ? fmtHHMM(h.departureMin) : '--:--';
+          console.log(
+            `[route] -> ${h.item?.title ?? 'Back home'}: planned ${planned} | depart ` +
+              `${departureTime ? departureTime.toISOString() : 'NOW (past/unresolved → fallback)'}` +
+              ` => ${leg?.mode ?? '?'} ${Math.round(leg?.minutes ?? 0)}m` +
+              `${leg?.estimated ? ' (estimated)' : ''}`,
+          );
+        }
       }),
     );
 

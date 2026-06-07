@@ -32,6 +32,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
+import type { ThemeColors } from '@/theme/colors';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import { HomePicker } from '@/components/HomePicker';
@@ -41,10 +42,33 @@ import { Button } from '@/components/Button';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
 import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
+import { requestAdjustOps } from '@/lib/ai/adjustItinerary';
+import {
+  applyOp,
+  applyRoutedLegs,
+  cascadeTimes,
+  classifyReorder,
+  describeOp,
+  fitGapsToAnchors,
+  flatten,
+  opNeedsRoute,
+  type CascadeConflict,
+  type EditOp,
+  type ReorderImpact,
+} from '@/lib/itinerary/edits';
+import { parseAdjustCommand } from '@/lib/itinerary/adjustCommand';
+import { compactItinerary, logItineraryEdit } from '@/lib/itinerary/debugLog';
+import { AdjustBar } from '@/components/AdjustBar';
+import { PlaceSwapSheet } from '@/components/PlaceSwapSheet';
+import { ItemActionsSheet } from '@/components/ItemActionsSheet';
+import { GapActionsSheet } from '@/components/GapActionsSheet';
+import { LegModeSheet } from '@/components/LegModeSheet';
+import { ReorderableList, type ReorderRow } from '@/components/ReorderableList';
 import {
   Itinerary,
   ItineraryItem,
   ItinerarySection,
+  ItineraryPlace,
   ItineraryTravelMode,
   KIND_EMOJI,
   TimeFlexibility,
@@ -62,9 +86,20 @@ import {
 } from '@/utils/time';
 
 /**
- * Flexibility pills are hidden for now; the field stays in the data model.
+ * Temporarily surfaces a small Fixed / Window / Flexible label on each plan
+ * block so the item's `flexibility` is visible at a glance. Flip back to
+ * `false` to hide the pills again; the field stays in the data model.
  */
-const SHOW_FLEX_BADGES = false;
+const SHOW_FLEX_BADGES = true;
+
+/**
+ * Dev logging verbosity for the `[day-snapshot]` dump. `false` (default) logs
+ * the compact one-row-per-block view so the focused `itin-edit` edit trace
+ * stays visible in Metro's scrollback. Flip to `true` only when you need the
+ * raw itinerary JSON (polylines, photos, descriptions) — it's ~300 lines per
+ * snapshot and will bury everything else.
+ */
+const SNAPSHOT_VERBOSE = false;
 
 const SAMPLE_PROMPT =
   "It's a day trip to Olomouc and I'm starting from home at Pekařova 859/12, " +
@@ -141,6 +176,9 @@ const HOME_ID = '__home__';
 
 // Don't flag tiny slivers as "free time" — only gaps worth noticing.
 const GAP_MIN_MINUTES = 20;
+
+// Default length for a gap the user adds by hand (between two plans, etc.).
+const DEFAULT_GAP_MINUTES = 30;
 
 const HOME_NAME_RE = /^(home|my home|house|residence)$/i;
 
@@ -233,6 +271,29 @@ function decodePolyline(encoded: string): LatLng[] {
   return points;
 }
 
+/**
+ * Builds a compact natural-language description of the current day for the AI
+ * re-plan path. Prefers the user's original prompt; otherwise reconstructs the
+ * gist from the itinerary so a saved plan (no prompt on hand) can still be
+ * adjusted contextually rather than re-planned from nothing.
+ */
+function describeItineraryForReplan(itin: Itinerary, originalPrompt?: string): string {
+  if (originalPrompt && originalPrompt.trim() && originalPrompt.trim() !== SAMPLE_PROMPT) {
+    return `My current plan: ${originalPrompt.trim()}`;
+  }
+  const lines = itin.sections.flatMap((s) =>
+    s.items.map((it) => {
+      const time = it.startTime ? `${it.startTime}${it.endTime ? `–${it.endTime}` : ''} ` : '';
+      const where = it.place?.name ? ` at ${it.place.name}` : '';
+      return `- ${time}${it.title}${where}`;
+    }),
+  );
+  const head = `Here is my planned day "${itin.title}"${
+    itin.origin ? ` starting from ${itin.origin}` : ''
+  }${itin.city ? ` in ${itin.city}` : ''}:`;
+  return `${head}\n${lines.join('\n')}`;
+}
+
 export default function ItineraryScreen() {
   const router = useRouter();
   const t = useTheme();
@@ -292,6 +353,30 @@ export default function ItineraryScreen() {
   // Keep the home anchor collapsed so the prompt field leads (and isn't pushed
   // under the keyboard). Auto-expand only when there's no home set yet.
   const [homeExpanded, setHomeExpanded] = useState(!home);
+
+  // --- live editing state ---------------------------------------------------
+  // True while an edit is being applied (route refresh / AI re-plan in flight).
+  const [editBusy, setEditBusy] = useState(false);
+  // The block whose venue the user is browsing alternatives for (place swap).
+  const [swapItem, setSwapItem] = useState<ItineraryItem | null>(null);
+  // Conflicts surfaced by the last cascade — e.g. an edit pushed past a fixed
+  // anchor. Rendered as a non-blocking banner; user picks how to resolve.
+  const [conflicts, setConflicts] = useState<CascadeConflict[]>([]);
+  // One-tap undo: snapshot of the itinerary before the last edit + a label.
+  const [undo, setUndo] = useState<{ itinerary: Itinerary; label: string } | null>(null);
+  const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Monotonically incremented for every edit; recompute responses that arrive
+  // after a newer edit was dispatched are dropped instead of clobbering it.
+  const editSeqRef = useRef(0);
+  // Items the user has explicitly opened a quick-action menu on. Independent
+  // of "now/next" so any card can be tweaked.
+  const [menuItemId, setMenuItemId] = useState<string | null>(null);
+  // The travel leg the user tapped to change its mode.
+  const [legMenuId, setLegMenuId] = useState<string | null>(null);
+  // True while the day is in "rearrange" mode (long-press to enter).
+  const [rearrangeMode, setRearrangeMode] = useState(false);
+  // Live "what will this move cost" readout while a row is lifted (null at rest).
+  const [dragImpact, setDragImpact] = useState<ReorderImpact | null>(null);
 
   // Cycle the status copy while planning so the wait feels alive.
   useEffect(() => {
@@ -386,27 +471,41 @@ export default function ItineraryScreen() {
   }, [params.id, preloaded, home, context, updateSavedItinerary]);
 
   // Dev-only snapshot dumper. Fires whenever the day loads or any edit
-  // reshapes the itinerary, so you can copy the structured JSON from Metro
-  // and share it instead of taking screenshots when reporting a bug. Includes
-  // every piece of state that influences how the day renders: the full
-  // itinerary, the resolved context (home / end-of-day), the saved-store id
-  // (if opened from the homepage), the AI vs heuristic flag, and the planner's
-  // debug envelope when one came back with the plan.
+  // reshapes the itinerary, so you can read the structured state from Metro
+  // when reporting a bug.
+  //
+  // It logs the COMPACT day by default (one row per block: time / flex / gap /
+  // travel) — the full JSON dump (with polylines, photos, descriptions) is
+  // ~300 lines per snapshot and floods Metro's scrollback, burying the focused
+  // `itin-edit` trace that's the actual signal during a debugging session. Flip
+  // SNAPSHOT_VERBOSE to true only when you specifically need the raw payload.
   useEffect(() => {
     if (!__DEV__ || !itinerary) return;
-    const snapshot = {
-      savedId: params.id ?? null,
-      usedAi,
-      context: { home, endOfDay },
-      itinerary,
-      debug,
-    };
     const stamp = new Date().toISOString();
-    // Sentinel lines either side make it trivial to copy a single snapshot
-    // out of a noisy log; the prefix makes filtering with `metro | grep`
-    // straightforward too.
     console.log(`══════════ [day-snapshot] ${stamp} ══════════`);
-    console.log(JSON.stringify(snapshot, null, 2));
+    if (SNAPSHOT_VERBOSE) {
+      console.log(
+        JSON.stringify(
+          { savedId: params.id ?? null, usedAi, context: { home, endOfDay }, itinerary, debug },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(
+        JSON.stringify(
+          {
+            savedId: params.id ?? null,
+            usedAi,
+            home: home?.label ?? null,
+            endOfDay,
+            day: compactItinerary(itinerary),
+          },
+          null,
+          2,
+        ),
+      );
+    }
     console.log(`══════════ [day-snapshot/end] ${stamp} ══════════`);
   }, [itinerary, debug, usedAi, home, endOfDay, params.id]);
 
@@ -416,6 +515,70 @@ export default function ItineraryScreen() {
   );
   const flatItemsRef = useRef(flatItems);
   flatItemsRef.current = flatItems;
+
+  // Compact rows for the long-press drag-and-drop rearrange view. Each row also
+  // carries the commute INTO it (so you can see where travel sits + how long)
+  // and whether it's a pinned anchor (dragging it unpins it).
+  const reorderRows = useMemo<ReorderRow[]>(
+    () =>
+      flatItems.map((it) => {
+        const leg = it.travelFromPrev;
+        const legMin = leg ? Math.round(leg.minutes) : 0;
+        return {
+          id: it.id,
+          emoji: it.place?.emoji || KIND_EMOJI[it.kind] || '•',
+          title: it.title,
+          subtitle:
+            it.startTime && it.endTime
+              ? `${it.startTime} – ${it.endTime}`
+              : it.startTime
+                ? it.startTime
+                : it.durationMinutes
+                  ? formatDuration(it.durationMinutes)
+                  : undefined,
+          isGap: it.kind === 'gap',
+          fixed: it.flexibility === 'fixed',
+          commute:
+            leg && legMin > 0
+              ? {
+                  icon: TRAVEL_MODE_ICON[leg.mode] ?? 'navigate',
+                  label:
+                    legMin < 60
+                      ? `${legMin}m`
+                      : `${Math.floor(legMin / 60)}h${legMin % 60 ? legMin % 60 : ''}`,
+                  estimated: leg.estimated,
+                }
+              : undefined,
+        };
+      }),
+    [flatItems],
+  );
+
+  // Pure, synchronous predictor the drag layer scores every drop-slot against.
+  const classifyMove = useCallback(
+    (orderedIds: string[]): ReorderImpact =>
+      itinerary ? classifyReorder(itinerary, orderedIds) : 'free',
+    [itinerary],
+  );
+
+  // Copy/color for the rearrange banner — default prompt at rest, live verdict
+  // while a row is lifted.
+  const bannerInfo = useMemo(() => {
+    switch (dragImpact) {
+      case 'free':
+        return { color: t.colors.success, icon: 'checkmark-circle' as const, text: 'Reflows freely' };
+      case 'reroute':
+        return { color: t.colors.warning, icon: 'navigate' as const, text: 'Re-checks travel times' };
+      case 'replan':
+        return { color: t.colors.danger, icon: 'sparkles' as const, text: 'May need a replan' };
+      default:
+        return {
+          color: t.colors.accent,
+          icon: 'swap-vertical' as const,
+          text: 'Hold & drag to reorder',
+        };
+    }
+  }, [dragImpact, t]);
 
   // Item IDs that are "continuations" — the previous item in the day was at
   // the SAME venue (matched by name + rounded coords). The card render uses
@@ -447,6 +610,21 @@ export default function ItineraryScreen() {
     for (const it of flatItems) if (itemEndMin(it) > nowMin) return it.id;
     return null;
   }, [flatItems, nowMin]);
+
+  // Lookups keyed on the latest conflict set / open menus, so the renderer
+  // doesn't have to walk the array per card.
+  const conflictIds = useMemo(
+    () => new Set(conflicts.map((c) => c.itemId)),
+    [conflicts],
+  );
+  const menuItem = useMemo(
+    () => (menuItemId ? flatItems.find((i) => i.id === menuItemId) ?? null : null),
+    [menuItemId, flatItems],
+  );
+  const legMenuItem = useMemo(
+    () => (legMenuId ? flatItems.find((i) => i.id === legMenuId) ?? null : null),
+    [legMenuId, flatItems],
+  );
 
   const nowSectionIndex = useMemo(() => {
     if (!itinerary || !nowItemId) return -1;
@@ -670,18 +848,359 @@ export default function ItineraryScreen() {
   };
 
   const reset = () => {
-    // Invalidate any background routing/plan jobs in flight so their
-    // resolutions are dropped instead of repopulating the cleared screen.
+    // Invalidate any in-flight jobs so their resolutions are dropped instead of
+    // repopulating the cleared screen: planSeqRef guards background plan/route
+    // jobs, editSeqRef guards live-edit cascades.
     planSeqRef.current += 1;
+    editSeqRef.current += 1;
     setItinerary(null);
     setDebug(null);
     setErrorMsg(null);
     setUsedAi(false);
     setSavedId(null);
     setRoutesRefining(false);
+    setUndo(null);
+    setConflicts([]);
+    setReplanPrompt(null);
+    setMenuItemId(null);
+    setLegMenuId(null);
+    setRearrangeMode(false);
     resetTracking();
     snapTo(expandedTop);
   };
+
+  // Persist the latest itinerary to the saved store, updating in place when we
+  // already have an id so the homepage card and a re-open both stay current.
+  const persist = useCallback(
+    (itin: Itinerary) => {
+      if (savedId) {
+        updateSavedItinerary(savedId, itin);
+      } else {
+        setSavedId(saveItinerary(itin));
+      }
+    },
+    [savedId, saveItinerary, updateSavedItinerary],
+  );
+
+  const showUndo = useCallback((snapshot: Itinerary, label: string) => {
+    setUndo({ itinerary: snapshot, label });
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    undoTimer.current = setTimeout(() => setUndo(null), 5000);
+  }, []);
+
+  /**
+   * Resourceful escalation. When a re-routed day no longer fits a FIXED anchor
+   * (the real, time-aware commutes ate ALL the downstream slack), a pure clock
+   * cascade can't rescue it — shrinking gaps already failed. So we hand the day
+   * to the planner to genuinely rebalance it (shorten / reorder / drop), tell
+   * it exactly which commitment overran and by how much, then route the result
+   * for real time-aware legs before showing it. Auto-applied but fully
+   * undoable: `before` is the PRE-edit day, so a single Undo rolls back the
+   * edit AND the replan. `mySeq` guard drops the result if a newer edit landed.
+   */
+  const escalateReplan = useCallback(
+    async (
+      before: Itinerary,
+      routed: Itinerary,
+      conflicts: CascadeConflict[],
+      mySeq: number,
+    ) => {
+      const overrun = conflicts.find((c) => c.kind === 'fixedOverrun') ?? conflicts[0];
+      const blocking = overrun
+        ? flatten(routed).find((i) => i.id === overrun.itemId)
+        : undefined;
+      const basis = describeItineraryForReplan(routed, input);
+      const constraint = overrun
+        ? `Important: after my latest change the day no longer fits. "${
+            blocking?.title ?? 'a fixed commitment'
+          }" gets pushed to ${overrun.proposedStart} but it is fixed at ${
+            overrun.requiredStart
+          } (about ${overrun.overrunMin} minutes too late), because the real travel time between places is longer than the free time allows. Re-plan the day so everything fits: keep the fixed commitments at their exact times, and shorten, reorder, or drop the flexible activities as needed. Keep the same overall intent of the day.`
+        : 'Important: after my latest change the day no longer fits its real travel times. Re-plan it so everything fits, keeping the fixed commitments at their exact times.';
+      const request = `${basis}\n\n${constraint}`;
+
+      const result = await planItinerary(request, {
+        context,
+        date: routed.date ?? todayISO(),
+      });
+      if (mySeq !== editSeqRef.current) return;
+      if (!result.itinerary) return;
+
+      // Route the fresh plan for real (time-aware) legs before it lands, then
+      // re-cascade on the client (keeping the planner's anchors authoritative).
+      const { itinerary: rerouted } = await recomputeItinerary(result.itinerary, context);
+      if (mySeq !== editSeqRef.current) return;
+      const cascaded = fitGapsToAnchors(applyRoutedLegs(result.itinerary, rerouted));
+      setItinerary(cascaded.itinerary);
+      setConflicts(cascaded.conflicts);
+      setUsedAi(result.usedAi);
+      persist(cascaded.itinerary);
+      logItineraryEdit({
+        phase: 'replan',
+        before,
+        after: cascaded.itinerary,
+        conflicts: cascaded.conflicts,
+        note: 'escalated replan — re-routed commutes did not fit the fixed anchors',
+      });
+      showUndo(before, 'Replanned around the longer commute');
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => undefined,
+      );
+    },
+    [context, input, persist, showUndo],
+  );
+
+  /**
+   * The single edit pipeline used by every editing surface. Each op is
+   * applied optimistically (instant time cascade), any constraint violations
+   * (fixed-anchor overruns, window overruns) are surfaced as conflicts, and
+   * — only when at least one op moved a place or changed the stop sequence —
+   * we make ONE backend recompute call at the end so an AI-suggested batch
+   * (e.g. "swap lunch + reorder + drop the museum") doesn't trigger three
+   * separate route refreshes. A monotonic `editSeq` token guards against late
+   * recompute responses overwriting a newer edit. Persists + offers undo.
+   */
+  const applyOps = useCallback(
+    async (ops: EditOp[]) => {
+      if (!itinerary || ops.length === 0) return;
+      const before = itinerary;
+      const mySeq = ++editSeqRef.current;
+      let current = itinerary;
+      let needsRoute = false;
+      for (const op of ops) {
+        const { itinerary: next } = applyOp(current, op);
+        current = next;
+        if (opNeedsRoute(op)) needsRoute = true;
+      }
+      // Final pass: shrink elastic gaps so no fixed anchor (sleep, a meeting)
+      // is overrun. Duration edits already absorbed their delta, so this is a
+      // no-op for them; for structural edits it keeps the day's end honest
+      // before the backend even responds.
+      const fitted = fitGapsToAnchors(current);
+      current = fitted.itinerary;
+      const allConflicts = fitted.conflicts;
+      setItinerary(current);
+      setConflicts(allConflicts);
+      persist(current);
+      // Structured trace of the INSTANT result: the op(s), the before→after
+      // delta (who moved / got re-timed / clashed), and the full compact day.
+      logItineraryEdit({
+        phase: 'optimistic',
+        ops,
+        before,
+        after: current,
+        conflicts: allConflicts,
+        needsRoute,
+      });
+      // Undo always rolls back to the state BEFORE the whole batch, so AI
+      // edits feel atomic from the user's POV.
+      const label =
+        ops.length === 1 ? describeOp(before, ops[0]) : `Applied ${ops.length} changes`;
+      showUndo(before, label);
+      Haptics.selectionAsync().catch(() => undefined);
+
+      if (!needsRoute) return;
+
+      const optimistic = current;
+      setEditBusy(true);
+      try {
+        const { itinerary: refreshed, refreshed: didRefresh } = await recomputeItinerary(
+          current,
+          context,
+        );
+        // Drop the response if a newer edit has been dispatched in the
+        // meantime; otherwise we'd silently undo the user's latest tweak.
+        if (mySeq !== editSeqRef.current) {
+          logItineraryEdit({
+            phase: 'route-skipped',
+            after: optimistic,
+            note: 'superseded by a newer edit before the backend responded',
+          });
+          return;
+        }
+        // Keep the server's fresh legs + structure but restore the client's
+        // anchors/durations/gaps (the server cascade slides fixed anchors to
+        // force a fit, which would hide the overrun); then re-fit gaps around
+        // the real travel so the day's end anchor stays honest.
+        const merged = applyRoutedLegs(optimistic, refreshed);
+        const cascaded = fitGapsToAnchors(merged);
+        // Decision point ("reroute if there's slack, else replan"): if the
+        // real, time-aware commutes still overrun a FIXED anchor after gaps
+        // were shrunk, the day genuinely doesn't fit — hand it to the planner.
+        // We only escalate when the backend actually re-routed (`didRefresh`);
+        // otherwise the overrun is just the optimistic estimate and we keep the
+        // existing non-blocking conflict banner.
+        const hardOverrun = cascaded.conflicts.some((c) => c.kind === 'fixedOverrun');
+        if (didRefresh && hardOverrun) {
+          logItineraryEdit({
+            phase: 'after-route',
+            before: optimistic,
+            after: cascaded.itinerary,
+            conflicts: cascaded.conflicts,
+            note: 'fixed-anchor overrun after reroute -> escalating to a planner rebalance',
+          });
+          await escalateReplan(before, cascaded.itinerary, cascaded.conflicts, mySeq);
+          return;
+        }
+        setItinerary(cascaded.itinerary);
+        setConflicts(cascaded.conflicts);
+        persist(cascaded.itinerary);
+        // Diff against the OPTIMISTIC state so the trace shows exactly what the
+        // backend touched — an empty `travelChanged` here is the smoking gun
+        // when "the commute didn't update" after a reorder/swap.
+        logItineraryEdit({
+          phase: didRefresh ? 'after-route' : 'route-skipped',
+          before: optimistic,
+          after: cascaded.itinerary,
+          conflicts: cascaded.conflicts,
+          note: didRefresh
+            ? undefined
+            : 'backend returned no refresh (routing disabled / unconfigured / failed) — legs kept their optimistic estimate',
+        });
+      } finally {
+        if (mySeq === editSeqRef.current) setEditBusy(false);
+      }
+    },
+    [itinerary, persist, showUndo, context, escalateReplan],
+  );
+  /** Convenience: most callers only have one op. */
+  const applyEdit = useCallback((op: EditOp) => applyOps([op]), [applyOps]);
+
+  /**
+   * The "replan from scratch" escape hatch: an explicit user choice (chip in
+   * the AdjustBar) when the local parser couldn't confidently match the input.
+   * Replaces the whole itinerary via the full planner — drops gap snapshots
+   * and any in-place edits, on purpose, because the user asked for a redo.
+   */
+  const runReplan = useCallback(
+    async (text: string) => {
+      if (!itinerary) return;
+      const before = itinerary;
+      const mySeq = ++editSeqRef.current;
+      setEditBusy(true);
+      Haptics.selectionAsync().catch(() => undefined);
+      try {
+        const basis = describeItineraryForReplan(itinerary, input);
+        const request = `${basis}\n\nAdjustment requested: ${text}`;
+        const result = await planItinerary(request, { context, date: todayISO() });
+        if (mySeq !== editSeqRef.current) return;
+        if (result.itinerary) {
+          const cascaded = cascadeTimes(result.itinerary);
+          setItinerary(cascaded.itinerary);
+          setConflicts(cascaded.conflicts);
+          setUsedAi(result.usedAi);
+          persist(cascaded.itinerary);
+          logItineraryEdit({
+            phase: 'replan',
+            before,
+            after: cascaded.itinerary,
+            conflicts: cascaded.conflicts,
+            note: `full replan from prompt: ${text}`,
+          });
+          showUndo(before, 'Updated your day');
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+            () => undefined,
+          );
+        }
+      } finally {
+        if (mySeq === editSeqRef.current) setEditBusy(false);
+      }
+    },
+    [itinerary, input, context, persist, showUndo],
+  );
+
+  // Free-text adjustments — three-stage funnel:
+  //   1. Confident local parse  → applyEdit immediately (zero latency).
+  //   2. Ambiguous              → ask the AI op-resolver for a small batch of
+  //                               ops; apply them through the same pipeline.
+  //   3. AI returns nothing     → surface an explicit "Ask the planner →"
+  //                               chip; full replan only happens if the user
+  //                               taps it (so manual edits don't get nuked).
+  const [replanPrompt, setReplanPrompt] = useState<string | null>(null);
+  const submitAdjust = useCallback(
+    async (text: string) => {
+      if (!itinerary) return;
+      const parsed = parseAdjustCommand(itinerary, text);
+      if (parsed.kind === 'empty') return;
+      if (parsed.kind === 'op') {
+        await applyEdit(parsed.op);
+        return;
+      }
+      setEditBusy(true);
+      try {
+        const result = await requestAdjustOps(itinerary, text);
+        if (result.ops.length > 0) {
+          await applyOps(result.ops);
+          return;
+        }
+        // The AI couldn't translate this into ops (or the backend isn't
+        // configured). Hand off to the explicit replan chip — never silently
+        // rewrite the whole day.
+        setReplanPrompt(text);
+      } finally {
+        setEditBusy(false);
+      }
+    },
+    [itinerary, applyEdit, applyOps],
+  );
+
+  const confirmReplan = useCallback(async () => {
+    const text = replanPrompt;
+    if (!text) return;
+    setReplanPrompt(null);
+    await runReplan(text);
+  }, [replanPrompt, runReplan]);
+
+  const cancelReplan = useCallback(() => setReplanPrompt(null), []);
+
+  const doUndo = useCallback(() => {
+    if (!undo) return;
+    // Bumping the sequence makes any in-flight recompute response from the
+    // edit we're undoing a no-op when it lands.
+    editSeqRef.current += 1;
+    logItineraryEdit({
+      phase: 'undo',
+      before: itinerary,
+      after: undo.itinerary,
+      note: `rolled back: ${undo.label}`,
+    });
+    setItinerary(undo.itinerary);
+    setConflicts([]);
+    persist(undo.itinerary);
+    setUndo(null);
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+    Haptics.selectionAsync().catch(() => undefined);
+  }, [undo, itinerary, persist]);
+
+  // Long-press on a card -> enter rearrange mode. We don't ship a true
+  // drag-and-drop (Reanimated 4 + a nested scroll view is fiddly to get right
+  // and adds a dep); instead each card sprouts up/down arrows and the user
+  // taps to shuffle. Works great for ~5-12 blocks, which is what a day is.
+  const enterRearrange = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => undefined);
+    setDragImpact(null);
+    setRearrangeMode(true);
+  }, []);
+  const exitRearrange = useCallback(() => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setDragImpact(null);
+    setRearrangeMode(false);
+  }, []);
+  // Drop a fresh free-time gap into the day. `beforeId` fills the slack in
+  // front of a block (tapping the "free" connector); `afterId` slots one in
+  // right behind a block ("add free time after this"). `minutes` defaults to
+  // the slack being filled, or DEFAULT_GAP_MINUTES when there's none to absorb.
+  const addGap = useCallback(
+    (opts: { afterId?: string; beforeId?: string; minutes?: number }) => {
+      applyEdit({
+        type: 'insertGap',
+        afterId: opts.afterId ?? null,
+        beforeId: opts.beforeId ?? null,
+        minutes: opts.minutes && opts.minutes > 0 ? opts.minutes : DEFAULT_GAP_MINUTES,
+      });
+    },
+    [applyEdit],
+  );
 
   const onScroll = (e: NativeSyntheticEvent<NativeScrollEvent>) => {
     if (!itinerary) return;
@@ -896,12 +1415,23 @@ export default function ItineraryScreen() {
           </View>
         </GestureDetector>
 
+        {rearrangeMode && itinerary && !loading ? (
+          <ReorderableList
+            rows={reorderRows}
+            onReorder={(orderedIds) => applyEdit({ type: 'reorder', orderedIds })}
+            classify={classifyMove}
+            onImpact={setDragImpact}
+            topInset={8}
+            bottomInset={insets.bottom + 132}
+          />
+        ) : (
         <ScrollView
           ref={listRef}
           contentContainerStyle={{
             paddingHorizontal: showRail ? 0 : t.spacing.lg,
             paddingTop: 8,
-            paddingBottom: insets.bottom + 80,
+            // Leave room for the floating adjust bar so the last card clears it.
+            paddingBottom: insets.bottom + (itinerary ? 132 : 80),
           }}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
@@ -1018,6 +1548,7 @@ export default function ItineraryScreen() {
                   index={si}
                   gapsById={gapsById}
                   continuationIds={continuationIds}
+                  conflictIds={conflictIds}
                   glow={glowPulse}
                   nowItemId={nowItemId}
                   nowMin={nowMin}
@@ -1026,6 +1557,12 @@ export default function ItineraryScreen() {
                     section.items.length > 0 &&
                     section.items.every((it) => itemEndMin(it) <= nowMin)
                   }
+                  rearrangeMode={rearrangeMode}
+                  onEnterRearrange={enterRearrange}
+                  onPressPlace={(it) => setSwapItem(it)}
+                  onOpenMenu={(it) => setMenuItemId(it.id)}
+                  onPressLeg={(it) => setLegMenuId(it.id)}
+                  onAddGap={(beforeId, minutes) => addGap({ beforeId, minutes })}
                   onSectionLayout={(y) => {
                     sectionOffsetsRef.current[si] = y;
                   }}
@@ -1077,6 +1614,7 @@ export default function ItineraryScreen() {
             </View>
           )}
         </ScrollView>
+        )}
       </Animated.View>
 
       <View style={[styles.floatingBar, { top: insets.top + 8 }]} pointerEvents="box-none">
@@ -1085,7 +1623,299 @@ export default function ItineraryScreen() {
           <RoundButton icon="refresh" label="Reset" onPress={reset} />
         ) : null}
       </View>
+
+      {rearrangeMode ? (
+        <Animated.View
+          entering={FadeInDown.duration(180)}
+          style={[styles.rearrangeBanner, { top: insets.top + 8 }]}
+          pointerEvents="box-none"
+        >
+          <View
+            style={[
+              styles.rearrangeChip,
+              { backgroundColor: bannerInfo.color, shadowColor: bannerInfo.color },
+            ]}
+          >
+            <Ionicons name={bannerInfo.icon} size={14} color={t.colors.textOnAccent} />
+            <Text
+              variant="caption"
+              weight="bold"
+              style={{ color: t.colors.textOnAccent }}
+            >
+              {bannerInfo.text}
+            </Text>
+            <Pressable
+              onPress={exitRearrange}
+              hitSlop={8}
+              style={({ pressed }) => [styles.rearrangeDone, pressed && { opacity: 0.7 }]}
+            >
+              <Text
+                variant="caption"
+                weight="bold"
+                style={{ color: t.colors.textOnAccent }}
+              >
+                Done
+              </Text>
+            </Pressable>
+          </View>
+        </Animated.View>
+      ) : null}
+
+      {undo ? (
+        <Animated.View
+          entering={FadeInDown.duration(200)}
+          style={[
+            styles.undoToast,
+            {
+              bottom: insets.bottom + (sheetExpanded && itinerary && !loading ? 92 : 24),
+              backgroundColor: t.colors.surface2,
+              borderColor: t.colors.separator,
+            },
+          ]}
+          pointerEvents="box-none"
+        >
+          <Ionicons name="checkmark-circle" size={18} color={t.colors.accent} />
+          <Text variant="bodySm" weight="medium" numberOfLines={1} style={{ flex: 1 }}>
+            {undo.label}
+          </Text>
+          <Pressable onPress={doUndo} hitSlop={8}>
+            <Text variant="bodySm" weight="bold" tone="accent" style={{ color: t.colors.accent }}>
+              Undo
+            </Text>
+          </Pressable>
+        </Animated.View>
+      ) : null}
+
+      {replanPrompt && itinerary && !loading && sheetExpanded ? (
+        <ReplanChip
+          text={replanPrompt}
+          bottomInset={insets.bottom}
+          onConfirm={confirmReplan}
+          onDismiss={cancelReplan}
+        />
+      ) : conflicts.length > 0 && itinerary && !loading && sheetExpanded ? (
+        <ConflictBanner
+          conflicts={conflicts}
+          itinerary={itinerary}
+          bottomInset={insets.bottom}
+          onResolve={(c) => {
+            applyEdit({ type: 'moveTime', id: c.itemId, hhmm: c.proposedStart });
+          }}
+          onDismiss={() => setConflicts([])}
+        />
+      ) : null}
+
+      <AdjustBar
+        visible={!!itinerary && !loading && sheetExpanded}
+        busy={editBusy}
+        bottomInset={insets.bottom}
+        onSubmit={submitAdjust}
+      />
+
+      <PlaceSwapSheet
+        item={swapItem}
+        city={itinerary?.city}
+        onClose={() => setSwapItem(null)}
+        onPick={(place: ItineraryPlace) => {
+          const target = swapItem;
+          setSwapItem(null);
+          if (target) applyEdit({ type: 'replacePlace', id: target.id, place });
+        }}
+      />
+
+      {/* One "..." entry point, two sheets: gaps get the gap-specific actions
+          (name / resize / split), every other block gets the standard ones. */}
+      <ItemActionsSheet
+        item={menuItem && menuItem.kind !== 'gap' ? menuItem : null}
+        onClose={() => setMenuItemId(null)}
+        onAdjustDuration={(deltaMin) => {
+          if (!menuItem) return;
+          applyEdit({ type: 'adjustDuration', id: menuItem.id, deltaMin });
+        }}
+        onMoveTime={(hhmm) => {
+          if (!menuItem) return;
+          setMenuItemId(null);
+          applyEdit({ type: 'moveTime', id: menuItem.id, hhmm });
+        }}
+        onSwapPlace={() => {
+          if (!menuItem) return;
+          setSwapItem(menuItem);
+        }}
+        onAddGapAfter={() => {
+          if (!menuItem) return;
+          setMenuItemId(null);
+          addGap({ afterId: menuItem.id });
+        }}
+        onRemove={() => {
+          if (!menuItem) return;
+          applyEdit({ type: 'remove', id: menuItem.id });
+        }}
+      />
+
+      <GapActionsSheet
+        item={menuItem && menuItem.kind === 'gap' ? menuItem : null}
+        onClose={() => setMenuItemId(null)}
+        onRename={(title) => {
+          if (!menuItem) return;
+          applyEdit({ type: 'renameItem', id: menuItem.id, title });
+        }}
+        onAdjustDuration={(deltaMin) => {
+          if (!menuItem) return;
+          applyEdit({ type: 'adjustDuration', id: menuItem.id, deltaMin });
+        }}
+        onSplit={() => {
+          if (!menuItem) return;
+          setMenuItemId(null);
+          applyEdit({ type: 'splitGap', id: menuItem.id });
+        }}
+        onRemove={() => {
+          if (!menuItem) return;
+          applyEdit({ type: 'remove', id: menuItem.id });
+        }}
+      />
+
+      <LegModeSheet
+        item={legMenuItem}
+        onClose={() => setLegMenuId(null)}
+        onPickLegMode={(mode) => {
+          if (!legMenuItem) return;
+          setLegMenuId(null);
+          applyEdit({ type: 'setLegMode', id: legMenuItem.id, mode });
+        }}
+        onPickDayMode={(mode) => {
+          setLegMenuId(null);
+          applyEdit({ type: 'setDayTransportMode', mode });
+        }}
+      />
     </View>
+  );
+}
+
+/**
+ * One-line warning above the AdjustBar when the latest cascade couldn't
+ * honour a constraint (a fixed appointment got squeezed by an earlier
+ * edit, a window block fell outside its open hours). The user picks
+ * between "Reschedule" (pins the item at the proposed time so the
+ * conflict clears) or "Dismiss" (accept the overlap and move on).
+ */
+function ConflictBanner({
+  conflicts,
+  itinerary,
+  bottomInset,
+  onResolve,
+  onDismiss,
+}: {
+  conflicts: CascadeConflict[];
+  itinerary: Itinerary;
+  bottomInset: number;
+  onResolve: (conflict: CascadeConflict) => void;
+  onDismiss: () => void;
+}) {
+  const t = useTheme();
+  // Show the earliest unresolved conflict first; the rest get a "+N more"
+  // tail so the banner never grows past a single line.
+  const head = conflicts[0];
+  const extra = conflicts.length - 1;
+  const item = itinerary.sections
+    .flatMap((s) => s.items)
+    .find((i) => i.id === head.itemId);
+  if (!item) return null;
+  const action =
+    head.kind === 'fixedOverrun'
+      ? `Move ${item.title} to ${head.proposedStart}`
+      : `Move ${item.title} to ${head.proposedStart}`;
+  const message =
+    head.kind === 'fixedOverrun'
+      ? `${item.title} can't start at ${head.requiredStart} — your earlier blocks run until ${head.proposedStart}.`
+      : `${item.title} would land at ${head.proposedStart}, after its ${head.requiredStart} window.`;
+  return (
+    <Animated.View
+      entering={FadeInDown.duration(180)}
+      style={[
+        styles.conflictWrap,
+        {
+          bottom: bottomInset + 84,
+          backgroundColor: t.colors.warningSoft,
+          borderColor: t.colors.warning,
+        },
+      ]}
+      pointerEvents="box-none"
+    >
+      <Ionicons name="warning" size={18} color={t.colors.warning} />
+      <View style={{ flex: 1, gap: 2 }}>
+        <Text variant="caption" weight="bold" style={{ color: t.colors.warning }}>
+          {extra > 0 ? `Timing conflict (+${extra} more)` : 'Timing conflict'}
+        </Text>
+        <Text variant="caption" tone="secondary" numberOfLines={2}>
+          {message}
+        </Text>
+      </View>
+      <View style={styles.conflictActions}>
+        <Pressable onPress={() => onResolve(head)} hitSlop={6}>
+          <Text variant="caption" weight="bold" style={{ color: t.colors.warning }}>
+            {action}
+          </Text>
+        </Pressable>
+        <Pressable onPress={onDismiss} hitSlop={8} style={styles.conflictDismiss}>
+          <Ionicons name="close" size={16} color={t.colors.textSecondary} />
+        </Pressable>
+      </View>
+    </Animated.View>
+  );
+}
+
+/**
+ * "Ask the planner →" chip shown above the AdjustBar when the local parser
+ * AND the lightweight op-resolver both came up empty. The user has to TAP
+ * it to actually trigger a full replan, because a full replan rewrites the
+ * whole day and would erase any earlier in-place edits — never the right
+ * thing to do silently from a typo or a vague phrase.
+ */
+function ReplanChip({
+  text,
+  bottomInset,
+  onConfirm,
+  onDismiss,
+}: {
+  text: string;
+  bottomInset: number;
+  onConfirm: () => void;
+  onDismiss: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <Animated.View
+      entering={FadeInDown.duration(180)}
+      style={[
+        styles.conflictWrap,
+        {
+          bottom: bottomInset + 84,
+          backgroundColor: t.colors.accentSoft,
+          borderColor: t.colors.accent,
+        },
+      ]}
+      pointerEvents="box-none"
+    >
+      <Ionicons name="sparkles" size={18} color={t.colors.accent} />
+      <View style={{ flex: 1, gap: 2 }}>
+        <Text variant="caption" weight="bold" style={{ color: t.colors.accent }}>
+          Need a full rewrite?
+        </Text>
+        <Text variant="caption" tone="secondary" numberOfLines={2}>
+          {`"${text}"`}
+        </Text>
+      </View>
+      <View style={styles.conflictActions}>
+        <Pressable onPress={onConfirm} hitSlop={6}>
+          <Text variant="caption" weight="bold" style={{ color: t.colors.accent }}>
+            Ask the planner →
+          </Text>
+        </Pressable>
+        <Pressable onPress={onDismiss} hitSlop={8} style={styles.conflictDismiss}>
+          <Ionicons name="close" size={16} color={t.colors.textSecondary} />
+        </Pressable>
+      </View>
+    </Animated.View>
   );
 }
 
@@ -1121,11 +1951,18 @@ function SectionBlock({
   continuationIds,
   index,
   gapsById,
+  conflictIds,
   glow,
   nowItemId,
   nowMin,
   sectionActive,
   sectionPast,
+  rearrangeMode,
+  onEnterRearrange,
+  onPressPlace,
+  onOpenMenu,
+  onPressLeg,
+  onAddGap,
   onSectionLayout,
   onItemLayout,
   onCardLayout,
@@ -1135,15 +1972,30 @@ function SectionBlock({
   continuationIds: Set<string>;
   index: number;
   gapsById: Record<string, number>;
+  /** Item ids the latest cascade flagged as conflicting (fixed-anchor overrun, etc.). */
+  conflictIds: Set<string>;
   glow: SharedValue<number>;
   nowItemId: string | null;
   nowMin: number;
   sectionActive: boolean;
   sectionPast: boolean;
+  /** True only in rearrange mode; here it just suppresses card taps (the drag
+   *  view itself is rendered separately by the parent). */
+  rearrangeMode: boolean;
+  /** Long-press a card -> enter rearrange mode. */
+  onEnterRearrange: () => void;
+  onPressPlace: (item: ItineraryItem) => void;
+  /** Tap the "..." on a card → open the per-card actions sheet. */
+  onOpenMenu: (item: ItineraryItem) => void;
+  /** Tap a travel connector → open the mode picker for that leg. */
+  onPressLeg: (item: ItineraryItem) => void;
+  /** Tap a "free time" connector → fill it with a named gap before that item. */
+  onAddGap: (beforeId: string, minutes: number) => void;
   onSectionLayout: (y: number) => void;
   onItemLayout: (id: string, y: number) => void;
   onCardLayout: (id: string, relY: number, h: number) => void;
 }) {
+  const t = useTheme();
   const base = Math.min(index * 50, 150);
   return (
     <>
@@ -1163,6 +2015,7 @@ function SectionBlock({
         const active = item.id === nowItemId;
         const past = itemEndMin(item) <= nowMin;
         const leg = item.travelFromPrev;
+        const isGapItem = item.kind === 'gap';
         // "Leave by HH:MM" semantics depend on what kind of item the leg
         // is feeding:
         //   - Normal item (meal, work, meetup, …): item.startTime is when
@@ -1189,17 +2042,45 @@ function SectionBlock({
             onLayout={(e) => onItemLayout(item.id, e.nativeEvent.layout.y)}
           >
             <View style={past && styles.pastDim}>
-              {gapsById[item.id] ? <GapRow minutes={gapsById[item.id]} /> : null}
-              {leg ? <TravelLegRow leg={leg} leaveBy={leaveBy} /> : null}
-              <View
+              {!isGapItem && gapsById[item.id] ? (
+                <GapRow
+                  minutes={gapsById[item.id]}
+                  onPress={
+                    rearrangeMode ? undefined : () => onAddGap(item.id, gapsById[item.id])
+                  }
+                />
+              ) : null}
+              {leg ? (
+                <TravelLegRow
+                  leg={leg}
+                  leaveBy={leaveBy}
+                  onPress={rearrangeMode ? undefined : () => onPressLeg(item)}
+                />
+              ) : null}
+              <Pressable
+                onLongPress={rearrangeMode ? undefined : onEnterRearrange}
+                delayLongPress={350}
                 style={styles.cardWrap}
                 onLayout={(e) =>
                   onCardLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
                 }
               >
-                <ItemCard item={item} isContinuation={continuationIds.has(item.id)} />
-                {active ? <CardGlow glow={glow} /> : null}
-              </View>
+                {isGapItem ? (
+                  <GapCard
+                    item={item}
+                    onOpenMenu={rearrangeMode ? undefined : () => onOpenMenu(item)}
+                  />
+                ) : (
+                  <ItemCard
+                    item={item}
+                    isContinuation={continuationIds.has(item.id)}
+                    onPressPlace={rearrangeMode ? undefined : () => onPressPlace(item)}
+                    onOpenMenu={rearrangeMode ? undefined : () => onOpenMenu(item)}
+                    hasConflict={conflictIds.has(item.id)}
+                  />
+                )}
+                {active && !rearrangeMode ? <CardGlow glow={glow} /> : null}
+              </Pressable>
             </View>
           </Animated.View>
         );
@@ -1446,13 +2327,6 @@ function OpenStatus({ status }: { status: string }) {
   );
 }
 
-const TRAVEL_MODE_EMOJI: Record<ItineraryTravelMode, string> = {
-  walk: '🚶',
-  bike: '🚲',
-  transit: '🚍',
-  drive: '🚗',
-};
-
 const TRAVEL_MODE_LABEL: Record<ItineraryTravelMode, string> = {
   walk: 'walk',
   bike: 'bike',
@@ -1460,15 +2334,71 @@ const TRAVEL_MODE_LABEL: Record<ItineraryTravelMode, string> = {
   drive: 'drive',
 };
 
-const TRAVEL_STEP_EMOJI: Record<TravelStepMode, string> = {
-  walk: '🚶',
-  bus: '🚌',
-  tram: '🚊',
-  subway: '🚇',
-  train: '🚆',
-  ferry: '⛴️',
-  transit: '🚍',
+/** Ionicon for the coarse leg mode, shown as the timeline rail node. */
+const TRAVEL_MODE_ICON: Record<ItineraryTravelMode, keyof typeof Ionicons.glyphMap> = {
+  walk: 'walk',
+  bike: 'bicycle',
+  transit: 'subway',
+  drive: 'car',
 };
+
+/** Ionicon per concrete transit sub-mode, shown in the per-step badge. */
+const TRAVEL_STEP_ICON: Record<TravelStepMode, keyof typeof Ionicons.glyphMap> = {
+  walk: 'walk',
+  bus: 'bus',
+  tram: 'train',
+  subway: 'subway',
+  train: 'train',
+  ferry: 'boat',
+  transit: 'navigate',
+};
+
+/** #RRGGBB -> rgba() so we can derive a soft tint for a step's icon badge. */
+function hexToRgba(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+/**
+ * Per-mode accent drawn from OUR palette (not a transit operator's livery):
+ * walk reads neutral, every ride gets a distinct-but-on-brand hue so two
+ * consecutive legs are easy to tell apart at a glance.
+ */
+function stepStyle(mode: TravelStepMode, c: ThemeColors): { color: string; badge: string } {
+  switch (mode) {
+    case 'walk':
+      return { color: c.textSecondary, badge: c.fill2 };
+    case 'bus':
+      return { color: c.warning, badge: hexToRgba(c.warning, 0.16) };
+    case 'tram':
+      return { color: c.highlightPurple, badge: hexToRgba(c.highlightPurple, 0.16) };
+    case 'subway':
+      return { color: c.accent, badge: hexToRgba(c.accent, 0.16) };
+    case 'train':
+      return { color: c.highlightRed, badge: hexToRgba(c.highlightRed, 0.16) };
+    case 'ferry':
+      return { color: c.info, badge: hexToRgba(c.info, 0.16) };
+    default:
+      return { color: c.accent, badge: hexToRgba(c.accent, 0.16) };
+  }
+}
+
+/** Same palette treatment as `stepStyle`, keyed by the coarse leg mode. */
+function legStyle(mode: ItineraryTravelMode, c: ThemeColors): { color: string; badge: string } {
+  switch (mode) {
+    case 'walk':
+      return { color: c.textSecondary, badge: c.fill2 };
+    case 'bike':
+      return { color: c.success, badge: hexToRgba(c.success, 0.16) };
+    case 'drive':
+      return { color: c.info, badge: hexToRgba(c.info, 0.16) };
+    default:
+      return { color: c.accent, badge: hexToRgba(c.accent, 0.16) };
+  }
+}
 
 function formatLegMinutes(min: number): string {
   if (min < 60) return `${min} min`;
@@ -1494,23 +2424,19 @@ function mergeWalkSteps(steps: TravelStep[]): TravelStep[] {
   return out;
 }
 
-function travelStepText(step: TravelStep): string {
-  if (step.mode === 'walk') {
-    return step.durationMinutes ? `Walk ${step.durationMinutes} min` : 'Walk';
-  }
-  const parts: string[] = [];
-  if (step.line) parts.push(step.line);
-  if (step.from && step.to) parts.push(`${step.from} → ${step.to}`);
-  else if (step.to) parts.push(step.to);
-  const head = parts.join(' · ');
-  return step.durationMinutes ? `${head}  ·  ${step.durationMinutes} min` : head || 'Transit';
-}
-
 /** A light connector marking idle/free time the user has between two blocks. */
-function GapRow({ minutes }: { minutes: number }) {
+function GapRow({ minutes, onPress }: { minutes: number; onPress?: () => void }) {
   const t = useTheme();
   return (
-    <View style={[styles.connRow, styles.connRowCenter]}>
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      style={({ pressed }) => [
+        styles.connRow,
+        styles.connRowCenter,
+        pressed && onPress && { opacity: 0.6 },
+      ]}
+    >
       <View style={styles.connRail} accessibilityElementsHidden>
         <View
           style={[
@@ -1521,75 +2447,354 @@ function GapRow({ minutes }: { minutes: number }) {
           <RNText style={styles.connDotEmojiSm}>⏳</RNText>
         </View>
       </View>
-      <View style={styles.connBody}>
+      <View style={[styles.connBody, styles.gapRowBody]}>
         <RNText style={[styles.gapText, { color: t.colors.textTertiary }]}>
           {`${formatDuration(minutes)} free`}
         </RNText>
+        {onPress ? (
+          <View style={[styles.gapAddPill, { borderColor: t.colors.separator }]}>
+            <Ionicons name="add" size={12} color={t.colors.accent} />
+            <RNText style={[styles.gapAddText, { color: t.colors.accent }]}>Add gap</RNText>
+          </View>
+        ) : null}
       </View>
+    </Pressable>
+  );
+}
+
+/**
+ * A free-time GAP rendered as its own card — elastic, nameable time the user
+ * owns (vs a real activity). Visually lighter than an ItemCard (dashed border,
+ * muted fill) so the day's "open" stretches read as breathing room, but it
+ * still carries a time range, a duration pill, and the "..." actions entry.
+ */
+function GapCard({
+  item,
+  onOpenMenu,
+}: {
+  item: ItineraryItem;
+  onOpenMenu?: () => void;
+}) {
+  const t = useTheme();
+  const timeRange =
+    item.startTime && item.endTime
+      ? `${item.startTime} – ${item.endTime}`
+      : item.startTime ?? '';
+  return (
+    <View
+      style={[
+        styles.gapCard,
+        { borderColor: t.colors.separator, backgroundColor: t.colors.fill1 },
+      ]}
+    >
+      <View style={styles.itemTopRow}>
+        <View style={styles.timeWrap}>
+          <RNText style={styles.gapCardEmoji}>{KIND_EMOJI.gap}</RNText>
+          <Text variant="caption" tone="tertiary" weight="semibold" style={styles.timeText}>
+            {timeRange ? `Free · ${timeRange}` : 'Free time'}
+          </Text>
+        </View>
+        {item.durationMinutes ? (
+          <View style={[styles.durationPill, { backgroundColor: t.colors.surface1 }]}>
+            <Ionicons name="time-outline" size={12} color={t.colors.textSecondary} />
+            <Text variant="micro" tone="secondary" weight="semibold">
+              {formatDuration(item.durationMinutes)}
+            </Text>
+          </View>
+        ) : null}
+        {onOpenMenu ? (
+          <Pressable
+            onPress={onOpenMenu}
+            accessibilityLabel="Edit free time"
+            hitSlop={10}
+            style={({ pressed }) => [
+              styles.menuBtn,
+              { backgroundColor: t.colors.surface1 },
+              pressed && { opacity: 0.6 },
+            ]}
+          >
+            <Ionicons name="ellipsis-horizontal" size={15} color={t.colors.textSecondary} />
+          </Pressable>
+        ) : null}
+      </View>
+      <Text variant="body" weight="semibold" style={{ marginTop: 6 }}>
+        {item.title}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * One ride/walk inside the commute panel, styled like a maps-app transit row:
+ * a tinted mode badge on the left, the line name (or "Walk …") up top, and the
+ * boarding / alighting stops with their times stacked beneath it.
+ */
+function CommuteStep({
+  step,
+  startTime,
+  endTime,
+  fromLabel,
+  colors,
+}: {
+  step: TravelStep;
+  /** Cascaded boarding clock, "HH:MM", when the leg's leave-by is known. */
+  startTime?: string;
+  /** Cascaded alighting clock, "HH:MM". */
+  endTime?: string;
+  /** Origin label, only for the very first (walk-from-home) step. */
+  fromLabel?: string;
+  colors: ThemeColors;
+}) {
+  const isWalk = step.mode === 'walk';
+  const sc = stepStyle(step.mode, colors);
+  const icon = TRAVEL_STEP_ICON[step.mode] ?? 'navigate';
+  const hasStops = !isWalk && (!!step.from || !!step.to);
+
+  // Walk title: name the origin on the first hop, else the destination.
+  const walkTitle = fromLabel
+    ? `Walk from ${fromLabel}`
+    : step.to
+      ? `Walk to ${step.to}`
+      : 'Walk';
+  const title = isWalk ? walkTitle : step.line ?? 'Transit';
+
+  // Right-aligned meta on the title row: stop count when known, else duration.
+  const titleMeta = isWalk
+    ? step.durationMinutes
+      ? formatDuration(step.durationMinutes)
+      : ''
+    : step.numStops
+      ? `${step.numStops} ${step.numStops === 1 ? 'stop' : 'stops'}`
+      : step.durationMinutes
+        ? formatDuration(step.durationMinutes)
+        : '';
+
+  return (
+    <View style={[styles.stepBlock, !hasStops && styles.stepBlockCenter]}>
+      <View style={[styles.stepBadge, { backgroundColor: sc.badge }]}>
+        <Ionicons name={icon} size={17} color={sc.color} />
+      </View>
+      <View style={styles.stepMain}>
+        <View style={styles.stepTitleRow}>
+          <RNText
+            style={[
+              styles.stepTitle,
+              { color: isWalk ? colors.textPrimary : sc.color },
+              isWalk && styles.stepTitleWalk,
+            ]}
+            numberOfLines={1}
+          >
+            {title}
+          </RNText>
+          {titleMeta ? (
+            <RNText style={[styles.stepMeta, { color: colors.textTertiary }]}>
+              {titleMeta}
+            </RNText>
+          ) : null}
+        </View>
+        {hasStops ? (
+          <View style={styles.stepStops}>
+            {step.from ? (
+              <CommuteStop name={step.from} time={startTime} colors={colors} />
+            ) : null}
+            {step.to ? (
+              <CommuteStop name={step.to} time={endTime} colors={colors} alight />
+            ) : null}
+          </View>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+/** A single boarding/alighting stop line: hollow→filled dot, name, time. */
+function CommuteStop({
+  name,
+  time,
+  colors,
+  alight,
+}: {
+  name: string;
+  time?: string;
+  colors: ThemeColors;
+  alight?: boolean;
+}) {
+  return (
+    <View style={styles.stopRow}>
+      <View
+        style={[
+          styles.stopDot,
+          {
+            borderColor: colors.textTertiary,
+            backgroundColor: alight ? colors.textTertiary : 'transparent',
+          },
+        ]}
+      />
+      <RNText style={[styles.stopName, { color: colors.textSecondary }]} numberOfLines={1}>
+        {name}
+      </RNText>
+      {time ? (
+        <RNText style={[styles.stopTime, { color: colors.textSecondary }]}>{time}</RNText>
+      ) : null}
     </View>
   );
 }
 
 /**
  * Connector that sits BETWEEN two place cards and shows how you get from one
- * to the next — when to leave, a simple hop on one line, or a full journey
- * broken into its transit legs (🚶 → 🚌 → 🚇 → 🚆), maps-app style.
+ * to the next, restyled as a clean "commute panel": a tinted rail node, an
+ * optional "Leave by HH:MM" header, then each hop (🚶/🚌/🚇/🚆) as its own
+ * row with a mode badge, line name and timed stops — maps-app style. Tap the
+ * panel to swap transport modes (walk/bike/transit/drive) for this leg.
  */
-function TravelLegRow({ leg, leaveBy }: { leg: TravelLeg; leaveBy?: string }) {
+function TravelLegRow({
+  leg,
+  leaveBy,
+  onPress,
+}: {
+  leg: TravelLeg;
+  leaveBy?: string;
+  onPress?: () => void;
+}) {
   const t = useTheme();
+  const c = t.colors;
   const steps = leg.steps ? mergeWalkSteps(leg.steps) : [];
   const hasSteps = steps.length > 0;
-  const bubbleEmoji = TRAVEL_MODE_EMOJI[leg.mode] ?? '➡️';
   const label = TRAVEL_MODE_LABEL[leg.mode] ?? 'travel';
+
+  // Cascade a clock across the steps from the leave-by time so every hop can
+  // show realistic board/alight times. Durations don't include platform waits,
+  // so these land a touch early — fine for planning, and only shown when we
+  // actually have a leave-by anchor to count from.
+  let clock = leaveBy;
+  const stepTimes = steps.map((s) => {
+    const start = clock;
+    const end = clock && s.durationMinutes ? addMinutes(clock, s.durationMinutes) : clock;
+    if (clock && s.durationMinutes) clock = addMinutes(clock, s.durationMinutes);
+    return { start, end };
+  });
+
   return (
-    <View style={styles.connRow}>
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      style={({ pressed }) => [
+        styles.connRow,
+        pressed && onPress && { opacity: 0.7 },
+      ]}
+    >
       <View style={styles.connRail} accessibilityElementsHidden>
         <View
           style={[
             styles.connDot,
-            { backgroundColor: t.colors.surface1, borderColor: t.colors.separator },
+            { backgroundColor: c.surface1, borderColor: c.separator },
           ]}
         >
-          <RNText style={styles.connDotEmoji}>{bubbleEmoji}</RNText>
+          <Ionicons
+            name={TRAVEL_MODE_ICON[leg.mode] ?? 'navigate'}
+            size={13}
+            color={c.textSecondary}
+          />
         </View>
       </View>
-      <View style={styles.connBody}>
-        {leaveBy ? (
-          <View style={styles.leaveRow}>
-            <Ionicons name="walk" size={13} color={t.colors.accent} />
-            <RNText style={[styles.leaveText, { color: t.colors.accent }]}>
-              {`Leave by ${leaveBy}`}
+      <View style={[styles.commutePanel, { backgroundColor: c.fill1 }]}>
+        <View style={styles.commuteHeader}>
+          {leaveBy ? (
+            <>
+              <Ionicons name="time-outline" size={12} color={c.accent} />
+              <RNText style={[styles.commuteLeave, { color: c.accent }]}>
+                {`Leave by ${leaveBy}`}
+              </RNText>
+              <RNText style={[styles.commuteMeta, { color: c.textTertiary }]}>
+                {`  ·  ${formatLegMinutes(leg.minutes)}`}
+              </RNText>
+            </>
+          ) : (
+            <RNText style={[styles.commuteMeta, { color: c.textSecondary }]}>
+              {`${formatLegMinutes(leg.minutes)} ${label}`}
             </RNText>
-            <RNText style={[styles.leaveMeta, { color: t.colors.textTertiary }]}>
-              {`  ·  ${formatLegMinutes(leg.minutes)} ${label}`}
-            </RNText>
-          </View>
+          )}
+          {onPress ? (
+            <Ionicons
+              name="chevron-forward"
+              size={14}
+              color={c.textTertiary}
+              style={styles.commuteChevron}
+            />
+          ) : null}
+        </View>
+        {hasSteps ? (
+          steps.map((s, i) => (
+            <CommuteStep
+              key={`${i}-${s.mode}`}
+              step={s}
+              startTime={stepTimes[i]?.start}
+              endTime={stepTimes[i]?.end}
+              fromLabel={i === 0 ? leg.fromLabel : undefined}
+              colors={c}
+            />
+          ))
         ) : (
-          <RNText style={[styles.legHead, { color: t.colors.textSecondary }]}>
-            {`${formatLegMinutes(leg.minutes)} ${label}`}
-          </RNText>
+          <CommuteFallbackStep leg={leg} label={label} colors={c} />
         )}
-        {leg.fromLabel ? (
-          <RNText style={[styles.legFrom, { color: t.colors.textTertiary }]}>
+      </View>
+    </Pressable>
+  );
+}
+
+/**
+ * Single-mode hop with no step breakdown (a trivial walk, or the haversine
+ * fallback): one badge + a duration. Mirrors `CommuteStep`'s layout using the
+ * coarse leg mode so the panel stays visually consistent.
+ */
+function CommuteFallbackStep({
+  leg,
+  label,
+  colors,
+}: {
+  leg: TravelLeg;
+  label: string;
+  colors: ThemeColors;
+}) {
+  const lc = legStyle(leg.mode, colors);
+  const isWalk = leg.mode === 'walk';
+  const title = isWalk
+    ? leg.fromLabel
+      ? `Walk from ${leg.fromLabel}`
+      : 'Walk'
+    : `${label.charAt(0).toUpperCase()}${label.slice(1)}`;
+  return (
+    <View style={[styles.stepBlock, styles.stepBlockCenter]}>
+      <View style={[styles.stepBadge, { backgroundColor: lc.badge }]}>
+        <Ionicons
+          name={TRAVEL_MODE_ICON[leg.mode] ?? 'navigate'}
+          size={17}
+          color={lc.color}
+        />
+      </View>
+      <View style={styles.stepMain}>
+        <View style={styles.stepTitleRow}>
+          <RNText
+            style={[
+              styles.stepTitle,
+              { color: isWalk ? colors.textPrimary : lc.color },
+              isWalk && styles.stepTitleWalk,
+            ]}
+            numberOfLines={1}
+          >
+            {title}
+          </RNText>
+          <RNText style={[styles.stepMeta, { color: colors.textTertiary }]}>
+            {formatLegMinutes(leg.minutes)}
+          </RNText>
+        </View>
+        {!isWalk && leg.fromLabel ? (
+          <RNText
+            style={[styles.stepFromLabel, { color: colors.textTertiary }]}
+            numberOfLines={1}
+          >
             {`from ${leg.fromLabel}`}
           </RNText>
-        ) : null}
-        {hasSteps ? (
-          <View style={styles.legSteps}>
-            {steps.map((s, i) => (
-              <View key={`${i}-${s.mode}`} style={styles.legStep}>
-                <RNText style={styles.legStepEmoji}>
-                  {TRAVEL_STEP_EMOJI[s.mode] ?? '🚍'}
-                </RNText>
-                <RNText
-                  style={[styles.legStepText, { color: t.colors.textTertiary }]}
-                  numberOfLines={1}
-                >
-                  {travelStepText(s)}
-                </RNText>
-              </View>
-            ))}
-          </View>
         ) : null}
       </View>
     </View>
@@ -1599,13 +2804,24 @@ function TravelLegRow({ leg, leaveBy }: { leg: TravelLeg; leaveBy?: string }) {
 function ItemCard({
   item,
   isContinuation,
+  onPressPlace,
+  onOpenMenu,
+  hasConflict,
 }: {
   item: ItineraryItem;
-  /** True when the previous item was at the SAME venue. We suppress the place
+  /**
+   * True when the previous item was at the SAME venue. We suppress the place
    * block (photo / name / rating / open status) so the same venue card doesn't
    * repeat across consecutive items like "Run to pull-up bar" → "Pull-up
-   * workout" — the title alone makes the continuity clear. */
+   * workout" — the title alone makes the continuity clear.
+   */
   isContinuation?: boolean;
+  /** Tap-handler on the place block (opens the swap-place sheet). */
+  onPressPlace?: () => void;
+  /** Tap-handler on the "..." menu button (opens the per-card actions sheet). */
+  onOpenMenu?: () => void;
+  /** Marks the card with a small warning glyph when this item has a conflict. */
+  hasConflict?: boolean;
 }) {
   const t = useTheme();
   const place = isContinuation ? undefined : item.place;
@@ -1624,9 +2840,15 @@ function ItemCard({
   return (
     <Card padded>
       <View style={styles.itemTopRow}>
-        <Text variant="caption" tone="secondary" weight="semibold" style={styles.timeText}>
-          {timeRange || ' '}
-        </Text>
+        <View style={styles.timeWrap}>
+          {hasConflict ? (
+            <Ionicons name="warning" size={13} color={t.colors.warning} />
+          ) : null}
+          <Text variant="caption" tone={hasConflict ? 'danger' : 'secondary'} weight="semibold" style={styles.timeText}>
+            {timeRange || ' '}
+          </Text>
+        </View>
+        {SHOW_FLEX_BADGES ? <FlexBadge flexibility={item.flexibility} /> : null}
         {item.durationMinutes ? (
           <View style={[styles.durationPill, { backgroundColor: t.colors.fill1 }]}>
             <Ionicons name="time-outline" size={12} color={t.colors.textSecondary} />
@@ -1634,8 +2856,20 @@ function ItemCard({
               {formatDuration(item.durationMinutes)}
             </Text>
           </View>
-        ) : SHOW_FLEX_BADGES ? (
-          <FlexBadge flexibility={item.flexibility} />
+        ) : null}
+        {onOpenMenu ? (
+          <Pressable
+            onPress={onOpenMenu}
+            accessibilityLabel="Edit this block"
+            hitSlop={10}
+            style={({ pressed }) => [
+              styles.menuBtn,
+              { backgroundColor: t.colors.fill1 },
+              pressed && { opacity: 0.6 },
+            ]}
+          >
+            <Ionicons name="ellipsis-horizontal" size={15} color={t.colors.textSecondary} />
+          </Pressable>
         ) : null}
       </View>
 
@@ -1644,7 +2878,11 @@ function ItemCard({
       </Text>
 
       {place ? (
-        <View style={styles.placeRow}>
+        <Pressable
+          onPress={onPressPlace}
+          disabled={!onPressPlace}
+          style={({ pressed }) => [styles.placeRow, pressed && onPressPlace && { opacity: 0.7 }]}
+        >
           {place.photoUrl ? (
             <Image
               source={{ uri: place.photoUrl }}
@@ -1677,7 +2915,12 @@ function ItemCard({
             ) : null}
             {place.openStatus ? <OpenStatus status={place.openStatus} /> : null}
           </View>
-        </View>
+          {onPressPlace ? (
+            <View style={[styles.swapHint, { backgroundColor: t.colors.fill1 }]}>
+              <Ionicons name="swap-horizontal" size={15} color={t.colors.accent} />
+            </View>
+          ) : null}
+        </Pressable>
       ) : null}
 
       {item.description ? (
@@ -1820,9 +3063,23 @@ const styles = StyleSheet.create({
     gap: 8,
     marginBottom: 2,
   },
+  timeWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    flexShrink: 1,
+    flexGrow: 1,
+  },
   timeText: {
     fontSize: 14,
     letterSpacing: 0.3,
+  },
+  menuBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   durationPill: {
     flexDirection: 'row',
@@ -1965,6 +3222,83 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 0 },
     shadowRadius: 12,
   },
+  swapHint: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+  },
+  rearrangeBanner: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  rearrangeChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingLeft: 12,
+    paddingRight: 6,
+    paddingVertical: 7,
+    borderRadius: 999,
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 6,
+  },
+  rearrangeDone: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
+  undoToast: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 10,
+  },
+  conflictWrap: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 16,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  conflictActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  conflictDismiss: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   // ---- Connectors (travel / free time) aligned to the rail ---------------
   connRow: {
     flexDirection: 'row',
@@ -1995,9 +3329,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  connDotEmoji: {
-    fontSize: 12,
-  },
   connDotEmojiSm: {
     fontSize: 10,
   },
@@ -2010,47 +3341,127 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
     fontWeight: '500',
   },
-  leaveRow: {
+  gapRowBody: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
-    flexWrap: 'wrap',
+    justifyContent: 'space-between',
   },
-  leaveText: {
-    fontSize: 13.5,
+  gapAddPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 8,
+    paddingVertical: 3,
+    paddingHorizontal: 7,
+  },
+  gapAddText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+  },
+  gapCard: {
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  gapCardEmoji: {
+    fontSize: 13,
+  },
+  // ---- Commute panel (redesigned travel leg) ----------------------------
+  commutePanel: {
+    flex: 1,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 12,
+    marginVertical: 3,
+  },
+  commuteHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  commuteLeave: {
+    fontSize: 13,
     fontWeight: '700',
     letterSpacing: 0.2,
   },
-  leaveMeta: {
+  commuteMeta: {
+    fontSize: 12.5,
+    fontWeight: '500',
+  },
+  commuteChevron: {
+    marginLeft: 'auto',
+    opacity: 0.7,
+  },
+  stepBlock: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 11,
+  },
+  stepBlockCenter: {
+    alignItems: 'center',
+  },
+  stepBadge: {
+    width: 34,
+    height: 34,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepMain: {
+    flex: 1,
+    gap: 4,
+    paddingTop: 1,
+  },
+  stepTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  stepTitle: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '700',
+    letterSpacing: 0.2,
+  },
+  stepTitleWalk: {
+    fontWeight: '600',
+    letterSpacing: 0,
+  },
+  stepMeta: {
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  stepStops: {
+    gap: 5,
+  },
+  stepFromLabel: {
     fontSize: 13,
     fontWeight: '500',
   },
-  legHead: {
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  legFrom: {
-    fontSize: 12.5,
-    fontWeight: '400',
-  },
-  legSteps: {
-    gap: 3,
-    marginTop: 2,
-  },
-  legStep: {
+  stopRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    gap: 8,
   },
-  legStepEmoji: {
-    fontSize: 12,
-    width: 16,
-    textAlign: 'center',
+  stopDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 3.5,
+    borderWidth: 1.5,
   },
-  legStepText: {
-    fontSize: 12.5,
-    fontWeight: '400',
+  stopName: {
     flex: 1,
+    fontSize: 13.5,
+    fontWeight: '500',
+  },
+  stopTime: {
+    fontSize: 13.5,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
   },
   skelCard: {
     marginTop: 10,

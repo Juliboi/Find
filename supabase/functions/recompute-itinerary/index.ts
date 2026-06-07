@@ -73,7 +73,7 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Method not allowed' }, 405);
   }
 
-  let payload: { itinerary?: any; context?: any };
+  let payload: { itinerary?: any; context?: any; timezone?: any; now?: any };
   try {
     payload = await req.json();
   } catch {
@@ -87,15 +87,28 @@ Deno.serve(async (req: Request) => {
   const context = normalizeContext(payload.context);
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
 
+  // Time-aware routing inputs (optional): the client's IANA zone + "now" let us
+  // price each transit/driving leg for its real departure slot instead of the
+  // moment the request happens to fire.
+  const timezone = typeof payload.timezone === 'string' ? payload.timezone : undefined;
+  const nowDate = typeof payload.now === 'string' ? new Date(payload.now) : undefined;
+  const timing = {
+    timezone,
+    now: nowDate && !Number.isNaN(nowDate.getTime()) ? nowDate : undefined,
+  };
+
   // Re-route every hop against the (possibly changed) coordinates and cascade
   // the clock. `stripTravel`/`appendBackHome` keep the synthetic "Back home"
   // block idempotent: the previous one is dropped and regenerated only if the
   // day still ends away from home. Best-effort — never fail the request.
   try {
-    await routeAndSchedule(itinerary, context, googleKey, {
-      stripTravel: true,
-      appendBackHome: true,
-    });
+    await routeAndSchedule(
+      itinerary,
+      context,
+      googleKey,
+      { stripTravel: true, appendBackHome: true },
+      timing,
+    );
   } catch (e) {
     return jsonResponse({ error: 'Recompute failed', detail: String(e) }, 500);
   }

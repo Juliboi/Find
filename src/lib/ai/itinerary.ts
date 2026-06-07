@@ -202,11 +202,17 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
         .map((h) => asString(h))
         .filter((h): h is string => Boolean(h))
     : undefined;
+  const kind = sanitizeKind(raw.kind);
+  // A gap IS open free time — it must always stay flexible so the elastic
+  // scheduler can grow/shrink it and the user can drag it freely. A "fixed"
+  // gap would wrongly pin the clock and tear holes on reorder, so coerce it.
+  const flexibility =
+    kind === 'gap' ? 'flexible' : sanitizeFlexibility(raw.flexibility);
   return {
     id: asString(raw.id) ?? uid('item'),
     title,
-    kind: sanitizeKind(raw.kind),
-    flexibility: sanitizeFlexibility(raw.flexibility),
+    kind,
+    flexibility,
     startTime: asHHMM(raw.startTime),
     endTime: asHHMM(raw.endTime),
     durationMinutes: (() => {
@@ -217,6 +223,10 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
     windowEnd: asHHMM(raw.windowEnd),
     place: sanitizePlace(raw.place),
     travelFromPrev: sanitizeTravelLeg(raw.travelFromPrev),
+    gapBeforeMin: (() => {
+      const n = asNumber(raw.gapBeforeMin);
+      return n !== undefined && n >= 0 ? Math.round(n) : undefined;
+    })(),
     description: asString(raw.description),
     highlights: highlights && highlights.length > 0 ? highlights : undefined,
     arrival: raw.arrival === true ? true : undefined,

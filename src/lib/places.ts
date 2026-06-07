@@ -143,6 +143,12 @@ export function clearPlacesCache(): void {
 export async function findPlaces(
   input: string | string[],
   intent?: string,
+  /**
+   * Search center. When omitted, falls back to the user's GPS location. Pass a
+   * place's own coordinates to surface alternatives "near that spot" (used by
+   * the itinerary place-swap browser) rather than near the user.
+   */
+  center?: Coords,
 ): Promise<FindPlacesResult> {
   const queries = (Array.isArray(input) ? input : [input])
     .map((q) => q.trim())
@@ -150,17 +156,19 @@ export async function findPlaces(
   if (queries.length === 0) {
     return { places: [], category: null, provider: 'none', reason: 'no_results' };
   }
-  const coords = await getCurrentCoords();
+  if (!isSupabaseConfigured || !supabase) {
+    return { places: [], category: null, provider: 'none', reason: 'no_supabase' };
+  }
+  // `center` lets callers anchor the search around a specific venue (used by
+  // the itinerary place-swap browser to find alternatives "near that spot")
+  // instead of around the user's current location.
+  const coords = center ?? (await getCurrentCoords());
   if (!coords) {
     return { places: [], category: null, provider: 'none', reason: 'no_location' };
   }
   const key = cacheKey(queries.join('|') + (intent ? `:${intent}` : ''), coords);
   const cached = readCache(key);
   if (cached) return cached;
-
-  if (!isSupabaseConfigured || !supabase) {
-    return { places: [], category: null, provider: 'none', reason: 'no_supabase' };
-  }
 
   try {
     const { data, error } = await supabase.functions.invoke('find-places', {

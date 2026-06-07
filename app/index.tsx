@@ -1,5 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
+  Alert,
   Image,
   Pressable,
   RefreshControl,
@@ -26,6 +27,7 @@ import { Button } from '@/components/Button';
 import { ComposerStatus } from '@/components/ComposerStatus';
 import { EmptyState } from '@/components/EmptyState';
 import { FloatingTabBar } from '@/components/FloatingTabBar';
+import { TripActionsSheet } from '@/components/TripActionsSheet';
 import { PRIMARY_TABS } from '@/components/nav/tabs';
 import { formatTime, formatDuration } from '@/utils/time';
 
@@ -75,6 +77,17 @@ export default function HomeScreen() {
   const t = useTheme();
 
   const savedTrips = useSavedItineraries((s) => s.items);
+  const duplicateTrip = useSavedItineraries((s) => s.duplicate);
+  const removeTrip = useSavedItineraries((s) => s.remove);
+
+  // The trip the user long-pressed — opens the actions sheet (open / duplicate
+  // / delete). Stored as an id (not the trip object) so the sheet stays in
+  // sync if the underlying list mutates while it's open.
+  const [actionsTripId, setActionsTripId] = useState<string | null>(null);
+  const actionsTrip =
+    actionsTripId != null
+      ? savedTrips.find((t) => t.id === actionsTripId) ?? null
+      : null;
 
   const date = useDayStore((s) => s.date);
   const plans = useDayStore((s) => s.plans);
@@ -185,6 +198,13 @@ export default function HomeScreen() {
                     Haptics.selectionAsync().catch(() => undefined);
                     router.push({ pathname: '/itinerary', params: { id: trip.id } });
                   }}
+                  onLongPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
+                      () => undefined,
+                    );
+                    setActionsTripId(trip.id);
+                  }}
+                  delayLongPress={350}
                   style={({ pressed }) => [
                     styles.tripCard,
                     {
@@ -410,6 +430,47 @@ export default function HomeScreen() {
       </ScrollView>
 
       <FloatingTabBar tabs={PRIMARY_TABS} onFabPress={goAdd} />
+
+      <TripActionsSheet
+        trip={actionsTrip}
+        onClose={() => setActionsTripId(null)}
+        onOpen={() => {
+          if (!actionsTrip) return;
+          router.push({ pathname: '/itinerary', params: { id: actionsTrip.id } });
+        }}
+        onDuplicate={() => {
+          if (!actionsTrip) return;
+          const newId = duplicateTrip(actionsTrip.id);
+          if (newId) {
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+              () => undefined,
+            );
+          }
+        }}
+        onDelete={() => {
+          if (!actionsTrip) return;
+          const target = actionsTrip;
+          // Destructive — confirm with the native alert so a stray tap can't
+          // wipe a planned day. Delete is unrecoverable from here.
+          Alert.alert(
+            'Delete trip?',
+            `"${target.title}" will be removed from your saved day trips.`,
+            [
+              { text: 'Cancel', style: 'cancel' },
+              {
+                text: 'Delete',
+                style: 'destructive',
+                onPress: () => {
+                  removeTrip(target.id);
+                  Haptics.notificationAsync(
+                    Haptics.NotificationFeedbackType.Warning,
+                  ).catch(() => undefined);
+                },
+              },
+            ],
+          );
+        }}
+      />
     </SafeAreaView>
   );
 }
