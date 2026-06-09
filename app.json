@@ -1,11 +1,12 @@
 {
   "expo": {
-    "name": "DayFlow",
+    "name": "Diem",
     "slug": "diem",
     "version": "0.1.0",
     "orientation": "portrait",
     "scheme": "dayflow",
     "userInterfaceStyle": "automatic",
+    "icon": "./assets/diem-logo.png",
     "splash": {
       "backgroundColor": "#ffffff",
       "resizeMode": "contain"
@@ -13,6 +14,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.cholify.dayflow",
+      "usesAppleSignIn": true,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
@@ -33,6 +35,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-apple-authentication",
       [
         "expo-location",
         {

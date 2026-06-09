@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -17,6 +18,9 @@ import { Text } from '@/components/Text';
 import { FloatingTabBar } from '@/components/FloatingTabBar';
 import { PRIMARY_TABS } from '@/components/nav/tabs';
 import { isSupabaseConfigured } from '@/lib/supabase';
+import { useAuthStore } from '@/store/useAuthStore';
+import { useProfileStore } from '@/store/useProfileStore';
+import { formatTime } from '@/utils/time';
 
 interface RowProps {
   icon: keyof typeof Ionicons.glyphMap;
@@ -106,9 +110,43 @@ export default function SettingsScreen() {
   const systemScheme = useColorScheme();
   const supabaseOn = isSupabaseConfigured;
 
+  const user = useAuthStore((s) => s.user);
+  const signOut = useAuthStore((s) => s.signOut);
+  const fullName = useProfileStore((s) => s.fullName);
+  const wakeTime = useProfileStore((s) => s.wakeTime);
+  const bedTime = useProfileStore((s) => s.bedTime);
+  const hasCar = useProfileStore((s) => s.hasCar);
+
+  const accountName =
+    fullName ??
+    (typeof user?.user_metadata?.full_name === 'string'
+      ? (user.user_metadata.full_name as string)
+      : null);
+  const accountEmail = user?.email ?? null;
+  const accountInitial = (accountName ?? accountEmail ?? '?')
+    .trim()
+    .charAt(0)
+    .toUpperCase();
+
   const goAdd = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     router.push('/add');
+  };
+
+  const confirmSignOut = () => {
+    Alert.alert('Sign out?', 'You can sign back in anytime.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Sign out',
+        style: 'destructive',
+        onPress: () => {
+          void signOut();
+          Haptics.notificationAsync(
+            Haptics.NotificationFeedbackType.Warning,
+          ).catch(() => undefined);
+        },
+      },
+    ]);
   };
 
   return (
@@ -138,6 +176,91 @@ export default function SettingsScreen() {
           },
         ]}
       >
+        {user ? (
+          <Card padded style={{ padding: 0 }}>
+            <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+              <Text
+                variant="caption"
+                tone="secondary"
+                uppercase
+                weight="semibold"
+              >
+                Account
+              </Text>
+            </View>
+            <View style={[styles.accountRow, { paddingHorizontal: 16 }]}>
+              <View
+                style={[styles.avatar, { backgroundColor: t.colors.accentSoft }]}
+              >
+                <Text variant="title3" weight="bold" tone="accent">
+                  {accountInitial}
+                </Text>
+              </View>
+              <View style={{ flex: 1, gap: 2 }}>
+                <Text variant="body" weight="semibold" numberOfLines={1}>
+                  {accountName ?? 'Signed in'}
+                </Text>
+                {accountEmail ? (
+                  <Text variant="caption" tone="secondary" numberOfLines={1}>
+                    {accountEmail}
+                  </Text>
+                ) : null}
+              </View>
+            </View>
+            <Row
+              icon="log-out-outline"
+              iconBg={t.colors.dangerSoft}
+              iconColor={t.colors.danger}
+              title="Sign out"
+              onPress={confirmSignOut}
+            />
+          </Card>
+        ) : null}
+
+        <Card padded style={{ padding: 0 }}>
+          <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+            <Text variant="caption" tone="secondary" uppercase weight="semibold">
+              Daily preferences
+            </Text>
+          </View>
+          <Row
+            first
+            icon="sunny-outline"
+            iconBg={t.colors.warningSoft}
+            iconColor={t.colors.warning}
+            title="Wake up"
+            subtitle="Seeds your default day start"
+            trailing={
+              <Text variant="body" weight="semibold" tone="secondary">
+                {wakeTime ? formatTime(wakeTime) : 'Not set'}
+              </Text>
+            }
+          />
+          <Row
+            icon="moon-outline"
+            iconBg={t.colors.fill1}
+            title="Bed time"
+            subtitle="When you want to wind down"
+            trailing={
+              <Text variant="body" weight="semibold" tone="secondary">
+                {bedTime ? formatTime(bedTime) : 'Not set'}
+              </Text>
+            }
+          />
+          <Row
+            icon={hasCar ? 'car-sport' : 'walk'}
+            iconBg={t.colors.infoSoft}
+            iconColor={t.colors.info}
+            title="Transport"
+            subtitle="Used to pick routes between stops"
+            trailing={
+              <Text variant="body" weight="semibold" tone="secondary">
+                {hasCar ? 'Has a car' : 'No car'}
+              </Text>
+            }
+          />
+        </Card>
+
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
@@ -297,5 +420,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 999,
+  },
+  accountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 8,
+    paddingBottom: 14,
+  },
+  avatar: {
+    width: 48,
+    height: 48,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });
