@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { Modal, Pressable, StyleSheet, Switch, View } from 'react-native';
-import Animated, { FadeInUp } from 'react-native-reanimated';
+import { Pressable, StyleSheet, Switch, View } from 'react-native';
+import { BottomSheetView } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
+import { Sheet } from './Sheet';
 import { Text } from './Text';
 import type { ItineraryItem, ItineraryTravelMode } from '@/types/itinerary';
 
@@ -56,20 +57,8 @@ export function LegModeSheet({ item, onClose, onPickLegMode, onPickDayMode }: Pr
   };
 
   return (
-    <Modal visible={open} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose} />
-      <Animated.View
-        entering={FadeInUp.duration(220)}
-        style={[
-          styles.sheet,
-          {
-            backgroundColor: t.colors.surface1,
-            borderColor: t.colors.separator,
-            paddingBottom: insets.bottom + 12,
-          },
-        ]}
-      >
-        <View style={[styles.grabber, { backgroundColor: t.colors.separator }]} />
+    <Sheet open={open} onClose={onClose}>
+      <BottomSheetView style={[styles.content, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
             <Text variant="micro" tone="tertiary" uppercase weight="bold">
@@ -135,33 +124,15 @@ export function LegModeSheet({ item, onClose, onPickLegMode, onPickDayMode }: Pr
             trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
           />
         </View>
-      </Animated.View>
-    </Modal>
+      </BottomSheetView>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-  },
-  sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    borderTopWidth: StyleSheet.hairlineWidth,
+  content: {
     paddingHorizontal: 16,
-    paddingTop: 8,
-  },
-  grabber: {
-    alignSelf: 'center',
-    width: 38,
-    height: 5,
-    borderRadius: 3,
-    marginBottom: 10,
+    paddingTop: 4,
   },
   header: {
     flexDirection: 'row',

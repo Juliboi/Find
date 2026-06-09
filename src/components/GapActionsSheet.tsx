@@ -1,16 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
-  TextInput,
   View,
 } from 'react-native';
-import Animated, { FadeInUp } from 'react-native-reanimated';
+import { BottomSheetTextInput, BottomSheetView } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
+import { Sheet } from './Sheet';
 import { Text } from './Text';
 import type { ItineraryItem } from '@/types/itinerary';
 import { formatDuration } from '@/utils/time';
@@ -68,20 +67,8 @@ export function GapActionsSheet({
   };
 
   return (
-    <Modal visible={open} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose} />
-      <Animated.View
-        entering={FadeInUp.duration(220)}
-        style={[
-          styles.sheet,
-          {
-            backgroundColor: t.colors.surface1,
-            borderColor: t.colors.separator,
-            paddingBottom: insets.bottom + 12,
-          },
-        ]}
-      >
-        <View style={[styles.grabber, { backgroundColor: t.colors.separator }]} />
+    <Sheet open={open} onClose={onClose}>
+      <BottomSheetView style={[styles.content, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
             <Text variant="micro" tone="tertiary" uppercase weight="bold">
@@ -105,7 +92,7 @@ export function GapActionsSheet({
               Name this time
             </Text>
           </View>
-          <TextInput
+          <BottomSheetTextInput
             value={name}
             onChangeText={setName}
             onBlur={commitName}
@@ -209,8 +196,8 @@ export function GapActionsSheet({
             onRemove();
           }}
         />
-      </Animated.View>
-    </Modal>
+      </BottomSheetView>
+    </Sheet>
   );
 }
 
@@ -261,27 +248,9 @@ function ActionRow({
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-  },
-  sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    borderTopWidth: StyleSheet.hairlineWidth,
+  content: {
     paddingHorizontal: 16,
-    paddingTop: 8,
-  },
-  grabber: {
-    alignSelf: 'center',
-    width: 38,
-    height: 5,
-    borderRadius: 3,
-    marginBottom: 10,
+    paddingTop: 4,
   },
   header: {
     flexDirection: 'row',

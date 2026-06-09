@@ -2,17 +2,16 @@ import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
-  Modal,
   Pressable,
-  ScrollView,
   StyleSheet,
-  TextInput,
   View,
 } from 'react-native';
-import Animated, { FadeIn, FadeInUp } from 'react-native-reanimated';
+import Animated, { FadeIn } from 'react-native-reanimated';
+import { BottomSheetScrollView, BottomSheetTextInput } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
+import { Sheet } from './Sheet';
 import { Text } from './Text';
 import { findPlaces, formatDistance, type NearbyPlace } from '@/lib/places';
 import { ItineraryItem, ItineraryPlace } from '@/types/itinerary';
@@ -94,20 +93,8 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
   };
 
   return (
-    <Modal visible={open} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose} />
-      <Animated.View
-        entering={FadeInUp.duration(220)}
-        style={[
-          styles.sheet,
-          {
-            backgroundColor: t.colors.surface1,
-            borderColor: t.colors.separator,
-            paddingBottom: insets.bottom + 12,
-          },
-        ]}
-      >
-        <View style={[styles.grabber, { backgroundColor: t.colors.separator }]} />
+    <Sheet open={open} onClose={onClose} heightFraction={0.82}>
+      <View style={[styles.content, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
             <Text variant="micro" tone="tertiary" uppercase weight="bold">
@@ -124,7 +111,7 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
 
         <View style={[styles.search, { backgroundColor: t.colors.fill1 }]}>
           <Ionicons name="search" size={16} color={t.colors.textTertiary} />
-          <TextInput
+          <BottomSheetTextInput
             style={[styles.searchInput, { color: t.colors.textPrimary }]}
             placeholder="Search a place or type…"
             placeholderTextColor={t.colors.textTertiary}
@@ -140,7 +127,7 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
           ) : null}
         </View>
 
-        <ScrollView
+        <BottomSheetScrollView
           style={styles.list}
           contentContainerStyle={{ paddingBottom: 8 }}
           keyboardShouldPersistTaps="handled"
@@ -217,35 +204,17 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
               </Animated.View>
             ))
           )}
-        </ScrollView>
-      </Animated.View>
-    </Modal>
+        </BottomSheetScrollView>
+      </View>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-  },
-  sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    maxHeight: '82%',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    borderTopWidth: StyleSheet.hairlineWidth,
+  content: {
+    flex: 1,
     paddingHorizontal: 16,
-    paddingTop: 8,
-  },
-  grabber: {
-    alignSelf: 'center',
-    width: 38,
-    height: 5,
-    borderRadius: 3,
-    marginBottom: 10,
+    paddingTop: 4,
   },
   header: {
     flexDirection: 'row',
@@ -274,7 +243,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   list: {
-    flexGrow: 0,
+    flex: 1,
   },
   loading: {
     paddingVertical: 36,

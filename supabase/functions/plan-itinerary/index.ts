@@ -127,12 +127,22 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                 place: {
                   type: 'object',
                   nullable: true,
-                  propertyOrdering: ['name', 'category', 'emoji', 'address', 'coords'],
+                  propertyOrdering: [
+                    'name',
+                    'category',
+                    'emoji',
+                    'address',
+                    'userQuery',
+                    'locationType',
+                    'coords',
+                  ],
                   properties: {
                     name: { type: 'string' },
                     category: { type: 'string' },
                     emoji: { type: 'string' },
                     address: { type: 'string' },
+                    userQuery: { type: 'string' },
+                    locationType: { type: 'string', enum: ['business', 'residence'] },
                     coords: {
                       type: 'object',
                       nullable: true,
@@ -306,9 +316,12 @@ function buildPlannerPrompt(args: {
   // Venue-sourcing instruction differs by mode: grounded mode has live Google
   // Search; schema mode relies on the model's own knowledge + a downstream
   // Google Places validation pass, so we ask for approximate coords.
+  const userQueryRule =
+    ' WHENEVER the user names a venue or gives an address, you MUST set place.userQuery to their EXACT words for that place — verbatim, copied character-for-character from their request, NOT paraphrased (e.g. user wrote "visit mom at Kadaňská 837/18 dolní Chabry" → place.userQuery = "Kadaňská 837/18 dolní Chabry"; user wrote "hostinec u misku" → place.userQuery = "hostinec u misku"; "max fitness oc krakov" → place.userQuery = "max fitness oc krakov"). We geocode place.userQuery against Google Maps EXACTLY as the user typed it, so it is the single most important field — a paraphrased name like "Mom\'s House" geocodes to the WRONG place. Omit place.userQuery only for at-home items (which have no place at all).' +
+    ' ALSO set place.locationType: "business" for a public business or point of interest (restaurant, pub, gym, shop, museum, office, station) — we fetch its photo, rating and opening hours — or "residence" for a private home / someone\'s flat or address (e.g. visiting mom at her address, a friend\'s house) — we just pin its exact address and show no rating/photo. When unsure, default to "business".';
   const venueRule = args.grounded
-    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. If the user NAMED a venue (e.g. "OC Krakov Max Fitness"), honour that exact venue regardless of distance.'
-    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. If the user NAMED a venue, honour that exact venue regardless of distance.';
+    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule
+    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule;
 
   return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
 
@@ -358,6 +371,8 @@ Output ONLY a single JSON object, no prose, no markdown fences. Match this schem
             "category": "Gym",
             "emoji": "🏋️",
             "address": "Lodžská 850/6, Prague 8",
+            "userQuery": "max fitness oc krakov",
+            "locationType": "business",
             "rating": 4.6,
             "coords": { "latitude": 50.13, "longitude": 14.42 }
           },
@@ -481,42 +496,47 @@ async function resolvePhotoUrl(
   }
 }
 
+// A located stop further than this from home is almost certainly a bad
+// geocode rather than a genuine plan (the "Dinner with Mom routed 61 km away"
+// bug). Generous enough to allow a real trip to a neighbouring town, tight
+// enough to reject a same-named venue resolved in the wrong country.
+const MAX_PLAUSIBLE_VENUE_M = 80_000;
+
 /**
- * Looks up one venue near `center` via Google Places Text Search, picking
- * the candidate whose name actually matches the model's intended name.
- * Tight radius on purpose — the model's coords should be within a few
- * hundred metres of the real venue, and widening pulls in popular
- * doppelgängers across town.
+ * One Google Places Text Search, biased to `center`. Returns the best
+ * candidate as an EnrichedRecord (with photo resolved). When `preferName` is
+ * given we pick the first NAME-similar hit, else Google's top relevance
+ * result. Acceptance (name/address/distance) is the caller's job — this is
+ * just the raw fetch + shape.
  */
-async function lookupGooglePlace(args: {
-  name: string;
-  center: Coords;
-  apiKey: string;
-  radiusM?: number;
-}): Promise<EnrichedRecord | null> {
-  const radius = args.radiusM ?? 1500;
-  const body = {
-    textQuery: args.name,
-    maxResultCount: 5,
-    rankPreference: 'RELEVANCE',
-    locationBias: {
-      circle: {
-        center: { latitude: args.center.latitude, longitude: args.center.longitude },
-        radius: Math.max(500, Math.min(20000, radius)),
-      },
-    },
-  };
+async function searchPlaceText(
+  query: string,
+  center: Coords,
+  radiusM: number,
+  apiKey: string,
+  preferName?: string,
+): Promise<EnrichedRecord | null> {
   let data: any;
   try {
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Goog-Api-Key': args.apiKey,
+        'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
           'places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.rating,places.userRatingCount,places.photos,places.currentOpeningHours.openNow',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        textQuery: query,
+        maxResultCount: 5,
+        rankPreference: 'RELEVANCE',
+        locationBias: {
+          circle: {
+            center: { latitude: center.latitude, longitude: center.longitude },
+            radius: Math.max(500, Math.min(50000, radiusM)),
+          },
+        },
+      }),
     });
     if (!res.ok) return null;
     data = await res.json();
@@ -526,20 +546,14 @@ async function lookupGooglePlace(args: {
   const raw: any[] = Array.isArray(data?.places) ? data.places : [];
   if (raw.length === 0) return null;
   const match =
-    raw.find((p) => nameSimilar(p?.displayName?.text ?? '', args.name)) ?? raw[0];
+    (preferName && raw.find((p) => nameSimilar(p?.displayName?.text ?? '', preferName))) || raw[0];
   const lat = match?.location?.latitude;
   const lon = match?.location?.longitude;
   const name = match?.displayName?.text;
   if (typeof lat !== 'number' || typeof lon !== 'number' || typeof name !== 'string') {
     return null;
   }
-  // Strict-ish name guard — we still let the top result through if it's
-  // similar enough, but a totally different business (the "Sevt, Inc." /
-  // "ALZHEIMER HOME" case) won't be merged in.
-  if (!nameSimilar(name, args.name)) {
-    return null;
-  }
-  const photoUrl = await resolvePhotoUrl(match?.photos?.[0]?.name, args.apiKey);
+  const photoUrl = await resolvePhotoUrl(match?.photos?.[0]?.name, apiKey);
   return {
     name,
     address:
@@ -555,6 +569,205 @@ async function lookupGooglePlace(args: {
     latitude: lat,
     longitude: lon,
   };
+}
+
+interface GeocodeHit {
+  latitude: number;
+  longitude: number;
+  address: string | null;
+  /** Rooftop / interpolated / street-address-typed — i.e. a real pinpoint
+   *  rather than a city-center fallback. */
+  precise: boolean;
+}
+
+/**
+ * Google GEOCODING API — the right tool for a plain street address.
+ *
+ * Places Text Search is business/POI-biased: it answers "what venue is here?"
+ * so a residential address ("Kadaňská 837/18, Dolní Chabry") has no business
+ * to match and snaps to the nearest named place — that's the "Mom's House in
+ * Letná" bug. The geocoder answers "where is this address?" and returns the
+ * exact rooftop coordinate with no business required. We bias it to a viewport
+ * around home so a same-named street elsewhere in the country loses.
+ *
+ * Needs the *Geocoding API* enabled on the key (a separate product from
+ * Places/Routes); logs a clear, actionable hint if it isn't.
+ */
+async function geocodeAddress(
+  query: string,
+  apiKey: string,
+  bounds?: string,
+): Promise<GeocodeHit | null> {
+  try {
+    const params = new URLSearchParams({ address: query, key: apiKey });
+    if (bounds) params.set('bounds', bounds);
+    const res = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.status && data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+      console.warn(
+        `[geocode] status=${data.status} ${data?.error_message ?? ''}` +
+          (data.status === 'REQUEST_DENIED'
+            ? ' — enable the "Geocoding API" on GOOGLE_PLACES_API_KEY in Google Cloud Console.'
+            : ''),
+      );
+      return null;
+    }
+    const r = Array.isArray(data?.results) ? data.results[0] : null;
+    const lat = Number(r?.geometry?.location?.lat);
+    const lng = Number(r?.geometry?.location?.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    const locType = r?.geometry?.location_type;
+    const types: string[] = Array.isArray(r?.types) ? r.types : [];
+    const precise =
+      locType === 'ROOFTOP' ||
+      locType === 'RANGE_INTERPOLATED' ||
+      types.some((t) =>
+        ['street_address', 'premise', 'subpremise', 'establishment', 'point_of_interest'].includes(t),
+      );
+    return {
+      latitude: lat,
+      longitude: lng,
+      address: typeof r?.formatted_address === 'string' ? r.formatted_address : null,
+      precise,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** True when a query names a street + house number — better resolved by the
+ *  geocoder than by business-biased Places search. Czech "čp/čo" numbers
+ *  ("837/18") are the strongest tell; a standalone house number among words
+ *  also counts. A pure venue name ("Max Fitness OC Krakov") has no number and
+ *  stays on the Places path. */
+function looksLikeStreetAddress(s: string): boolean {
+  if (!s) return false;
+  if (/\d+\s*\/\s*\d+/.test(s)) return true;
+  return /\b\d{1,4}[a-z]?\b/i.test(s) && s.trim().split(/\s+/).length >= 2;
+}
+
+/** A ~110 km viewport around home, as Geocoding's `bounds` bias param. */
+function boundsAround(home: Coords | null | undefined, deg = 0.5): string | undefined {
+  if (!home) return undefined;
+  const sw = `${(home.latitude - deg).toFixed(4)},${(home.longitude - deg).toFixed(4)}`;
+  const ne = `${(home.latitude + deg).toFixed(4)},${(home.longitude + deg).toFixed(4)}`;
+  return `${sw}|${ne}`;
+}
+
+// Relational / private-home words that strongly imply a RESIDENCE rather than
+// a business — a backstop for when the model omits place.locationType. Kept
+// narrow on purpose: generic "house"/"home" appears in real business names
+// ("Bowling House") and would wrongly suppress their photo/rating.
+const RESIDENCE_HINT_RE =
+  /\b(mom|mum|mam|mommy|maminka|mami|dad|daddy|tata|t[áa]ta|parents?|grandma|grandpa|granny|babi|d[ěe]da|aunt|uncle|sister|brother)('?s)?\b/i;
+
+/**
+ * Resolves ONE venue to a real coordinate, KEEPING Google's photo/rating/
+ * open-now whenever the place is a business. The model hands us a name, the
+ * user's exact words, the address, an APPROXIMATE coord, and a locationType
+ * ('business' | 'residence'). We route by that, because a business and a home
+ * need opposite tools:
+ *
+ *   - BUSINESS → Places Text Search (gym, pub, shop). Only Places returns the
+ *     photo + rating, so we try it FIRST and accept on a NAME match — the gate
+ *     that stops a home snapping to a same-named storefront.
+ *   - RESIDENCE → Geocoding API. A home isn't a business, so Places would snap
+ *     to the nearest shop ("Mom's House in Letná"); the geocoder pins the exact
+ *     address instead.
+ *   - Unknown → try the business path, then fall back to geocoding the address.
+ *
+ * Everything is biased to HOME and rejected if it lands implausibly far, so a
+ * hallucinated coord or a same-named place in another town can't win.
+ */
+async function lookupGooglePlace(args: {
+  name: string;
+  address?: string | null;
+  userQuery?: string | null;
+  locationType?: string | null;
+  center: Coords;
+  home?: Coords | null;
+  city?: string | null;
+  apiKey: string;
+  radiusM?: number;
+}): Promise<EnrichedRecord | null> {
+  const name = (args.name ?? '').trim();
+  const addr = typeof args.address === 'string' ? args.address.trim() : '';
+  const uq = typeof args.userQuery === 'string' ? args.userQuery.trim() : '';
+  const city = typeof args.city === 'string' ? args.city.trim() : '';
+  if (!name && !addr && !uq) return null;
+
+  // Home is the trustworthy anchor; the model's own coord is only a fallback
+  // for when no home is pinned.
+  const biasCenter = args.home ?? args.center;
+  const radius = args.radiusM ?? 30000;
+  const bounds = boundsAround(args.home);
+  const withCity = (q: string) => (city && !q.toLowerCase().includes(city.toLowerCase()) ? `${q}, ${city}` : q);
+  const tooFar = (lat: number, lon: number): boolean =>
+    !!args.home && haversineMeters({ latitude: lat, longitude: lon }, args.home) > MAX_PLAUSIBLE_VENUE_M;
+  // A geocoded address keeps the model's friendly name ("Mom's") but takes the
+  // real coordinate + canonical address from the geocoder.
+  const fromGeocode = (g: GeocodeHit): EnrichedRecord => ({
+    name: name || g.address || uq || addr,
+    address: g.address ?? (addr || null),
+    rating: null,
+    ratingCount: null,
+    photoUrl: null,
+    openNow: null,
+    latitude: g.latitude,
+    longitude: g.longitude,
+  });
+
+  // Accept a Places hit only when its name resembles what the user actually
+  // asked for (their words or the model's name). This is what lets a business
+  // through with full metadata while rejecting a wrong storefront.
+  const matchesWanted = (n: string): boolean =>
+    nameSimilar(n, name) || (uq.length >= 3 && nameSimilar(n, uq));
+
+  const isResidence =
+    args.locationType === 'residence' ||
+    (args.locationType !== 'business' && RESIDENCE_HINT_RE.test(`${name} ${uq}`));
+  const addrText = looksLikeStreetAddress(uq) ? uq : looksLikeStreetAddress(addr) ? addr : '';
+
+  // 1) BUSINESS via Places — the ONLY path that returns photo + rating. Try the
+  //    user's exact words first, then name+address, then name; accept on a name
+  //    match so a residence can't grab a same-named shop. Skipped for homes.
+  if (!isResidence) {
+    const queries = [uq, name && addr ? `${name}, ${addr}` : '', name].filter(Boolean) as string[];
+    const tried = new Set<string>();
+    for (const q of queries) {
+      const key = q.toLowerCase();
+      if (tried.has(key)) continue;
+      tried.add(key);
+      const rec = await searchPlaceText(withCity(q), biasCenter, radius, args.apiKey, name || uq);
+      if (rec && matchesWanted(rec.name) && !tooFar(rec.latitude, rec.longitude)) return rec;
+    }
+  }
+
+  // 2) ADDRESS via the geocoder — exact coords, no business needed. This is the
+  //    residence path, and the fallback when no business name matched above.
+  const geoText = addrText || (isResidence ? uq || addr : '');
+  if (geoText) {
+    const g = await geocodeAddress(withCity(geoText), args.apiKey, bounds);
+    if (g && g.precise && !tooFar(g.latitude, g.longitude)) return fromGeocode(g);
+  }
+
+  // 3) Address via Places — for an address that IS a storefront (no name match
+  //    required; the address itself is the signal).
+  if (addr) {
+    const rec = await searchPlaceText(withCity(addr), biasCenter, radius, args.apiKey, name || uq);
+    if (rec && !tooFar(rec.latitude, rec.longitude)) return rec;
+  }
+
+  // 4) Final geocode net — any words, even without a strong number pattern (an
+  //    imprecise pin is still better than a wrong business across town).
+  const lastResort = addr || uq;
+  if (lastResort) {
+    const g = await geocodeAddress(withCity(lastResort), args.apiKey, bounds);
+    if (g && !tooFar(g.latitude, g.longitude)) return fromGeocode(g);
+  }
+
+  return null;
 }
 
 function openStatusFromBool(b: boolean | null): string | null {
@@ -578,15 +791,25 @@ async function enrichItinerary(
 ): Promise<void> {
   if (!parsed || !Array.isArray(parsed.sections)) return;
 
-  // Index every (name, rounded-coord) venue across the day.
+  const city = typeof parsed?.city === 'string' ? parsed.city.trim() : null;
+  const homeC: Coords | null = home
+    ? { latitude: home.latitude, longitude: home.longitude }
+    : null;
+
+  // Index every venue across the day. We key by name + rounded-coord so the
+  // same place reused twice is resolved once; an address-only stop (a coord-
+  // less venue the user named by address) keys on its address instead.
   interface Slot {
     item: any;
     name: string;
-    coords: Coords;
+    address: string;
+    userQuery: string;
+    locationType: string;
+    coords: Coords | null;
   }
   const slotsByKey = new Map<string, Slot[]>();
-  const keyOf = (name: string, c: Coords) =>
-    `${normaliseName(name)}|${c.latitude.toFixed(3)},${c.longitude.toFixed(3)}`;
+  const keyOf = (label: string, c: Coords | null) =>
+    `${normaliseName(label)}|${c ? `${c.latitude.toFixed(3)},${c.longitude.toFixed(3)}` : 'addr'}`;
 
   for (const section of parsed.sections) {
     if (!section || !Array.isArray(section.items)) continue;
@@ -594,22 +817,32 @@ async function enrichItinerary(
       const p = item?.place;
       if (!p || typeof p !== 'object') continue;
       const name = typeof p.name === 'string' ? p.name.trim() : '';
+      const address = typeof p.address === 'string' ? p.address.trim() : '';
+      const userQuery = typeof p.userQuery === 'string' ? p.userQuery.trim() : '';
+      const locationType = typeof p.locationType === 'string' ? p.locationType.trim().toLowerCase() : '';
       const lat = Number(p?.coords?.latitude);
       const lon = Number(p?.coords?.longitude);
-      if (!name || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      const coords: Coords = { latitude: lat, longitude: lon };
+      const coords: Coords | null =
+        Number.isFinite(lat) && Number.isFinite(lon) ? { latitude: lat, longitude: lon } : null;
+
+      // Resolve a stop only when we have a name/address/user-phrase AND
+      // something to anchor the search to (a coord hint, an address, or the
+      // user's literal words). A bare ambiguous name with nothing else is left
+      // alone so we don't geocode an at-home "reading nook" into a random café.
+      if (!name && !address && !userQuery) continue;
+      if (!coords && !address && !userQuery) continue;
 
       // Defensive: refuse to enrich anything that looks like "Home" — the
       // model is told not to emit one, but if it slips through we don't
       // want Google's nearest "Home"-named business to override the user.
-      if (looksLikeHome(name, coords, home)) {
+      if (coords && looksLikeHome(name, coords, home)) {
         item.place = undefined;
         continue;
       }
 
-      const k = keyOf(name, coords);
+      const k = keyOf(userQuery || name || address, coords);
       if (!slotsByKey.has(k)) slotsByKey.set(k, []);
-      slotsByKey.get(k)!.push({ item, name, coords });
+      slotsByKey.get(k)!.push({ item, name, address, userQuery, locationType, coords });
     }
   }
 
@@ -618,9 +851,47 @@ async function enrichItinerary(
   // One lookup per unique venue, in parallel.
   await Promise.all(
     Array.from(slotsByKey.values()).map(async (slots) => {
-      const { name, coords } = slots[0];
-      const record = await lookupGooglePlace({ name, center: coords, apiKey });
-      if (!record) return;
+      const { name, address, userQuery, locationType, coords } = slots[0];
+      const center = coords ?? homeC;
+      if (!center) return; // no anchor to bias the search to
+      const record = await lookupGooglePlace({
+        name,
+        address,
+        userQuery,
+        locationType,
+        center,
+        home: homeC,
+        city,
+        apiKey,
+      });
+      // Compact resolution trace — read via `supabase functions logs
+      // plan-itinerary`. Shows what the model gave us (userQuery / name /
+      // address) and what Google matched, so a bad geocode is one line away.
+      console.log(
+        `[enrich] type=${locationType || '?'} uq=${JSON.stringify(userQuery)} ` +
+          `name=${JSON.stringify(name)} addr=${JSON.stringify(address)} → ` +
+          (record
+            ? `${record.name} @${record.latitude.toFixed(4)},${record.longitude.toFixed(4)}` +
+              (homeC
+                ? ` (${Math.round(
+                    haversineMeters({ latitude: record.latitude, longitude: record.longitude }, homeC) /
+                      1000,
+                  )}km from home)`
+                : '')
+            : 'NO MATCH'),
+      );
+      if (!record) {
+        // Couldn't verify the venue. A model coord that sits absurdly far from
+        // home is almost certainly hallucinated (the "routed 61 km away" bug) —
+        // drop it so routing doesn't draw a phantom cross-country leg; the stop
+        // falls back to unlocated instead of teleporting the whole day.
+        if (homeC && coords && haversineMeters(coords, homeC) > MAX_PLAUSIBLE_VENUE_M) {
+          for (const { item } of slots) {
+            if (item.place && typeof item.place === 'object') item.place.coords = undefined;
+          }
+        }
+        return;
+      }
       for (const { item } of slots) {
         const hint = item.place && typeof item.place === 'object' ? item.place : {};
         item.place = {
