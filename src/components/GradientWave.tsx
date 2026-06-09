@@ -15,15 +15,34 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useTheme } from '@/theme/useTheme';
 
-/** The Gemini sweep: blue → indigo → violet → magenta → amber. */
-const GEMINI_STOPS = ['#1BA1E3', '#5489D6', '#9B72CB', '#D96570', '#F49C46'];
+/** A flowing colour field: a diagonal `sweep` plus three drifting `blobs`. */
+export interface GradientPalette {
+  /** 3–5 colour stops for the diagonal sweep (top-left → bottom-right). */
+  sweep: string[];
+  /** Three blob colours for the wandering, aurora-like highlights. */
+  blobs: string[];
+}
+
+/** The default Gemini sweep: blue → indigo → violet → magenta → amber. */
+const GEMINI_PALETTE: GradientPalette = {
+  sweep: ['#1BA1E3', '#5489D6', '#9B72CB', '#D96570', '#F49C46'],
+  blobs: ['#9B72CB', '#1BA1E3', '#F49C46'],
+};
 
 /**
  * The base colour field — an oversized diagonal sweep that slowly slides and
  * rotates so the whole palette appears to flow. It's drawn once and only its
  * transform is animated, so the movement runs entirely on the UI thread.
  */
-function MovingSweep({ width, height }: { width: number; height: number }) {
+function MovingSweep({
+  width,
+  height,
+  stops,
+}: {
+  width: number;
+  height: number;
+  stops: string[];
+}) {
   const w = width * 2;
   const h = height * 2;
   const ax = width * 0.22;
@@ -77,10 +96,10 @@ function MovingSweep({ width, height }: { width: number; height: number }) {
       <Svg width={w} height={h}>
         <Defs>
           <LinearGradient id="gem" x1="0%" y1="0%" x2="100%" y2="100%">
-            {GEMINI_STOPS.map((c, i) => (
+            {stops.map((c, i) => (
               <Stop
-                key={c}
-                offset={`${(i / (GEMINI_STOPS.length - 1)) * 100}%`}
+                key={`${c}-${i}`}
+                offset={`${(i / (stops.length - 1)) * 100}%`}
                 stopColor={c}
               />
             ))}
@@ -157,6 +176,8 @@ function FloatingBlob({
 interface Props {
   /** Total height of the header banner. */
   height: number;
+  /** Colour palette to flow. Defaults to the Gemini sweep. */
+  palette?: GradientPalette;
   style?: StyleProp<ViewStyle>;
 }
 
@@ -164,7 +185,7 @@ interface Props {
  * A Gemini-style header: a living, drifting colour field that melts smoothly
  * down into the page background.
  */
-export function GradientWave({ height, style }: Props) {
+export function GradientWave({ height, palette = GEMINI_PALETTE, style }: Props) {
   const t = useTheme();
   const { width } = useWindowDimensions();
   const bg = t.colors.background;
@@ -184,12 +205,12 @@ export function GradientWave({ height, style }: Props) {
       style={[styles.wrap, { height, width }, introStyle, style]}
     >
       {/* Flowing colour sweep. */}
-      <MovingSweep width={width} height={height} />
+      <MovingSweep width={width} height={height} stops={palette.sweep} />
 
       {/* Wandering colour blobs for an aurora-like motion. */}
       <FloatingBlob
         id="blobA"
-        color="#9B72CB"
+        color={palette.blobs[0]}
         size={blob}
         left={-blob * 0.2}
         top={-blob * 0.25}
@@ -199,7 +220,7 @@ export function GradientWave({ height, style }: Props) {
       />
       <FloatingBlob
         id="blobB"
-        color="#1BA1E3"
+        color={palette.blobs[1]}
         size={blob * 0.9}
         left={width - blob * 0.6}
         top={-blob * 0.18}
@@ -209,7 +230,7 @@ export function GradientWave({ height, style }: Props) {
       />
       <FloatingBlob
         id="blobC"
-        color="#F49C46"
+        color={palette.blobs[2]}
         size={blob * 0.8}
         left={width * 0.25}
         top={height * 0.1}

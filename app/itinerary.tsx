@@ -36,6 +36,7 @@ import type { ThemeColors } from '@/theme/colors';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
+import { useProfileStore } from '@/store/useProfileStore';
 import { HomePicker } from '@/components/HomePicker';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { Card } from '@/components/Card';
@@ -428,6 +429,14 @@ export default function ItineraryScreen() {
 
   const home = useHomeStore((s) => s.home);
   const endOfDay = useHomeStore((s) => selectEndOfDay(s));
+  // Profile-derived personalisation woven into every planner call below.
+  const userName = useProfileStore((s) => s.fullName);
+  const profileWakeTime = useProfileStore((s) => s.wakeTime);
+  const profileBedTime = useProfileStore((s) => s.bedTime);
+  const hasCar = useProfileStore((s) => s.hasCar);
+  const dietary = useProfileStore((s) => s.dietary);
+  const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
+  const useCarToday = usePlanSetupStore((s) => s.useCarToday);
   const saveItinerary = useSavedItineraries((s) => s.save);
   const updateSavedItinerary = useSavedItineraries((s) => s.update);
 
@@ -575,8 +584,28 @@ export default function ItineraryScreen() {
   // (auto-refresh, log dumper) only re-fire when the underlying pins actually
   // change, not on every parent re-render.
   const context = useMemo<SchedulerContext>(
-    () => ({ home, endOfDay }),
-    [home, endOfDay],
+    () => ({
+      home,
+      endOfDay,
+      userName,
+      wakeTime: profileWakeTime,
+      bedTime: profileBedTime,
+      hasCar,
+      useCarToday,
+      dietary,
+      dietaryNotes,
+    }),
+    [
+      home,
+      endOfDay,
+      userName,
+      profileWakeTime,
+      profileBedTime,
+      hasCar,
+      useCarToday,
+      dietary,
+      dietaryNotes,
+    ],
   );
 
   // Saved trips planned BEFORE real routing existed (everything in the body

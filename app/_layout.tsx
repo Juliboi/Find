@@ -128,8 +128,6 @@ export default function RootLayout() {
               options={{ animation: 'none', gestureEnabled: false }}
             />
             <Stack.Screen name="index" />
-            <Stack.Screen name="plans" />
-            <Stack.Screen name="places" />
             <Stack.Screen name="settings" />
             <Stack.Screen
               name="add"
@@ -139,7 +137,6 @@ export default function RootLayout() {
                 contentStyle: { backgroundColor: colors.background },
               }}
             />
-            <Stack.Screen name="test" />
             <Stack.Screen name="itinerary" />
           </Stack>
           {!settled ? <Splash /> : null}

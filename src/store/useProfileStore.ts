@@ -16,8 +16,12 @@ interface ProfileState {
   wakeTime: string | null;
   /** "HH:MM" 24h — when the user wants to be done for the day. */
   bedTime: string | null;
-  /** Whether the user has a car (drives default travel mode later). */
+  /** Whether the user owns/has access to a car (availability, not "always"). */
   hasCar: boolean;
+  /** Canonical dietary tags chosen during onboarding. */
+  dietary: string[];
+  /** Freeform dietary notes / allergies. */
+  dietaryNotes: string | null;
   /** Mirror of profiles.onboarding_completed for snappy launch gating. */
   onboardingComplete: boolean;
 
@@ -30,6 +34,8 @@ const EMPTY = {
   wakeTime: null,
   bedTime: null,
   hasCar: false,
+  dietary: [] as string[],
+  dietaryNotes: null,
   onboardingComplete: false,
 } as const;
 
@@ -48,6 +54,8 @@ export const useProfileStore = create<ProfileState>()(
         wakeTime: s.wakeTime,
         bedTime: s.bedTime,
         hasCar: s.hasCar,
+        dietary: s.dietary,
+        dietaryNotes: s.dietaryNotes,
         onboardingComplete: s.onboardingComplete,
       }),
     },

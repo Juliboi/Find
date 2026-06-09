@@ -19,11 +19,19 @@ interface PlanSetupState {
   startTime: string;
   /** Configurable default start-of-day, used to seed non-today days. */
   dayStartTime: string;
+  /**
+   * Whether the user's car is available for THIS day's plan. Only meaningful
+   * when the profile says they have a car. Defaults to true so the planner may
+   * use it when helpful; the user can switch it off per day (e.g. a night out).
+   */
+  useCarToday: boolean;
 
   /** Persist a confirmed day + start time from the planner setup drawer. */
   setSelection: (date: string, startTime: string) => void;
   /** Update the default day-start time (used for future days). */
   setDayStartTime: (hhmm: string) => void;
+  /** Toggle whether the car is in play for the day being planned. */
+  setUseCarToday: (useCar: boolean) => void;
 }
 
 /**
@@ -38,8 +46,10 @@ export const usePlanSetupStore = create<PlanSetupState>()(
       date: todayISO(),
       startTime: roundedNowHHMM(),
       dayStartTime: DEFAULT_DAY_START_TIME,
+      useCarToday: true,
       setSelection: (date, startTime) => set({ date, startTime }),
       setDayStartTime: (dayStartTime) => set({ dayStartTime }),
+      setUseCarToday: (useCarToday) => set({ useCarToday }),
     }),
     {
       name: 'dayflow.plan-setup.v1',

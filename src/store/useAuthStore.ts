@@ -53,6 +53,8 @@ function applyProfileToStores(row: ProfileRow) {
     wakeTime: wake,
     bedTime: bed,
     hasCar: row.has_car,
+    dietary: row.dietary ?? [],
+    dietaryNotes: row.dietary_notes ?? null,
     onboardingComplete: row.onboarding_completed,
   });
   if (row.home_label && row.home_latitude != null && row.home_longitude != null) {
@@ -234,6 +236,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       wake_time: input.wakeTime,
       bed_time: input.bedTime,
       has_car: input.hasCar,
+      dietary: input.dietary,
+      dietary_notes: input.dietaryNotes,
       onboarding_completed: true,
     };
     const { data, error } = await supabase

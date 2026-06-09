@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Platform, Pressable, StyleSheet, View } from 'react-native';
+import { Platform, Pressable, StyleSheet, Switch, View } from 'react-native';
 import DateTimePicker, {
   type DateTimePickerEvent,
 } from '@react-native-community/datetimepicker';
@@ -7,12 +7,13 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
-import { BottomSheet } from './BottomSheet';
+import { Sheet } from './Sheet';
 import { WheelPicker, type WheelOption } from './WheelPicker';
 import { Text } from './Text';
 import { Button } from './Button';
 import { upcomingWeek, roundedNowHHMM } from '@/utils/days';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
+import { useProfileStore } from '@/store/useProfileStore';
 import { formatTime, minutesOfDay } from '@/utils/time';
 
 interface Props {
@@ -60,6 +61,9 @@ export function PlanSetupSheet({
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const dayStartTime = usePlanSetupStore((s) => s.dayStartTime);
+  const hasCar = useProfileStore((s) => s.hasCar);
+  const useCarToday = usePlanSetupStore((s) => s.useCarToday);
+  const setUseCarToday = usePlanSetupStore((s) => s.setUseCarToday);
 
   // The week is held in state and refreshed each time the sheet opens, so
   // "today" stays correct across a midnight rollover while the app sits
@@ -118,7 +122,12 @@ export function PlanSetupSheet({
   };
 
   return (
-    <BottomSheet visible={open} onClose={onClose} fullScreen hideDefaultHeader>
+    <Sheet
+      open={open}
+      onClose={onClose}
+      heightFraction={0.975}
+      enableContentPanningGesture={false}
+    >
       <View style={[styles.container, { paddingBottom: insets.bottom + 4 }]}>
         <View style={styles.header}>
           <View style={{ flex: 1 }}>
@@ -194,6 +203,36 @@ export function PlanSetupSheet({
           />
         ) : null}
 
+        {hasCar ? (
+          <View style={[styles.carRow, { borderTopColor: t.colors.separator }]}>
+            <View style={styles.carLabel}>
+              <Ionicons
+                name={useCarToday ? 'car-sport' : 'walk'}
+                size={18}
+                color={t.colors.textSecondary}
+              />
+              <View style={{ flex: 1 }}>
+                <Text variant="body" weight="semibold">
+                  Use my car today
+                </Text>
+                <Text variant="caption" tone="tertiary">
+                  {useCarToday
+                    ? 'Driven only when it helps — park back home anytime'
+                    : 'Walking & transit only for this day'}
+                </Text>
+              </View>
+            </View>
+            <Switch
+              value={useCarToday}
+              onValueChange={(v) => {
+                Haptics.selectionAsync().catch(() => undefined);
+                setUseCarToday(v);
+              }}
+              trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
+            />
+          </View>
+        ) : null}
+
         <View style={styles.footer}>
           <Text variant="caption" tone="secondary" style={styles.summary}>
             {selected
@@ -203,13 +242,15 @@ export function PlanSetupSheet({
           <Button title="Confirm" onPress={confirm} fullWidth size="lg" />
         </View>
       </View>
-    </BottomSheet>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 4,
   },
   header: {
     flexDirection: 'row',
@@ -249,6 +290,20 @@ const styles = StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
   },
   timeLabel: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  carRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    paddingVertical: 14,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  carLabel: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,

@@ -70,6 +70,20 @@ function buildContextPayload(
       longitude: ctx.endOfDay.longitude,
     };
   }
+  if (ctx.userName && ctx.userName.trim()) out.userName = ctx.userName.trim();
+  if (ctx.wakeTime) out.wakeTime = ctx.wakeTime;
+  if (ctx.bedTime) out.bedTime = ctx.bedTime;
+  // Always describe car availability so the planner knows whether it may emit
+  // any "drive" legs. `owns` gates the car entirely; `useToday` is the per-day
+  // switch (off ⇒ plan as if car-free for, e.g., a night out).
+  out.car = {
+    owns: ctx.hasCar === true,
+    useToday: ctx.hasCar === true && ctx.useCarToday !== false,
+  };
+  if (ctx.dietary && ctx.dietary.length > 0) out.dietary = ctx.dietary;
+  if (ctx.dietaryNotes && ctx.dietaryNotes.trim()) {
+    out.dietaryNotes = ctx.dietaryNotes.trim();
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

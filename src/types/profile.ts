@@ -13,6 +13,10 @@ export interface ProfileRow {
   wake_time: string | null;
   bed_time: string | null;
   has_car: boolean;
+  /** Canonical dietary tags (e.g. "vegetarian", "gluten-free"). */
+  dietary: string[] | null;
+  /** Freeform dietary notes / allergies the chips don't cover. */
+  dietary_notes: string | null;
   onboarding_completed: boolean;
   created_at: string;
   updated_at: string;
@@ -29,6 +33,10 @@ export interface OnboardingInput {
   /** "HH:MM" 24h. */
   bedTime: string;
   hasCar: boolean;
+  /** Canonical dietary tags chosen from the onboarding chip set. */
+  dietary: string[];
+  /** Freeform dietary notes / allergies, or null when left blank. */
+  dietaryNotes: string | null;
 }
 
 /** Trim a Postgres "HH:MM:SS" time to the app's "HH:MM". */

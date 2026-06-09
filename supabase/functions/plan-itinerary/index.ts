@@ -223,8 +223,25 @@ interface HomePin {
   longitude: number;
 }
 
+interface CarContext {
+  /** Whether the user owns/has a car at all. */
+  owns: boolean;
+  /** Whether the car is in play for this specific day. */
+  useToday: boolean;
+}
+
 interface Context {
   home?: HomePin;
+  userName?: string;
+  /** "HH:MM" the user usually wakes. */
+  wakeTime?: string;
+  /** "HH:MM" the user usually winds down. */
+  bedTime?: string;
+  car?: CarContext;
+  /** Canonical dietary tags (vegetarian, gluten-free, …). */
+  dietary?: string[];
+  /** Freeform dietary notes / allergies. */
+  dietaryNotes?: string;
 }
 
 // ----------------------------------------------------------- HTTP helpers
@@ -330,11 +347,40 @@ function normalizeHome(input: any): HomePin | undefined {
   };
 }
 
+function isHHMM(v: unknown): v is string {
+  return typeof v === 'string' && /^\d{1,2}:\d{2}$/.test(v);
+}
+
 function normalizeContext(input: any): Context {
   const ctx: Context = {};
   if (!input || typeof input !== 'object') return ctx;
   const home = normalizeHome(input.home);
   if (home) ctx.home = home;
+
+  if (typeof input.userName === 'string' && input.userName.trim()) {
+    ctx.userName = input.userName.trim().slice(0, 80);
+  }
+  if (isHHMM(input.wakeTime)) ctx.wakeTime = input.wakeTime;
+  if (isHHMM(input.bedTime)) ctx.bedTime = input.bedTime;
+
+  if (input.car && typeof input.car === 'object') {
+    const owns = input.car.owns === true;
+    ctx.car = { owns, useToday: owns && input.car.useToday !== false };
+  }
+
+  if (Array.isArray(input.dietary)) {
+    const tags = input.dietary
+      .filter(
+        (d: unknown): d is string =>
+          typeof d === 'string' && d.trim().length > 0,
+      )
+      .map((d: string) => d.trim().slice(0, 40))
+      .slice(0, 12);
+    if (tags.length) ctx.dietary = tags;
+  }
+  if (typeof input.dietaryNotes === 'string' && input.dietaryNotes.trim()) {
+    ctx.dietaryNotes = input.dietaryNotes.trim().slice(0, 300);
+  }
   return ctx;
 }
 
@@ -345,12 +391,49 @@ function buildPlannerPrompt(args: {
   home: HomePin | null;
   date: string;
   grounded: boolean;
+  userName?: string;
+  wakeTime?: string;
+  bedTime?: string;
+  car?: CarContext;
+  dietary?: string[];
+  dietaryNotes?: string;
 }): string {
   const home = args.home;
   const homeBlock = home
     ? `- Home: "${home.label}" at latitude ${home.latitude}, longitude ${home.longitude}.`
     : '- The user has not pinned a home location. Keep venue picks generic and assume the day happens close to wherever they start.';
   const originDefault = home?.label ?? 'home';
+
+  // ----- Personalisation context lines (only what we actually know) -----
+  const nameLine = args.userName
+    ? `- The user's name is ${args.userName}. You may address them warmly by name in the title/summary, but never force it.`
+    : '';
+  const rhythmLine =
+    args.wakeTime || args.bedTime
+      ? `- Daily rhythm: the user usually ${
+          args.wakeTime ? `wakes around ${args.wakeTime}` : 'wakes in the morning'
+        } and ${
+          args.bedTime ? `winds down around ${args.bedTime}` : 'ends in the evening'
+        }. Keep the plan inside these hours and end with a wind-down/bed anchor near ${
+          args.bedTime ?? 'their usual bedtime'
+        }.`
+      : '';
+  const dietLine =
+    args.dietary && args.dietary.length > 0
+      ? `- Dietary profile: ${args.dietary.join(', ')}.${
+          args.dietaryNotes ? ` Notes/allergies: ${args.dietaryNotes}.` : ''
+        }`
+      : args.dietaryNotes
+        ? `- Dietary notes/allergies: ${args.dietaryNotes}.`
+        : '';
+
+  // ----- Transport / car context line (the per-day, "only if needed" logic) -----
+  const car = args.car;
+  const carLine = !car || !car.owns
+    ? '- Transport: the user has NO car available. Move them on foot, by bike, or public transit (a taxi/rideshare only when nothing else is reasonable). Never emit a "drive" leg for their own travel.'
+    : !car.useToday
+      ? '- Transport: the user HAS a car but is NOT using it today. Plan as if car-free — walking, transit, or taxi only. Do NOT emit any "drive" legs.'
+      : '- Transport: the user has a car AVAILABLE today, but do NOT overuse it (see the transport rule). It may be used for only part of the day and parked back home before a night out.';
   // Venue-sourcing instruction differs by mode: grounded mode has live Google
   // Search; schema mode relies on the model's own knowledge + a downstream
   // Google Places validation pass, so we ask for approximate coords.
@@ -367,11 +450,31 @@ function buildPlannerPrompt(args: {
     ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
     : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
 
+  const contextLines = [
+    homeBlock,
+    `- Today is ${args.date}.`,
+    nameLine,
+    rhythmLine,
+    carLine,
+    dietLine,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const transportRule =
+    car && car.owns && car.useToday
+      ? '\n11. TRANSPORT — "mode": "drive" means the user\'s OWN car, and it is available today. Use it ONLY when it genuinely helps (longer or awkward hops, carrying things, real time saved); keep short, easy hops on foot or transit. The car is a physical object: once driven somewhere it stays there until driven again, and it does NOT have to be used all day. It is perfectly fine to drive for only a few stops, return home to PARK it, then continue the rest of the day on foot/transit. CRUCIAL: never have the user drive after drinking alcohol — if the day includes drinks/bars/a night out, route them to drop the car at home (or leave it home) BEFORE the drinking starts, then continue by walking, transit, or taxi. Model "park the car at home" as a "drive" leg back home followed by an onward walk/transit leg.'
+      : '\n11. TRANSPORT — the user has no car in play today. Never emit a "mode": "drive" leg for their own travel; move them on foot, by bike, or by public transit (a taxi only when truly necessary). Plan the whole day so it works without a private car.';
+
+  const dietaryRule =
+    (args.dietary && args.dietary.length > 0) || args.dietaryNotes
+      ? '\n12. DIETARY — honour the user\'s dietary profile for EVERY food or drink venue YOU choose: pick places that genuinely serve suitable options (e.g. for vegan, somewhere with real vegan dishes, not just a token side salad), and never centre a meal on a listed allergen. This does NOT override a venue the USER named themselves — keep those verbatim even if the fit is imperfect.'
+      : '';
+
   return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
 
 CONTEXT
-${homeBlock}
-- Today is ${args.date}.
+${contextLines}
 
 USER REQUEST (their own words, between triple quotes):
 """
@@ -388,7 +491,7 @@ ${venueRule}
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
 9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
-10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.
+10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.${transportRule}${dietaryRule}
 
 Output ONLY a single JSON object, no prose, no markdown fences. Match this schema. OMIT optional fields you don't have rather than inventing. Use null for unknown ratings; do not make up transit line numbers.
 
@@ -1252,6 +1355,12 @@ Deno.serve(async (req: Request) => {
     home: context.home ?? null,
     date,
     grounded: GROUNDING_ENABLED,
+    userName: context.userName,
+    wakeTime: context.wakeTime,
+    bedTime: context.bedTime,
+    car: context.car,
+    dietary: context.dietary,
+    dietaryNotes: context.dietaryNotes,
   });
   let gem = await callGeminiPlanner({
     prompt,

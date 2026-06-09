@@ -20,6 +20,12 @@ interface Props {
    * for sheets that own a scroll view. Omit it to let the sheet hug its content.
    */
   heightFraction?: number;
+  /**
+   * Allow dragging the sheet *body* to dismiss. Defaults to `true`. Set `false`
+   * for sheets whose content owns the vertical gesture (e.g. a scroll wheel) so
+   * dragging the content doesn't fight the sheet — the handle still dismisses.
+   */
+  enableContentPanningGesture?: boolean;
   children?: React.ReactNode;
 }
 
@@ -33,7 +39,13 @@ interface Props {
  * sized sheets, or a flex `View` + `BottomSheetScrollView` when `heightFraction`
  * is set.
  */
-export function Sheet({ open, onClose, heightFraction, children }: Props) {
+export function Sheet({
+  open,
+  onClose,
+  heightFraction,
+  enableContentPanningGesture = true,
+  children,
+}: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const ref = useRef<BottomSheetModal>(null);
@@ -101,6 +113,7 @@ export function Sheet({ open, onClose, heightFraction, children }: Props) {
       onDismiss={handleDismiss}
       enablePanDownToClose
       enableDynamicSizing={!heightFraction}
+      enableContentPanningGesture={enableContentPanningGesture}
       snapPoints={snapPoints}
       topInset={insets.top}
       backdropComponent={renderBackdrop}

@@ -1,16 +1,16 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
-  Alert,
+  ActivityIndicator,
   Image,
   Pressable,
-  RefreshControl,
-  ScrollView,
   StyleSheet,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { StatusBar } from 'expo-status-bar';
 import * as Haptics from 'expo-haptics';
 import { useDayStore } from '@/store/useDayStore';
 import {
@@ -19,38 +19,32 @@ import {
 } from '@/store/useSavedItineraries';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
 import { useTheme } from '@/theme/useTheme';
-import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
-import { TopBar } from '@/components/TopBar';
-import { SectionHeader } from '@/components/SectionHeader';
-import { Chip } from '@/components/Chip';
-import { Button } from '@/components/Button';
-import { ComposerStatus } from '@/components/ComposerStatus';
-import { EmptyState } from '@/components/EmptyState';
-import { FloatingTabBar } from '@/components/FloatingTabBar';
-import { TripActionsSheet } from '@/components/TripActionsSheet';
+import { GlassSurface } from '@/components/Glass';
+import { GradientWave } from '@/components/GradientWave';
+import { ChatComposerBar } from '@/components/ChatComposerBar';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
-import { PRIMARY_TABS } from '@/components/nav/tabs';
 import { formatTime, formatDuration } from '@/utils/time';
+import {
+  DAYTIME_PALETTES,
+  getDayPart,
+  getDayPartLabel,
+  getGreeting,
+} from '@/utils/daytime';
 
-function formatDateLong(iso: string): string {
+// Text that sits on top of the saturated part of the gradient — kept light in
+// both themes since the colour field underneath is vivid regardless of mode.
+const ON = '#FFFFFF';
+const ON_SOFT = 'rgba(255, 255, 255, 0.82)';
+const ON_DIM = 'rgba(255, 255, 255, 0.64)';
+
+function formatLongDate(iso: string): string {
   const d = new Date(`${iso}T00:00:00`);
   return d.toLocaleDateString(undefined, {
     weekday: 'long',
     month: 'long',
     day: 'numeric',
   });
-}
-
-function formatKicker(iso: string): string {
-  const d = new Date(`${iso}T00:00:00`);
-  return d
-    .toLocaleDateString(undefined, {
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
-    })
-    .toUpperCase();
 }
 
 function tripSubtitle(trip: SavedItinerary): string {
@@ -63,519 +57,349 @@ function tripSubtitle(trip: SavedItinerary): string {
   return parts.join(' · ');
 }
 
-function highlightForIndex(idx: number, c: ReturnType<typeof useTheme>['colors']) {
-  const palette = [
-    c.highlightBlue,
-    c.highlightPurple,
-    c.highlightYellow,
-    c.highlightRed,
-    c.success,
-  ];
-  return palette[idx % palette.length];
-}
-
 export default function HomeScreen() {
   const router = useRouter();
   const t = useTheme();
+  const insets = useSafeAreaInsets();
+  const { height } = useWindowDimensions();
 
-  const savedTrips = useSavedItineraries((s) => s.items);
-  const duplicateTrip = useSavedItineraries((s) => s.duplicate);
-  const removeTrip = useSavedItineraries((s) => s.remove);
+  // The part of the day drives the gradient + greeting. Re-evaluate on a slow
+  // tick so the colour field flows from, say, sunset into night if the screen
+  // is left open across a boundary — but only re-render when it actually moves.
+  const [dayPart, setDayPart] = useState(() => getDayPart());
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDayPart((prev) => {
+        const next = getDayPart();
+        return next === prev ? prev : next;
+      });
+    }, 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
-  // The trip the user long-pressed — opens the actions sheet (open / duplicate
-  // / delete). Stored as an id (not the trip object) so the sheet stays in
-  // sync if the underlying list mutates while it's open.
-  const [actionsTripId, setActionsTripId] = useState<string | null>(null);
-  const actionsTrip =
-    actionsTripId != null
-      ? savedTrips.find((t) => t.id === actionsTripId) ?? null
-      : null;
-
-  // The day-picker drawer the "+" FAB opens. Confirming it stores the chosen
-  // day + start time and drops the user into the v2 itinerary planner.
-  const [setupOpen, setSetupOpen] = useState(false);
-  const setPlanSelection = usePlanSetupStore((s) => s.setSelection);
+  const palette = DAYTIME_PALETTES[dayPart];
+  const greeting = getGreeting(dayPart);
+  const label = getDayPartLabel(dayPart);
 
   const date = useDayStore((s) => s.date);
   const plans = useDayStore((s) => s.plans);
-  const summary = useDayStore((s) => s.summary);
   const isScheduling = useDayStore((s) => s.isScheduling);
   const isComposing = useDayStore((s) => s.isComposing);
-  const usedAi = useDayStore((s) => s.usedAi);
-  const reorderAndReschedule = useDayStore((s) => s.reorderAndReschedule);
-  const dismissComposeSummary = useDayStore((s) => s.dismissComposeSummary);
-  // While the AI pipeline runs we want the empty-state to *not* show —
-  // it'd flash up between submission and the first plan landing. Treat
-  // "we're working on it" as already having content.
   const isWorking = isScheduling || isComposing;
 
-  const isEmpty = plans.length === 0 && !isWorking;
-  const upNext = plans.slice(0, 3);
-  const remaining = Math.max(0, plans.length - upNext.length);
+  const savedTrips = useSavedItineraries((s) => s.items);
+  const latestTrip = useMemo(
+    () =>
+      savedTrips.length > 0
+        ? [...savedTrips].sort((a, b) => b.createdAt - a.createdAt)[0]
+        : undefined,
+    [savedTrips],
+  );
 
-  const totalMinutes = plans.reduce((sum, p) => sum + p.durationMinutes, 0);
-
-  const goAdd = () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-    router.push('/add');
-  };
-
-  // The primary "+" action now leads into the v2 planner: open the day picker
-  // first, then carry the chosen day + start time into the itinerary screen.
+  const [setupOpen, setSetupOpen] = useState(false);
+  const setPlanSelection = usePlanSetupStore((s) => s.setSelection);
   const openSetup = () => setSetupOpen(true);
-  const onSetupConfirm = (date: string, startTime: string) => {
-    setPlanSelection(date, startTime);
+  const onSetupConfirm = (d: string, startTime: string) => {
+    setPlanSelection(d, startTime);
     setSetupOpen(false);
     router.push('/itinerary');
   };
 
-  return (
-    <SafeAreaView
-      style={[styles.container, { backgroundColor: t.colors.background }]}
-      edges={['top']}
-    >
-      <TopBar
-        actions={[
-          {
-            icon: 'notifications-outline',
-            accessibilityLabel: 'Notifications',
-          },
-          {
-            icon: 'ellipsis-horizontal',
-            onPress: () => router.push('/settings'),
-            accessibilityLabel: 'More',
-          },
-        ]}
-        compact
-      />
+  const gradientHeight = Math.round(height * 0.6);
 
-      <ScrollView
-        contentContainerStyle={[
-          styles.scrollContent,
-          {
-            paddingHorizontal: t.spacing.lg,
-            paddingBottom: 140,
-          },
-          isEmpty && { flexGrow: 1, justifyContent: 'space-between' },
-        ]}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl
-            refreshing={isScheduling}
-            onRefresh={reorderAndReschedule}
-            tintColor={t.colors.accent}
-          />
-        }
-      >
-        <View style={styles.heroBlock}>
-          <Text variant="caption" tone="secondary" uppercase weight="semibold">
-            {formatKicker(date)}
+  const next = plans[0];
+  const moreCount = Math.max(0, plans.length - 1);
+
+  // Build the single adaptive card: planning → up-next → recent trip → prompt.
+  let cardOnPress: (() => void) | undefined;
+  let cardA11y: string | undefined;
+  let cardBody: React.ReactNode;
+
+  if (isWorking) {
+    cardBody = (
+      <>
+        <ActivityIndicator color={t.colors.accent} />
+        <View style={styles.cardText}>
+          <Text variant="micro" uppercase weight="bold" tone="secondary">
+            Planning
           </Text>
-          <View style={styles.titleRow}>
-            <Text variant="title1" tight>
-              Your day
+          <Text variant="body" weight="semibold">
+            Building your schedule…
+          </Text>
+        </View>
+      </>
+    );
+  } else if (next) {
+    cardOnPress = () => {
+      Haptics.selectionAsync().catch(() => undefined);
+      router.push('/itinerary');
+    };
+    cardA11y = "Open today's plan";
+    cardBody = (
+      <>
+        <View style={[styles.dot, { backgroundColor: t.colors.accent }]} />
+        <View style={styles.cardText}>
+          <Text variant="micro" uppercase weight="bold" tone="accent">
+            Up next
+          </Text>
+          <Text variant="body" weight="semibold" numberOfLines={1}>
+            {next.title || next.rawText}
+          </Text>
+          <Text variant="caption" tone="secondary" numberOfLines={1}>
+            {[
+              next.startTime ? formatTime(next.startTime) : null,
+              formatDuration(next.durationMinutes),
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </Text>
+        </View>
+        {moreCount > 0 ? (
+          <View style={[styles.morePill, { backgroundColor: t.colors.fill1 }]}>
+            <Text variant="caption" weight="semibold" tone="secondary">
+              +{moreCount}
             </Text>
-            {plans.length > 0 ? (
-              <View
-                style={[
-                  styles.badge,
-                  {
-                    backgroundColor: usedAi
-                      ? t.colors.accentSoft
-                      : t.colors.fill1,
-                  },
-                ]}
-              >
-                <Text
-                  variant="micro"
-                  weight="bold"
-                  uppercase
-                  tone={usedAi ? 'accent' : 'secondary'}
-                >
-                  {usedAi ? 'AI' : 'Offline'}
-                </Text>
-              </View>
-            ) : null}
           </View>
+        ) : null}
+        <Ionicons
+          name="chevron-forward"
+          size={18}
+          color={t.colors.textTertiary}
+        />
+      </>
+    );
+  } else if (latestTrip) {
+    cardOnPress = () => {
+      Haptics.selectionAsync().catch(() => undefined);
+      router.push({ pathname: '/itinerary', params: { id: latestTrip.id } });
+    };
+    cardA11y = `Open ${latestTrip.title}`;
+    cardBody = (
+      <>
+        <View style={[styles.thumb, { backgroundColor: t.colors.fill1 }]}>
+          {latestTrip.thumbUrl ? (
+            <Image source={{ uri: latestTrip.thumbUrl }} style={styles.thumbImg} />
+          ) : (
+            <Ionicons
+              name="map-outline"
+              size={20}
+              color={t.colors.textSecondary}
+            />
+          )}
+        </View>
+        <View style={styles.cardText}>
+          <Text variant="micro" uppercase weight="bold" tone="secondary">
+            Pick up where you left off
+          </Text>
+          <Text variant="body" weight="semibold" numberOfLines={1}>
+            {latestTrip.title}
+          </Text>
+          <Text variant="caption" tone="secondary" numberOfLines={1}>
+            {tripSubtitle(latestTrip)}
+          </Text>
+        </View>
+        <Ionicons
+          name="chevron-forward"
+          size={18}
+          color={t.colors.textTertiary}
+        />
+      </>
+    );
+  } else {
+    cardOnPress = () => {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(
+        () => undefined,
+      );
+      openSetup();
+    };
+    cardA11y = 'Plan your day';
+    cardBody = (
+      <>
+        <View style={[styles.iconCircle, { backgroundColor: t.colors.accentSoft }]}>
+          <Ionicons name="sparkles" size={20} color={t.colors.accentText} />
+        </View>
+        <View style={styles.cardText}>
+          <Text variant="micro" uppercase weight="bold" tone="accent">
+            Start
+          </Text>
+          <Text variant="body" weight="semibold">
+            Plan your day
+          </Text>
+          <Text variant="caption" tone="secondary" numberOfLines={2}>
+            Tell me what&apos;s on and I&apos;ll build your schedule.
+          </Text>
+        </View>
+        <Ionicons name="add" size={20} color={t.colors.textTertiary} />
+      </>
+    );
+  }
+
+  return (
+    <View style={[styles.container, { backgroundColor: t.colors.background }]}>
+      <StatusBar style="light" />
+      <GradientWave height={gradientHeight} palette={palette} />
+
+      <SafeAreaView style={styles.safe} edges={['top']}>
+        <View style={[styles.header, { paddingHorizontal: t.spacing.lg }]}>
+          <Text variant="title3" weight="bold" tight style={{ color: ON }}>
+            Your day
+          </Text>
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              router.push('/settings');
+            }}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Settings"
+            style={({ pressed }) => [styles.gear, pressed && { opacity: 0.6 }]}
+          >
+            <Ionicons name="settings-outline" size={19} color={ON} />
+          </Pressable>
         </View>
 
-        {savedTrips.length > 0 ? (
-          <View style={{ gap: t.spacing.sm }}>
-            <SectionHeader title="Day trips" showChevron={false} />
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.tripsRow}
+        <View
+          style={[
+            styles.content,
+            {
+              paddingHorizontal: t.spacing.lg,
+              paddingBottom: insets.bottom + 96,
+            },
+          ]}
+        >
+          <View style={styles.hero}>
+            <Text
+              variant="caption"
+              uppercase
+              weight="bold"
+              style={{ color: ON_DIM, letterSpacing: 1.4 }}
             >
-              {savedTrips.map((trip) => (
-                <Pressable
-                  key={trip.id}
-                  onPress={() => {
-                    Haptics.selectionAsync().catch(() => undefined);
-                    router.push({ pathname: '/itinerary', params: { id: trip.id } });
-                  }}
-                  onLongPress={() => {
-                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
-                      () => undefined,
-                    );
-                    setActionsTripId(trip.id);
-                  }}
-                  delayLongPress={350}
-                  style={({ pressed }) => [
-                    styles.tripCard,
-                    {
-                      backgroundColor: t.colors.surface2,
-                      borderColor: t.colors.separator,
-                    },
-                    pressed && { opacity: 0.85 },
-                  ]}
-                >
-                  <View
-                    style={[styles.tripThumb, { backgroundColor: t.colors.fill1 }]}
-                  >
-                    {trip.thumbUrl ? (
-                      <Image
-                        source={{ uri: trip.thumbUrl }}
-                        style={styles.tripThumbImg}
-                      />
-                    ) : (
-                      <Ionicons
-                        name="map-outline"
-                        size={22}
-                        color={t.colors.textSecondary}
-                      />
-                    )}
-                  </View>
-                  <View style={styles.tripMeta}>
-                    <Text variant="bodySm" weight="semibold" numberOfLines={1}>
-                      {trip.title}
-                    </Text>
-                    <Text variant="caption" tone="secondary" numberOfLines={1}>
-                      {tripSubtitle(trip)}
-                    </Text>
-                  </View>
-                </Pressable>
-              ))}
-              <Pressable
-                onPress={() => {
-                  Haptics.selectionAsync().catch(() => undefined);
-                  router.push('/itinerary');
-                }}
-                style={({ pressed }) => [
-                  styles.tripNewCard,
-                  { borderColor: t.colors.separator },
-                  pressed && { opacity: 0.7 },
-                ]}
-              >
-                <Ionicons name="add" size={24} color={t.colors.accent} />
-                <Text variant="caption" weight="semibold" tone="accent">
-                  New plan
-                </Text>
-              </Pressable>
-            </ScrollView>
+              {label}
+            </Text>
+            <Text
+              variant="title1"
+              weight="heavy"
+              tight
+              style={[styles.greeting, { color: ON }]}
+            >
+              {greeting}
+            </Text>
+            <Text variant="body" style={{ color: ON_SOFT }}>
+              {formatLongDate(date)}
+            </Text>
           </View>
-        ) : null}
 
-        {isEmpty ? (
-          <EmptyState
-            icon="sparkles-outline"
-            title="Get started with Diem"
-            body="Add plans, errands, or focus blocks with the action bar. Diem will order them, estimate timings, and ask follow-ups when needed."
-            pointToFab
-          />
-        ) : (
-          <View style={[styles.stack, { gap: t.spacing.xl }]}>
-            <ComposerStatus onDismissSummary={dismissComposeSummary} />
-            {summary ? (
-              <Card padded>
-                <Text variant="caption" tone="secondary" uppercase weight="semibold">
-                  Summary
-                </Text>
-                <Text variant="body" style={{ marginTop: 6 }}>
-                  {summary}
-                </Text>
-              </Card>
-            ) : null}
+          <Pressable
+            disabled={!cardOnPress}
+            onPress={cardOnPress}
+            accessibilityRole={cardOnPress ? 'button' : undefined}
+            accessibilityLabel={cardA11y}
+            style={({ pressed }) =>
+              pressed && cardOnPress
+                ? { opacity: 0.9, transform: [{ scale: 0.99 }] }
+                : undefined
+            }
+          >
+            <GlassSurface
+              variant="regular"
+              radius={t.radii.xl}
+              style={[styles.card, { shadowColor: t.colors.shadow }]}
+              innerStyle={styles.cardInner}
+            >
+              {cardBody}
+            </GlassSurface>
+          </Pressable>
+        </View>
+      </SafeAreaView>
 
-            <View style={{ gap: t.spacing.sm }}>
-              <SectionHeader title="Up next" onPress={() => router.push('/plans')} />
-              <Card padded>
-                {upNext.map((plan, idx) => (
-                  <View
-                    key={plan.id}
-                    style={[
-                      styles.planRow,
-                      idx > 0 && {
-                        borderTopWidth: StyleSheet.hairlineWidth,
-                        borderTopColor: t.colors.separator,
-                      },
-                    ]}
-                  >
-                    <View
-                      style={[
-                        styles.planBar,
-                        { backgroundColor: highlightForIndex(idx, t.colors) },
-                      ]}
-                    />
-                    <View style={{ flex: 1, gap: 2 }}>
-                      <Text variant="body" weight="semibold" numberOfLines={1}>
-                        {plan.title || plan.rawText}
-                      </Text>
-                      <Text variant="caption" tone="secondary" numberOfLines={1}>
-                        {formatDuration(plan.durationMinutes)}
-                        {plan.location ? ` · ${plan.location}` : ''}
-                      </Text>
-                    </View>
-                    <Text
-                      variant="caption"
-                      weight="semibold"
-                      tone="secondary"
-                    >
-                      {plan.startTime ? formatTime(plan.startTime) : '—'}
-                    </Text>
-                  </View>
-                ))}
-                {remaining > 0 ? (
-                  <View
-                    style={[
-                      styles.planRow,
-                      {
-                        borderTopWidth: StyleSheet.hairlineWidth,
-                        borderTopColor: t.colors.separator,
-                      },
-                    ]}
-                  >
-                    <View style={styles.planBar} />
-                    <Text variant="bodySm" tone="secondary" style={{ flex: 1 }}>
-                      +{remaining} more plan{remaining === 1 ? '' : 's'}
-                    </Text>
-                    <Ionicons
-                      name="chevron-forward"
-                      size={16}
-                      color={t.colors.textSecondary}
-                    />
-                  </View>
-                ) : null}
-              </Card>
-            </View>
-
-            <View style={{ gap: t.spacing.sm }}>
-              <SectionHeader title="At a glance" showChevron={false} />
-              <View style={styles.glanceRow}>
-                <Card padded style={styles.glanceCard}>
-                  <Ionicons
-                    name="time-outline"
-                    size={20}
-                    color={t.colors.textSecondary}
-                  />
-                  <Text
-                    variant="title2"
-                    tight
-                    weight="bold"
-                    style={{ marginTop: 4 }}
-                  >
-                    {formatDuration(totalMinutes)}
-                  </Text>
-                  <Text variant="caption" tone="secondary">
-                    Scheduled today
-                  </Text>
-                </Card>
-                <Card padded style={styles.glanceCard}>
-                  <Ionicons
-                    name="list-outline"
-                    size={20}
-                    color={t.colors.textSecondary}
-                  />
-                  <Text
-                    variant="title2"
-                    tight
-                    weight="bold"
-                    style={{ marginTop: 4 }}
-                  >
-                    {plans.length}
-                  </Text>
-                  <Text variant="caption" tone="secondary">
-                    {plans.length === 1 ? 'Plan' : 'Plans'}
-                  </Text>
-                </Card>
-              </View>
-            </View>
-
-            <View style={{ gap: t.spacing.sm }}>
-              <SectionHeader title="Quick actions" showChevron={false} />
-              <View style={styles.actionsRow}>
-                <Chip
-                  icon="add"
-                  label="Add plan"
-                  onPress={goAdd}
-                  large
-                />
-                <Chip
-                  icon="sync"
-                  label="Reschedule"
-                  onPress={reorderAndReschedule}
-                  large
-                />
-                <Chip
-                  icon="location-outline"
-                  label="Set home"
-                  onPress={() => router.push('/places')}
-                  large
-                />
-              </View>
-            </View>
-          </View>
-        )}
-
-        {isEmpty ? (
-          <View style={{ alignItems: 'center', paddingVertical: 12, gap: 2 }}>
-            <Button
-              title="Or open the sandbox"
-              variant="ghost"
-              size="sm"
-              onPress={() => router.push('/test')}
-            />
-            <Button
-              title="Try the day planner (v2)"
-              variant="ghost"
-              size="sm"
-              onPress={() => router.push('/itinerary')}
-            />
-          </View>
-        ) : null}
-      </ScrollView>
-
-      <FloatingTabBar tabs={PRIMARY_TABS} onFabPress={openSetup} />
+      <ChatComposerBar onPlus={openSetup} />
 
       <PlanSetupSheet
         open={setupOpen}
         onClose={() => setSetupOpen(false)}
         onConfirm={onSetupConfirm}
       />
-
-      <TripActionsSheet
-        trip={actionsTrip}
-        onClose={() => setActionsTripId(null)}
-        onOpen={() => {
-          if (!actionsTrip) return;
-          router.push({ pathname: '/itinerary', params: { id: actionsTrip.id } });
-        }}
-        onDuplicate={() => {
-          if (!actionsTrip) return;
-          const newId = duplicateTrip(actionsTrip.id);
-          if (newId) {
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-              () => undefined,
-            );
-          }
-        }}
-        onDelete={() => {
-          if (!actionsTrip) return;
-          const target = actionsTrip;
-          // Destructive — confirm with the native alert so a stray tap can't
-          // wipe a planned day. Delete is unrecoverable from here.
-          Alert.alert(
-            'Delete trip?',
-            `"${target.title}" will be removed from your saved day trips.`,
-            [
-              { text: 'Cancel', style: 'cancel' },
-              {
-                text: 'Delete',
-                style: 'destructive',
-                onPress: () => {
-                  removeTrip(target.id);
-                  Haptics.notificationAsync(
-                    Haptics.NotificationFeedbackType.Warning,
-                  ).catch(() => undefined);
-                },
-              },
-            ],
-          );
-        }}
-      />
-    </SafeAreaView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  scrollContent: {
-    paddingTop: 16,
-    paddingBottom: 80,
-    gap: 20,
-  },
-  heroBlock: {
-    gap: 6,
-    paddingTop: 4,
-    paddingBottom: 4,
-  },
-  titleRow: {
+  safe: { flex: 1 },
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    justifyContent: 'space-between',
+    paddingTop: 6,
+    paddingBottom: 6,
   },
-  badge: {
+  gear: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.14)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255, 255, 255, 0.24)',
+  },
+  content: {
+    flex: 1,
+    justifyContent: 'space-between',
+  },
+  hero: {
+    marginTop: 28,
+    gap: 8,
+  },
+  greeting: {
+    fontSize: 38,
+    lineHeight: 44,
+  },
+  card: {
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.18,
+    shadowRadius: 22,
+    elevation: 8,
+  },
+  cardInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    padding: 16,
+  },
+  cardText: {
+    flex: 1,
+    gap: 2,
+  },
+  dot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    alignSelf: 'flex-start',
+    marginTop: 6,
+  },
+  morePill: {
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 999,
   },
-  stack: {},
-  planRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 12,
-    gap: 12,
-  },
-  planBar: {
-    width: 3,
-    alignSelf: 'stretch',
-    borderRadius: 2,
-    minHeight: 24,
-  },
-  glanceRow: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  glanceCard: {
-    flex: 1,
-    gap: 2,
-  },
-  actionsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  tripsRow: {
-    gap: 12,
-    paddingRight: 4,
-    paddingVertical: 2,
-  },
-  tripCard: {
-    width: 168,
-    borderRadius: 16,
-    borderWidth: StyleSheet.hairlineWidth,
+  thumb: {
+    width: 46,
+    height: 46,
+    borderRadius: 12,
     overflow: 'hidden',
-  },
-  tripThumb: {
-    height: 92,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  tripThumbImg: {
+  thumbImg: {
     width: '100%',
     height: '100%',
   },
-  tripMeta: {
-    padding: 10,
-    gap: 2,
-  },
-  tripNewCard: {
-    width: 110,
-    borderRadius: 16,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderStyle: 'dashed',
+  iconCircle: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 6,
   },
 });

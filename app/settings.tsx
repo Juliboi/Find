@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Alert,
   Pressable,
@@ -8,18 +8,19 @@ import {
   useColorScheme,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { BottomSheetScrollView } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { TopBar } from '@/components/TopBar';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
-import { FloatingTabBar } from '@/components/FloatingTabBar';
-import { PRIMARY_TABS } from '@/components/nav/tabs';
-import { isSupabaseConfigured } from '@/lib/supabase';
+import { Sheet } from '@/components/Sheet';
+import { HomePicker, type AnchorSlot } from '@/components/HomePicker';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
+import { useHomeStore } from '@/store/useHomeStore';
 import { formatTime } from '@/utils/time';
 
 interface RowProps {
@@ -67,7 +68,7 @@ function Row({
           {title}
         </Text>
         {subtitle ? (
-          <Text variant="caption" tone="secondary">
+          <Text variant="caption" tone="secondary" numberOfLines={1}>
             {subtitle}
           </Text>
         ) : null}
@@ -108,7 +109,7 @@ export default function SettingsScreen() {
   const router = useRouter();
   const t = useTheme();
   const systemScheme = useColorScheme();
-  const supabaseOn = isSupabaseConfigured;
+  const insets = useSafeAreaInsets();
 
   const user = useAuthStore((s) => s.user);
   const signOut = useAuthStore((s) => s.signOut);
@@ -116,6 +117,19 @@ export default function SettingsScreen() {
   const wakeTime = useProfileStore((s) => s.wakeTime);
   const bedTime = useProfileStore((s) => s.bedTime);
   const hasCar = useProfileStore((s) => s.hasCar);
+  const dietary = useProfileStore((s) => s.dietary);
+  const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
+  const home = useHomeStore((s) => s.home);
+  const work = useHomeStore((s) => s.work);
+
+  // Which anchor the location-picker sheet is editing (null = closed).
+  const [anchorSlot, setAnchorSlot] = useState<AnchorSlot | null>(null);
+
+  const dietarySummary = dietary.length
+    ? dietary.join(', ')
+    : dietaryNotes
+      ? dietaryNotes
+      : 'No restrictions';
 
   const accountName =
     fullName ??
@@ -127,11 +141,6 @@ export default function SettingsScreen() {
     .trim()
     .charAt(0)
     .toUpperCase();
-
-  const goAdd = () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
-    router.push('/add');
-  };
 
   const confirmSignOut = () => {
     Alert.alert('Sign out?', 'You can sign back in anytime.', [
@@ -157,13 +166,11 @@ export default function SettingsScreen() {
       <TopBar
         kicker="Profile"
         title="Settings"
-        actions={[
-          {
-            icon: 'flask-outline',
-            onPress: () => router.push('/test'),
-            accessibilityLabel: 'Open sandbox',
-          },
-        ]}
+        left={{
+          icon: 'chevron-back',
+          onPress: () => router.back(),
+          accessibilityLabel: 'Back',
+        }}
       />
 
       <ScrollView
@@ -172,7 +179,7 @@ export default function SettingsScreen() {
           {
             paddingHorizontal: t.spacing.lg,
             paddingTop: t.spacing.sm,
-            paddingBottom: 140,
+            paddingBottom: 40,
           },
         ]}
       >
@@ -252,10 +259,32 @@ export default function SettingsScreen() {
             iconBg={t.colors.infoSoft}
             iconColor={t.colors.info}
             title="Transport"
-            subtitle="Used to pick routes between stops"
+            subtitle={
+              hasCar
+                ? 'Driven only when it helps — toggle per day'
+                : 'Walking and transit between stops'
+            }
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {hasCar ? 'Has a car' : 'No car'}
+              </Text>
+            }
+          />
+          <Row
+            icon="restaurant-outline"
+            iconBg={t.colors.successSoft}
+            iconColor={t.colors.success}
+            title="Dietary"
+            subtitle="Filters food and drink stops"
+            trailing={
+              <Text
+                variant="body"
+                weight="semibold"
+                tone="secondary"
+                numberOfLines={1}
+                style={styles.dietaryValue}
+              >
+                {dietarySummary}
               </Text>
             }
           />
@@ -300,78 +329,24 @@ export default function SettingsScreen() {
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
-              AI &amp; Sync
-            </Text>
-          </View>
-          <Row
-            first
-            icon={supabaseOn ? 'cloud-done' : 'cloud-offline'}
-            iconBg={
-              supabaseOn ? t.colors.successSoft : t.colors.fill1
-            }
-            iconColor={supabaseOn ? t.colors.success : t.colors.textSecondary}
-            title="Supabase"
-            subtitle={
-              supabaseOn
-                ? 'Connected — schedule-day Edge Function will be used'
-                : 'Not configured — using local heuristic scheduler'
-            }
-            trailing={
-              <View
-                style={[
-                  styles.pill,
-                  {
-                    backgroundColor: supabaseOn
-                      ? t.colors.successSoft
-                      : t.colors.fill1,
-                  },
-                ]}
-              >
-                <Text
-                  variant="micro"
-                  weight="bold"
-                  uppercase
-                  style={{
-                    color: supabaseOn ? t.colors.success : t.colors.textSecondary,
-                  }}
-                >
-                  {supabaseOn ? 'On' : 'Off'}
-                </Text>
-              </View>
-            }
-          />
-          <Row
-            icon="flask-outline"
-            iconBg={t.colors.infoSoft}
-            iconColor={t.colors.info}
-            title="Sandbox"
-            subtitle="Inspect AI scheduling for a single plan"
-            onPress={() => router.push('/test')}
-          />
-          <Row
-            icon="sparkles-outline"
-            iconBg={t.colors.accentSoft}
-            iconColor={t.colors.accentText}
-            title="Day planner (v2)"
-            subtitle="Whole-day itinerary as place objects"
-            onPress={() => router.push('/itinerary')}
-          />
-        </Card>
-
-        <Card padded style={{ padding: 0 }}>
-          <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
-            <Text variant="caption" tone="secondary" uppercase weight="semibold">
               Places
             </Text>
           </View>
           <Row
             first
-            icon="location-outline"
+            icon="home-outline"
             iconBg={t.colors.accentSoft}
             iconColor={t.colors.accentText}
-            title="Anchors"
-            subtitle="Home + end of day location"
-            onPress={() => router.push('/places')}
+            title="Home"
+            subtitle={home ? home.label : 'Set your home base'}
+            onPress={() => setAnchorSlot('home')}
+          />
+          <Row
+            icon="briefcase-outline"
+            iconBg={t.colors.fill1}
+            title="Work"
+            subtitle={work ? work.label : 'Optional — for office plans'}
+            onPress={() => setAnchorSlot('work')}
           />
         </Card>
 
@@ -390,7 +365,23 @@ export default function SettingsScreen() {
         </Card>
       </ScrollView>
 
-      <FloatingTabBar tabs={PRIMARY_TABS} onFabPress={goAdd} />
+      <Sheet
+        open={anchorSlot !== null}
+        onClose={() => setAnchorSlot(null)}
+        heightFraction={0.82}
+        enableContentPanningGesture={false}
+      >
+        <BottomSheetScrollView
+          contentContainerStyle={{
+            paddingHorizontal: t.spacing.lg,
+            paddingTop: t.spacing.sm,
+            paddingBottom: insets.bottom + 24,
+          }}
+          keyboardShouldPersistTaps="handled"
+        >
+          {anchorSlot ? <HomePicker slot={anchorSlot} flat /> : null}
+        </BottomSheetScrollView>
+      </Sheet>
     </SafeAreaView>
   );
 }
@@ -420,6 +411,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 999,
+  },
+  dietaryValue: {
+    maxWidth: 170,
+    textAlign: 'right',
   },
   accountRow: {
     flexDirection: 'row',

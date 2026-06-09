@@ -10,18 +10,40 @@ import { useTheme } from '@/theme/useTheme';
 import { Text } from '@/components/Text';
 import { Button } from '@/components/Button';
 import { Card } from '@/components/Card';
+import { Input } from '@/components/Input';
 import { HomePicker } from '@/components/HomePicker';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { formatTime } from '@/utils/time';
 
-const STEP_COUNT = 3;
+const STEP_COUNT = 5;
+
+/** Dietary tags offered as chips in onboarding (kept short + recognisable). */
+const DIET_OPTIONS = [
+  'Vegetarian',
+  'Vegan',
+  'Pescatarian',
+  'Halal',
+  'Kosher',
+  'Gluten-free',
+  'Dairy-free',
+  'Nut allergy',
+];
 
 function makeTime(hour: number, minute = 0): Date {
   const d = new Date();
   d.setHours(hour, minute, 0, 0);
   return d;
+}
+
+/** Seed a time picker from a stored "HH:MM", falling back to a sensible hour. */
+function hhmmToTime(hhmm: string | null, fallbackHour: number): Date {
+  if (hhmm && /^\d{1,2}:\d{2}$/.test(hhmm)) {
+    const [h, m] = hhmm.split(':').map(Number);
+    return makeTime(h, m);
+  }
+  return makeTime(fallbackHour, 0);
 }
 
 function toHHMM(d: Date): string {
@@ -36,19 +58,43 @@ export default function OnboardingScreen() {
 
   const home = useHomeStore((s) => s.home);
   const saveOnboarding = useAuthStore((s) => s.saveOnboarding);
+  const user = useAuthStore((s) => s.user);
+  const storedName = useProfileStore((s) => s.fullName);
   const storedWake = useProfileStore((s) => s.wakeTime);
   const storedBed = useProfileStore((s) => s.bedTime);
 
+  const initialName =
+    storedName ??
+    (typeof user?.user_metadata?.full_name === 'string'
+      ? (user.user_metadata.full_name as string)
+      : '');
+
   const [step, setStep] = useState(0);
-  const [wake, setWake] = useState<Date>(() => makeTime(7, 0));
-  const [bed, setBed] = useState<Date>(() => makeTime(23, 0));
+  const [name, setName] = useState(initialName ?? '');
+  const [wake, setWake] = useState<Date>(() => hhmmToTime(storedWake, 7));
+  const [bed, setBed] = useState<Date>(() => hhmmToTime(storedBed, 23));
   const [hasCar, setHasCar] = useState<boolean | null>(null);
+  const [dietary, setDietary] = useState<string[]>([]);
+  const [dietaryNotes, setDietaryNotes] = useState('');
   const [androidPicker, setAndroidPicker] = useState<'wake' | 'bed' | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const canContinue =
-    step === 0 ? home != null : step === 2 ? hasCar != null : true;
+    step === 0
+      ? name.trim().length > 0
+      : step === 1
+        ? home != null
+        : step === 3
+          ? hasCar != null
+          : true;
+
+  const toggleDiet = (opt: string) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setDietary((prev) =>
+      prev.includes(opt) ? prev.filter((d) => d !== opt) : [...prev, opt],
+    );
+  };
 
   const goNext = () => {
     if (!canContinue) return;
@@ -70,13 +116,15 @@ export default function OnboardingScreen() {
     setSaving(true);
     try {
       await saveOnboarding({
-        fullName: null,
+        fullName: name.trim() || null,
         homeLabel: home?.label ?? null,
         homeLatitude: home?.latitude ?? null,
         homeLongitude: home?.longitude ?? null,
         wakeTime: toHHMM(wake),
         bedTime: toHHMM(bed),
         hasCar: hasCar ?? false,
+        dietary,
+        dietaryNotes: dietaryNotes.trim() ? dietaryNotes.trim() : null,
       });
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
         () => undefined,
@@ -137,26 +185,52 @@ export default function OnboardingScreen() {
       >
         {step === 0 ? (
           <StepIntro
+            title="What should we call you?"
+            subtitle="We'll use your name to make your plans feel like yours."
+          />
+        ) : null}
+        {step === 1 ? (
+          <StepIntro
             title="Where's home?"
             subtitle="Diem plans your day around it — travel times, your first stop, and the trip back home."
           />
         ) : null}
-        {step === 1 ? (
+        {step === 2 ? (
           <StepIntro
             title="Your daily rhythm"
             subtitle="When do you usually wake up and wind down? We'll keep your plans inside these hours."
           />
         ) : null}
-        {step === 2 ? (
+        {step === 3 ? (
           <StepIntro
             title="Do you have a car?"
-            subtitle="This helps Diem choose between walking, transit, and driving routes between stops."
+            subtitle="Optional. When you do, Diem only drives when it actually saves time — and you can switch the car off for any individual day."
+          />
+        ) : null}
+        {step === 4 ? (
+          <StepIntro
+            title="How do you eat?"
+            subtitle="So every food and drink stop fits you. Pick any that apply, or skip it."
           />
         ) : null}
 
-        {step === 0 ? <HomePicker slot="home" /> : null}
+        {step === 0 ? (
+          <Input
+            placeholder="Your name"
+            leftIcon="person-outline"
+            value={name}
+            onChangeText={setName}
+            autoCapitalize="words"
+            autoComplete="name"
+            autoCorrect={false}
+            returnKeyType="next"
+            onSubmitEditing={goNext}
+          />
+        ) : null}
 
-        {step === 1 ? (
+        {step === 1 ? <HomePicker slot="home" /> : null}
+
+        {step === 2 ? (
           <Card padded style={{ padding: 0 }}>
             <TimeRow
               icon="sunny-outline"
@@ -180,12 +254,12 @@ export default function OnboardingScreen() {
           </Card>
         ) : null}
 
-        {step === 2 ? (
+        {step === 3 ? (
           <View style={{ gap: t.spacing.md }}>
             <ChoiceCard
               icon="car-sport"
-              label="Yes, I drive"
-              hint="We'll prefer driving for longer hops"
+              label="Yes, I have a car"
+              hint="Diem drives only when it helps — you choose per day"
               selected={hasCar === true}
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
@@ -201,6 +275,29 @@ export default function OnboardingScreen() {
                 Haptics.selectionAsync().catch(() => undefined);
                 setHasCar(false);
               }}
+            />
+          </View>
+        ) : null}
+
+        {step === 4 ? (
+          <View style={{ gap: t.spacing.lg }}>
+            <View style={styles.chips}>
+              {DIET_OPTIONS.map((opt) => (
+                <DietChip
+                  key={opt}
+                  label={opt}
+                  selected={dietary.includes(opt)}
+                  onPress={() => toggleDiet(opt)}
+                />
+              ))}
+            </View>
+            <Input
+              placeholder="Allergies or notes (optional)"
+              leftIcon="information-circle-outline"
+              value={dietaryNotes}
+              onChangeText={setDietaryNotes}
+              autoCapitalize="sentences"
+              returnKeyType="done"
             />
           </View>
         ) : null}
@@ -391,6 +488,40 @@ function ChoiceCard({
   );
 }
 
+function DietChip({
+  label,
+  selected,
+  onPress,
+}: {
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.chip,
+        {
+          backgroundColor: selected ? t.colors.accentSoft : t.colors.surface1,
+          borderColor: selected ? t.colors.accent : t.colors.separator,
+          borderWidth: selected ? 1.5 : StyleSheet.hairlineWidth,
+          borderRadius: t.radii.lg,
+        },
+        pressed && { opacity: 0.85 },
+      ]}
+    >
+      {selected ? (
+        <Ionicons name="checkmark" size={15} color={t.colors.accent} />
+      ) : null}
+      <Text variant="bodySm" weight="semibold" tone={selected ? 'accent' : 'primary'}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: {
@@ -443,6 +574,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 14,
     padding: 16,
+  },
+  chips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
   },
   choiceIcon: {
     width: 44,

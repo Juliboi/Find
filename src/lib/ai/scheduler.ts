@@ -21,6 +21,22 @@ export interface SchedulerContext {
   work?: LocationPin | null;
   endOfDay?: LocationPin | null;
   currentLocation?: { latitude: number; longitude: number } | null;
+
+  // ----- Profile-derived personalisation (optional; planner-only) -----
+  /** The user's name, so the planner can address them in the summary. */
+  userName?: string | null;
+  /** "HH:MM" the user usually wakes — bounds the day's start. */
+  wakeTime?: string | null;
+  /** "HH:MM" the user usually winds down — anchors the day's end. */
+  bedTime?: string | null;
+  /** Whether the user owns a car at all (availability, not "always drive"). */
+  hasCar?: boolean | null;
+  /** Whether the car is in play for THIS day (per-day toggle). */
+  useCarToday?: boolean | null;
+  /** Canonical dietary tags that constrain food/drink venue picks. */
+  dietary?: string[] | null;
+  /** Freeform dietary notes / allergies. */
+  dietaryNotes?: string | null;
 }
 
 export interface SchedulerDebug {
