@@ -1,5 +1,6 @@
 import * as Location from 'expo-location';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
+import type { VenueOpeningHours } from '@/types/itinerary';
 
 export interface Coords {
   latitude: number;
@@ -19,6 +20,13 @@ export interface NearbyPlace {
   priceLevel: number | null;
   types: string[];
   openNow: boolean | null;
+  /**
+   * Structured weekly opening hours (Google provider only). Lets the swap
+   * sheet judge a candidate against the item's SCHEDULED visit time, and is
+   * carried onto the swapped-in place so the card's hours warning keeps
+   * working after a swap. Absent for Foursquare/OSM results.
+   */
+  openingHours?: VenueOpeningHours | null;
   /**
    * Short AI-written explanation of why this place is being recommended
    * for the user's intent. ~1 sentence, set by the GPT re-rank pass in
@@ -110,6 +118,16 @@ function cacheKey(query: string, coords: Coords): string {
   return `${query.trim().toLowerCase()}@${lat},${lon}`;
 }
 
+/** Coarse (~100m) cache fragment for the optional prev/next route anchors. */
+function routeCacheKey(route?: RouteContext): string {
+  if (!route || (!route.prev && !route.next)) return '';
+  const fmt = (c?: Coords) =>
+    c
+      ? `${Math.round(c.latitude * 1000) / 1000},${Math.round(c.longitude * 1000) / 1000}`
+      : '-';
+  return `|r=${fmt(route.prev)}>${fmt(route.next)}`;
+}
+
 function readCache(key: string): FindPlacesResult | null {
   const entry = placesCache.get(key);
   if (!entry) return null;
@@ -131,6 +149,19 @@ export function clearPlacesCache(): void {
 // ----------------------------------------------------------------- main API
 
 /**
+ * Optional route context for a place-swap lookup. When the venue being
+ * swapped sits BETWEEN two other located stops, passing the previous and
+ * next stop coordinates lets the edge function bias the search to the
+ * corridor between them and rank alternatives by *detour* (extra travel
+ * added to the day) instead of raw distance — so the suggestions stay
+ * on-route and don't make the day zig-zag.
+ */
+export interface RouteContext {
+  prev?: Coords;
+  next?: Coords;
+}
+
+/**
  * Looks up real places near the user matching `input`. Accepts either a
  * single query string or an array of query variants (the latter triggers
  * multi-query fan-out + AI re-ranking in the edge function). Caches
@@ -149,6 +180,12 @@ export async function findPlaces(
    * the itinerary place-swap browser) rather than near the user.
    */
   center?: Coords,
+  /**
+   * Previous/next located stops around the venue being swapped. When set,
+   * the edge function ranks alternatives by how little they detour the
+   * existing route rather than by distance from `center`.
+   */
+  route?: RouteContext,
 ): Promise<FindPlacesResult> {
   const queries = (Array.isArray(input) ? input : [input])
     .map((q) => q.trim())
@@ -166,7 +203,14 @@ export async function findPlaces(
   if (!coords) {
     return { places: [], category: null, provider: 'none', reason: 'no_location' };
   }
-  const key = cacheKey(queries.join('|') + (intent ? `:${intent}` : ''), coords);
+  // Route context, when present, changes which alternatives win — fold a
+  // coarse (~100m) version of both anchors into the cache key so a
+  // route-aware lookup never serves a plain "near the old pin" result.
+  const routeKey = routeCacheKey(route);
+  const key = cacheKey(
+    queries.join('|') + (intent ? `:${intent}` : '') + routeKey,
+    coords,
+  );
   const cached = readCache(key);
   if (cached) return cached;
 
@@ -183,6 +227,8 @@ export async function findPlaces(
         // stay locally meaningful.
         radiusM: 5000,
         limit: 6,
+        ...(route?.prev ? { prev: route.prev } : {}),
+        ...(route?.next ? { next: route.next } : {}),
       },
     });
     if (error) {

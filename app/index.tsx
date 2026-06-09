@@ -17,6 +17,7 @@ import {
   useSavedItineraries,
   type SavedItinerary,
 } from '@/store/useSavedItineraries';
+import { usePlanSetupStore } from '@/store/usePlanSetupStore';
 import { useTheme } from '@/theme/useTheme';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
@@ -28,6 +29,7 @@ import { ComposerStatus } from '@/components/ComposerStatus';
 import { EmptyState } from '@/components/EmptyState';
 import { FloatingTabBar } from '@/components/FloatingTabBar';
 import { TripActionsSheet } from '@/components/TripActionsSheet';
+import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { PRIMARY_TABS } from '@/components/nav/tabs';
 import { formatTime, formatDuration } from '@/utils/time';
 
@@ -89,6 +91,11 @@ export default function HomeScreen() {
       ? savedTrips.find((t) => t.id === actionsTripId) ?? null
       : null;
 
+  // The day-picker drawer the "+" FAB opens. Confirming it stores the chosen
+  // day + start time and drops the user into the v2 itinerary planner.
+  const [setupOpen, setSetupOpen] = useState(false);
+  const setPlanSelection = usePlanSetupStore((s) => s.setSelection);
+
   const date = useDayStore((s) => s.date);
   const plans = useDayStore((s) => s.plans);
   const summary = useDayStore((s) => s.summary);
@@ -111,6 +118,15 @@ export default function HomeScreen() {
   const goAdd = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
     router.push('/add');
+  };
+
+  // The primary "+" action now leads into the v2 planner: open the day picker
+  // first, then carry the chosen day + start time into the itinerary screen.
+  const openSetup = () => setSetupOpen(true);
+  const onSetupConfirm = (date: string, startTime: string) => {
+    setPlanSelection(date, startTime);
+    setSetupOpen(false);
+    router.push('/itinerary');
   };
 
   return (
@@ -429,7 +445,13 @@ export default function HomeScreen() {
         ) : null}
       </ScrollView>
 
-      <FloatingTabBar tabs={PRIMARY_TABS} onFabPress={goAdd} />
+      <FloatingTabBar tabs={PRIMARY_TABS} onFabPress={openSetup} />
+
+      <PlanSetupSheet
+        open={setupOpen}
+        onClose={() => setSetupOpen(false)}
+        onConfirm={onSetupConfirm}
+      />
 
       <TripActionsSheet
         trip={actionsTrip}

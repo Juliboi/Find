@@ -29,6 +29,13 @@
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
+import {
+  extractOpeningHours,
+  openStatusForVisit,
+  visitFitsHours,
+  type VenueOpeningHours,
+} from '../_shared/hours.ts';
+
 // The planner needs Google Search grounding AND a large strict-JSON output in
 // one call. Gemini 2.5 Flash handles that combo reliably; lighter models do
 // not — gemini-2.5-flash-lite consistently returns an EMPTY response for this
@@ -41,6 +48,20 @@ const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 // DEFAULT_GEMINI_MODEL, so a bad override degrades to "slower" — never to the
 // offline sample. Revert with: supabase secrets unset GEMINI_MODEL.
 const CONFIGURED_GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') ?? DEFAULT_GEMINI_MODEL;
+
+// Re-plans of an EXISTING day — the "Ask the planner" escalation from the
+// adjust field, and the auto-replan when an edit no longer fits — favour a
+// cheaper + faster grounded model than a cold-start plan: it's a tweak of a
+// day that already exists, not a blank-page generation. gemini-3.1-flash-lite
+// is both cheaper and faster than 2.5 Flash while still supporting Google
+// Search grounding, and (unlike 2.5-flash-lite) it's capable enough to emit
+// the big grounded JSON without drifting empty. If it ever fails, the handler
+// self-heals to DEFAULT_GEMINI_MODEL, so a replan degrades to "slower" — never
+// to the offline sample. Override with:
+//   supabase secrets set GEMINI_FAST_MODEL=gemini-2.5-flash
+const DEFAULT_FAST_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const CONFIGURED_FAST_GEMINI_MODEL =
+  Deno.env.get('GEMINI_FAST_MODEL') ?? DEFAULT_FAST_GEMINI_MODEL;
 
 // Planning has two mutually-exclusive modes (Gemini forbids combining the
 // google_search tool with a JSON responseSchema):
@@ -243,6 +264,23 @@ function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** "HH:MM" + minutes → "HH:MM" (wraps across midnight). */
+function addMinutesHHMM(hhmm: string, minutes: number): string {
+  const [h, m] = hhmm.split(':');
+  const total = Number(h) * 60 + Number(m) + minutes;
+  const wrapped = ((total % 1440) + 1440) % 1440;
+  return `${String(Math.floor(wrapped / 60)).padStart(2, '0')}:${String(wrapped % 60).padStart(2, '0')}`;
+}
+
+/** The end of a visit, from an explicit endTime or start + duration. */
+function visitEndHHMM(startTime: string, endTime: string, durationMinutes: number | null): string {
+  if (endTime) return endTime;
+  if (startTime && durationMinutes && durationMinutes > 0) {
+    return addMinutesHHMM(startTime, durationMinutes);
+  }
+  return '';
+}
+
 function normaliseName(s: string): string {
   return s
     .toLowerCase()
@@ -319,9 +357,15 @@ function buildPlannerPrompt(args: {
   const userQueryRule =
     ' WHENEVER the user names a venue or gives an address, you MUST set place.userQuery to their EXACT words for that place — verbatim, copied character-for-character from their request, NOT paraphrased (e.g. user wrote "visit mom at Kadaňská 837/18 dolní Chabry" → place.userQuery = "Kadaňská 837/18 dolní Chabry"; user wrote "hostinec u misku" → place.userQuery = "hostinec u misku"; "max fitness oc krakov" → place.userQuery = "max fitness oc krakov"). We geocode place.userQuery against Google Maps EXACTLY as the user typed it, so it is the single most important field — a paraphrased name like "Mom\'s House" geocodes to the WRONG place. Omit place.userQuery only for at-home items (which have no place at all).' +
     ' ALSO set place.locationType: "business" for a public business or point of interest (restaurant, pub, gym, shop, museum, office, station) — we fetch its photo, rating and opening hours — or "residence" for a private home / someone\'s flat or address (e.g. visiting mom at her address, a friend\'s house) — we just pin its exact address and show no rating/photo. When unsure, default to "business".';
+  // Opening-hours discipline: a venue the model picks ITSELF must be open for
+  // the whole planned block at the scheduled time (accounting for how long the
+  // activity takes). User-named venues are sacrosanct — kept verbatim even if
+  // they might be closed (the app shows a "consider changing" notice instead).
+  const hoursRule =
+    ` OPENING HOURS (the day is ${args.date}): for any venue YOU choose yourself (the user did NOT name it), pick one that is OPEN for the ENTIRE planned time block at its scheduled start/end time — factor in how long the activity needs. Never self-select a venue that is closed or about to close at that time; choose an alternative that is open for the whole visit instead. EXCEPTION: if the user NAMED the venue or gave its address, keep it EXACTLY as written even if it might be closed — do NOT substitute it.`;
   const venueRule = args.grounded
-    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule
-    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule;
+    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
+    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
 
   return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
 
@@ -475,9 +519,20 @@ interface EnrichedRecord {
   ratingCount: number | null;
   photoUrl: string | null;
   openNow: boolean | null;
+  openingHours: VenueOpeningHours | null;
   latitude: number;
   longitude: number;
 }
+
+// Field mask shared by the venue lookups — includes the weekly opening-hours
+// periods so we can decide whether a stop is open for its SCHEDULED visit time
+// (not just "open right now", which is all `openNow` tells us).
+const PLACES_FIELD_MASK =
+  'places.displayName,places.formattedAddress,places.shortFormattedAddress,' +
+  'places.location,places.rating,places.userRatingCount,places.photos,' +
+  'places.currentOpeningHours.openNow,places.currentOpeningHours.periods,' +
+  'places.currentOpeningHours.weekdayDescriptions,places.regularOpeningHours.periods,' +
+  'places.regularOpeningHours.weekdayDescriptions';
 
 async function resolvePhotoUrl(
   photoName: string | undefined,
@@ -523,8 +578,7 @@ async function searchPlaceText(
       headers: {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask':
-          'places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.rating,places.userRatingCount,places.photos,places.currentOpeningHours.openNow',
+        'X-Goog-FieldMask': PLACES_FIELD_MASK,
       },
       body: JSON.stringify({
         textQuery: query,
@@ -566,8 +620,143 @@ async function searchPlaceText(
       typeof match?.currentOpeningHours?.openNow === 'boolean'
         ? match.currentOpeningHours.openNow
         : null,
+    openingHours: extractOpeningHours(match),
     latitude: lat,
     longitude: lon,
+  };
+}
+
+// --------------------------------------------------- open-alternative re-pick
+//
+// A lightweight category search used ONLY to rescue an AI-picked venue that
+// turns out closed (or closing before the visit ends) at its scheduled time.
+// Unlike `searchPlaceText` (which resolves one named venue) this returns the
+// top candidates WITH their opening hours so the caller can pick one that is
+// open for the whole planned block. Photos are resolved lazily for the winner.
+
+interface PlaceCandidate {
+  name: string;
+  address: string | null;
+  rating: number | null;
+  ratingCount: number | null;
+  openNow: boolean | null;
+  openingHours: VenueOpeningHours | null;
+  latitude: number;
+  longitude: number;
+  photoName?: string;
+}
+
+async function searchPlaceCandidates(
+  query: string,
+  center: Coords,
+  radiusM: number,
+  apiKey: string,
+  limit = 12,
+): Promise<PlaceCandidate[]> {
+  let data: any;
+  try {
+    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': PLACES_FIELD_MASK,
+      },
+      body: JSON.stringify({
+        textQuery: query,
+        maxResultCount: Math.max(1, Math.min(20, limit)),
+        rankPreference: 'RELEVANCE',
+        locationBias: {
+          circle: {
+            center: { latitude: center.latitude, longitude: center.longitude },
+            radius: Math.max(500, Math.min(50000, radiusM)),
+          },
+        },
+      }),
+    });
+    if (!res.ok) return [];
+    data = await res.json();
+  } catch {
+    return [];
+  }
+  const raw: any[] = Array.isArray(data?.places) ? data.places : [];
+  const out: PlaceCandidate[] = [];
+  for (const p of raw) {
+    const lat = p?.location?.latitude;
+    const lon = p?.location?.longitude;
+    const nm = p?.displayName?.text;
+    if (typeof lat !== 'number' || typeof lon !== 'number' || typeof nm !== 'string') continue;
+    out.push({
+      name: nm,
+      address:
+        (typeof p.shortFormattedAddress === 'string' ? p.shortFormattedAddress : null) ??
+        (typeof p.formattedAddress === 'string' ? p.formattedAddress : null),
+      rating: typeof p.rating === 'number' ? p.rating : null,
+      ratingCount: typeof p.userRatingCount === 'number' ? p.userRatingCount : null,
+      openNow:
+        typeof p?.currentOpeningHours?.openNow === 'boolean' ? p.currentOpeningHours.openNow : null,
+      openingHours: extractOpeningHours(p),
+      latitude: lat,
+      longitude: lon,
+      photoName: p?.photos?.[0]?.name,
+    });
+  }
+  return out;
+}
+
+/**
+ * Finds a same-category venue near home that is OPEN for the whole planned
+ * window, used to replace an AI-picked stop that's closed/closing at its
+ * scheduled time. Best-effort: returns null (caller keeps the original, which
+ * the client then flags) if nothing suitable is found.
+ */
+async function findOpenAlternative(args: {
+  category: string;
+  excludeName: string;
+  home: Coords;
+  city: string | null;
+  apiKey: string;
+  dateISO: string;
+  startHHMM: string;
+  endHHMM: string;
+}): Promise<EnrichedRecord | null> {
+  const base = (args.category ?? '').trim();
+  if (!base || !args.startHHMM) return null;
+  const query =
+    args.city && !base.toLowerCase().includes(args.city.toLowerCase())
+      ? `${base}, ${args.city}`
+      : base;
+  const candidates = await searchPlaceCandidates(query, args.home, 6000, args.apiKey, 12);
+  if (candidates.length === 0) return null;
+
+  const best = candidates
+    .map((c) => ({
+      c,
+      fit: visitFitsHours(c.openingHours, args.dateISO, args.startHHMM, args.endHHMM),
+      dist: haversineMeters({ latitude: c.latitude, longitude: c.longitude }, args.home),
+    }))
+    // Only swap to a venue we can VERIFY is open for the whole visit, isn't the
+    // one we're replacing, and isn't visibly low quality.
+    .filter(
+      (x) =>
+        x.fit.fits &&
+        !nameSimilar(x.c.name, args.excludeName) &&
+        (x.c.rating == null || x.c.rating >= 4.0),
+    )
+    .sort((a, b) => a.dist - b.dist)[0];
+  if (!best) return null;
+
+  const photoUrl = await resolvePhotoUrl(best.c.photoName, args.apiKey);
+  return {
+    name: best.c.name,
+    address: best.c.address,
+    rating: best.c.rating,
+    ratingCount: best.c.ratingCount,
+    photoUrl,
+    openNow: best.c.openNow,
+    openingHours: best.c.openingHours,
+    latitude: best.c.latitude,
+    longitude: best.c.longitude,
   };
 }
 
@@ -714,6 +903,7 @@ async function lookupGooglePlace(args: {
     ratingCount: null,
     photoUrl: null,
     openNow: null,
+    openingHours: null,
     latitude: g.latitude,
     longitude: g.longitude,
   });
@@ -788,6 +978,7 @@ async function enrichItinerary(
   parsed: any,
   home: HomePin | null,
   apiKey: string,
+  dateISO: string,
 ): Promise<void> {
   if (!parsed || !Array.isArray(parsed.sections)) return;
 
@@ -806,6 +997,12 @@ async function enrichItinerary(
     userQuery: string;
     locationType: string;
     coords: Coords | null;
+    /** The item's scheduled visit window, for the opening-hours fit check. */
+    startTime: string;
+    endTime: string;
+    durationMinutes: number | null;
+    /** Venue type the model assigned ("Czech restaurant"), used to re-pick. */
+    category: string;
   }
   const slotsByKey = new Map<string, Slot[]>();
   const keyOf = (label: string, c: Coords | null) =>
@@ -820,6 +1017,12 @@ async function enrichItinerary(
       const address = typeof p.address === 'string' ? p.address.trim() : '';
       const userQuery = typeof p.userQuery === 'string' ? p.userQuery.trim() : '';
       const locationType = typeof p.locationType === 'string' ? p.locationType.trim().toLowerCase() : '';
+      const category = typeof p.category === 'string' ? p.category.trim() : '';
+      const startTime = typeof item.startTime === 'string' ? item.startTime : '';
+      const endTime = typeof item.endTime === 'string' ? item.endTime : '';
+      const durationMinutes = Number.isFinite(Number(item.durationMinutes))
+        ? Number(item.durationMinutes)
+        : null;
       const lat = Number(p?.coords?.latitude);
       const lon = Number(p?.coords?.longitude);
       const coords: Coords | null =
@@ -842,7 +1045,18 @@ async function enrichItinerary(
 
       const k = keyOf(userQuery || name || address, coords);
       if (!slotsByKey.has(k)) slotsByKey.set(k, []);
-      slotsByKey.get(k)!.push({ item, name, address, userQuery, locationType, coords });
+      slotsByKey.get(k)!.push({
+        item,
+        name,
+        address,
+        userQuery,
+        locationType,
+        coords,
+        startTime,
+        endTime,
+        durationMinutes,
+        category,
+      });
     }
   }
 
@@ -854,7 +1068,7 @@ async function enrichItinerary(
       const { name, address, userQuery, locationType, coords } = slots[0];
       const center = coords ?? homeC;
       if (!center) return; // no anchor to bias the search to
-      const record = await lookupGooglePlace({
+      let record = await lookupGooglePlace({
         name,
         address,
         userQuery,
@@ -892,15 +1106,55 @@ async function enrichItinerary(
         }
         return;
       }
-      for (const { item } of slots) {
+      // Opening-hours awareness. A venue the user NAMED (userQuery set) is kept
+      // verbatim even if it's closed at the visit time — the card shows a
+      // "consider changing" notice. A venue the AI chose ITSELF that won't be
+      // open for the whole planned block is swapped for an open same-category
+      // alternative near home; if none is found we keep it (the card warns).
+      const userNamed = !!userQuery;
+      const repStart = slots[0].startTime;
+      const repEnd = visitEndHHMM(repStart, slots[0].endTime, slots[0].durationMinutes);
+      if (!userNamed && homeC) {
+        const fit = visitFitsHours(record.openingHours, dateISO, repStart, repEnd);
+        if (fit.status === 'closed' || fit.status === 'closingSoon') {
+          const alt = await findOpenAlternative({
+            category: slots[0].category || slots[0].item?.title || record.name,
+            excludeName: record.name,
+            home: homeC,
+            city,
+            apiKey,
+            dateISO,
+            startHHMM: repStart,
+            endHHMM: repEnd,
+          });
+          if (alt) {
+            console.log(
+              `[hours] re-picked AI venue ${JSON.stringify(record.name)} (${fit.status}) → ` +
+                `${JSON.stringify(alt.name)} for ${repStart}-${repEnd || '?'}`,
+            );
+            record = alt;
+          }
+        }
+      }
+
+      for (const { item, startTime, endTime, durationMinutes } of slots) {
         const hint = item.place && typeof item.place === 'object' ? item.place : {};
+        const endForItem = visitEndHHMM(startTime, endTime, durationMinutes);
+        // Scheduled-time status string ("Open · Closes 6:00 PM" / "Closed at
+        // this time"). Falls back to the live openNow flag when hours are
+        // unknown (e.g. a residence or a venue Google has no hours for).
+        const scheduledStatus =
+          openStatusForVisit(record.openingHours, dateISO, startTime, endForItem) ??
+          openStatusFromBool(record.openNow);
         item.place = {
           ...hint,
           name: record.name,
           address: record.address ?? hint.address ?? null,
           rating: record.rating ?? (typeof hint.rating === 'number' ? hint.rating : null),
           ratingCount: record.ratingCount,
-          openStatus: openStatusFromBool(record.openNow),
+          openStatus: scheduledStatus ?? undefined,
+          openingHours: record.openingHours ?? undefined,
+          userNamed: userNamed || undefined,
           photoUrl: record.photoUrl,
           coords: { latitude: record.latitude, longitude: record.longitude },
         };
@@ -975,7 +1229,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  let payload: { request?: string; date?: string; context?: any };
+  let payload: { request?: string; date?: string; context?: any; fast?: boolean };
   try {
     payload = await req.json();
   } catch {
@@ -987,6 +1241,9 @@ Deno.serve(async (req: Request) => {
   }
   const date = typeof payload.date === 'string' ? payload.date : todayISO();
   const context = normalizeContext(payload.context);
+  // Re-plans of an existing day ask for the cheaper/faster grounded model.
+  const fast = payload.fast === true;
+  const primaryModel = fast ? CONFIGURED_FAST_GEMINI_MODEL : CONFIGURED_GEMINI_MODEL;
 
   // 1) Single Gemini call that produces the whole itinerary (grounded with
   //    live search, or schema-constrained — see GROUNDING_ENABLED).
@@ -999,16 +1256,16 @@ Deno.serve(async (req: Request) => {
   let gem = await callGeminiPlanner({
     prompt,
     apiKey: geminiKey,
-    model: CONFIGURED_GEMINI_MODEL,
+    model: primaryModel,
     grounded: GROUNDING_ENABLED,
   });
-  // Self-heal a bad GEMINI_MODEL override: if the configured model fails or
-  // returns junk (flash-lite, e.g., emits an empty GROUNDED response), retry
-  // once on the known-reliable default rather than failing the whole request
-  // (which would drop the client to its offline sample itinerary).
-  if (!gem.ok && CONFIGURED_GEMINI_MODEL !== DEFAULT_GEMINI_MODEL) {
+  // Self-heal a primary that fails or returns junk — a bad GEMINI_MODEL
+  // override, or the cheaper fast-replan model emitting an empty GROUNDED
+  // response. Retry once on the known-reliable default rather than failing the
+  // whole request (which would drop the client to its offline sample).
+  if (!gem.ok && primaryModel !== DEFAULT_GEMINI_MODEL) {
     console.warn(
-      `plan-itinerary: model "${CONFIGURED_GEMINI_MODEL}" failed (${gem.detail}); retrying with "${DEFAULT_GEMINI_MODEL}".`,
+      `plan-itinerary: model "${primaryModel}" failed (${gem.detail}); retrying with "${DEFAULT_GEMINI_MODEL}".`,
     );
     gem = await callGeminiPlanner({
       prompt,
@@ -1033,7 +1290,7 @@ Deno.serve(async (req: Request) => {
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
   if (googleKey) {
     try {
-      await enrichItinerary(parsed, context.home ?? null, googleKey);
+      await enrichItinerary(parsed, context.home ?? null, googleKey, date);
     } catch {
       // ignore — the unenriched plan is still useful
     }

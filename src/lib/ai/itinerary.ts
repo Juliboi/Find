@@ -11,6 +11,8 @@ import {
   TravelLeg,
   TravelStep,
   TravelStepMode,
+  VenueOpeningHours,
+  VenueOpenPeriod,
 } from '@/types/itinerary';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import type { SchedulerContext } from './scheduler';
@@ -34,6 +36,12 @@ interface PlanItineraryOptions {
   context?: SchedulerContext;
   date?: string;
   debug?: boolean;
+  /**
+   * Re-planning an EXISTING day (an adjust-field escalation or an auto-replan
+   * after an edit no longer fits) rather than generating from scratch. Routes
+   * the request to the planner's cheaper + faster grounded model.
+   */
+  fast?: boolean;
 }
 
 function buildContextPayload(
@@ -98,6 +106,41 @@ function sanitizeFlexibility(v: unknown): TimeFlexibility {
     : 'flexible';
 }
 
+/**
+ * Defensively reshapes the server's opening-hours blob into our
+ * VenueOpeningHours. Drops malformed periods; returns undefined when nothing
+ * usable remains so the UI treats hours as unknown (never falsely flagged).
+ */
+function sanitizeOpeningHours(raw: any): VenueOpeningHours | undefined {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.periods)) return undefined;
+  const periods: VenueOpenPeriod[] = [];
+  for (const p of raw.periods) {
+    const o = p?.open;
+    if (!o || !Number.isFinite(Number(o.day))) continue;
+    const open = {
+      day: Number(o.day),
+      hour: Number(o.hour) || 0,
+      minute: Number(o.minute) || 0,
+    };
+    const c = p?.close;
+    if (c && Number.isFinite(Number(c.day))) {
+      periods.push({
+        open,
+        close: { day: Number(c.day), hour: Number(c.hour) || 0, minute: Number(c.minute) || 0 },
+      });
+    } else {
+      periods.push({ open });
+    }
+  }
+  if (periods.length === 0) return undefined;
+  const weekdayDescriptions = Array.isArray(raw.weekdayDescriptions)
+    ? raw.weekdayDescriptions.filter((s: unknown) => typeof s === 'string')
+    : undefined;
+  return weekdayDescriptions && weekdayDescriptions.length
+    ? { periods, weekdayDescriptions }
+    : { periods };
+}
+
 function sanitizePlace(raw: any): ItineraryPlace | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const name = asString(raw.name);
@@ -112,6 +155,8 @@ function sanitizePlace(raw: any): ItineraryPlace | undefined {
     ratingCount: asNumber(raw.ratingCount),
     priceLevel: asString(raw.priceLevel),
     openStatus: asString(raw.openStatus),
+    openingHours: sanitizeOpeningHours(raw.openingHours),
+    userNamed: raw.userNamed === true ? true : undefined,
     coords:
       raw.coords &&
       Number.isFinite(Number(raw.coords.latitude)) &&
@@ -307,6 +352,7 @@ export async function planItinerary(
   if (isSupabaseConfigured && supabase) {
     const body: Record<string, unknown> = { request: text };
     if (options.date) body.date = options.date;
+    if (options.fast) body.fast = true;
     const ctx = buildContextPayload(options.context);
     if (ctx) body.context = ctx;
     if (debug) debug.request = body;

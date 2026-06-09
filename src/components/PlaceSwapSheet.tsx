@@ -13,14 +13,29 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 import { Sheet } from './Sheet';
 import { Text } from './Text';
-import { findPlaces, formatDistance, type NearbyPlace } from '@/lib/places';
+import { findPlaces, formatDistance, type Coords, type NearbyPlace } from '@/lib/places';
 import { ItineraryItem, ItineraryPlace } from '@/types/itinerary';
+import { getVenueHoursStatus } from '@/lib/itinerary/hours';
 
 interface Props {
   /** The block whose venue is being swapped; null closes the sheet. */
   item: ItineraryItem | null;
   /** Day's city, used to bias/format a custom search. */
   city?: string;
+  /**
+   * The day's date ("YYYY-MM-DD"). Lets each result show whether it's open for
+   * THIS item's scheduled visit time, so a swap doesn't reintroduce a closed
+   * venue.
+   */
+  date?: string;
+  /**
+   * Coordinates of the previous located stop in the day (falling back to the
+   * user's home/origin). Lets the search rank alternatives that stay on the
+   * route between this stop and the next, instead of drifting cross-town.
+   */
+  prevCoords?: Coords;
+  /** Coordinates of the next located stop (or home/origin) — see prevCoords. */
+  nextCoords?: Coords;
   onClose: () => void;
   onPick: (place: ItineraryPlace) => void;
 }
@@ -38,6 +53,9 @@ function toItineraryPlace(p: NearbyPlace, fallbackEmoji?: string): ItineraryPlac
       typeof p.priceLevel === 'number' ? '$'.repeat(Math.max(1, p.priceLevel)) : undefined,
     coords: { latitude: p.latitude, longitude: p.longitude },
     photoUrl: p.photoUrl ?? undefined,
+    // Carry hours through so the card's scheduled-time warning keeps working
+    // after a swap (and isn't lost the moment you replace a venue).
+    openingHours: p.openingHours ?? undefined,
   };
 }
 
@@ -47,7 +65,15 @@ function toItineraryPlace(p: NearbyPlace, fallbackEmoji?: string): ItineraryPlac
  * Picking one hands a fresh `ItineraryPlace` back to the screen, which swaps it
  * and re-routes the day.
  */
-export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
+export function PlaceSwapSheet({
+  item,
+  city,
+  date,
+  prevCoords,
+  nextCoords,
+  onClose,
+  onPick,
+}: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const [query, setQuery] = useState('');
@@ -78,7 +104,12 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
     setLoading(true);
     setReason(null);
     const intent = `${item?.title ?? ''} — ${q}`.trim();
-    const res = await findPlaces(q, intent, center);
+    // Pass the surrounding stops so the edge function favours alternatives
+    // that stay on the route (low detour) over ones that merely sit close
+    // to the venue we're replacing.
+    const route =
+      prevCoords || nextCoords ? { prev: prevCoords, next: nextCoords } : undefined;
+    const res = await findPlaces(q, intent, center, route);
     setResults(res.places);
     if (res.places.length === 0) {
       setReason(
@@ -147,7 +178,17 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
               </Text>
             </View>
           ) : (
-            results.map((p, i) => (
+            results.map((p, i) => {
+              // Judge each candidate against THIS item's scheduled visit window
+              // (date + start/end), not just "open right now", so a swap can't
+              // silently reintroduce a venue that's closed at the planned time.
+              const fit = getVenueHoursStatus(
+                { name: p.name, openingHours: p.openingHours ?? undefined },
+                date,
+                item?.startTime,
+                item?.endTime,
+              );
+              return (
               <Animated.View key={p.id} entering={FadeIn.delay(Math.min(i * 40, 240))}>
                 <Pressable
                   onPress={() => onPick(toItineraryPlace(p, emoji))}
@@ -183,7 +224,26 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
                       <Text variant="caption" tone="tertiary">
                         {formatDistance(p.distanceM)}
                       </Text>
-                      {p.openNow != null ? (
+                      {fit.status !== 'unknown' ? (
+                        <Text
+                          variant="caption"
+                          weight="medium"
+                          style={{
+                            color:
+                              fit.status === 'open'
+                                ? t.colors.success
+                                : fit.status === 'closingSoon'
+                                ? t.colors.warning
+                                : t.colors.danger,
+                          }}
+                        >
+                          {fit.status === 'open'
+                            ? 'Open'
+                            : fit.status === 'closingSoon'
+                            ? fit.statusLabel
+                            : 'Closed then'}
+                        </Text>
+                      ) : p.openNow != null ? (
                         <Text
                           variant="caption"
                           weight="medium"
@@ -202,7 +262,8 @@ export function PlaceSwapSheet({ item, city, onClose, onPick }: Props) {
                   <Ionicons name="swap-horizontal" size={18} color={t.colors.accent} />
                 </Pressable>
               </Animated.View>
-            ))
+              );
+            })
           )}
         </BottomSheetScrollView>
       </View>

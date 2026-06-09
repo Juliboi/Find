@@ -23,6 +23,7 @@ import Animated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 import { GlassSurface } from './Glass';
 import { TopBar, type TopBarAction } from './TopBar';
@@ -32,6 +33,12 @@ interface Props {
   onClose: () => void;
   /** Height fraction of the screen (0..1). Default 0.86 for tall sheets. */
   heightFraction?: number;
+  /**
+   * Fill the whole screen edge-to-edge (no side/bottom insets, square corners,
+   * top safe-area respected). Use for immersive, full-bleed pickers. Overrides
+   * `heightFraction`.
+   */
+  fullScreen?: boolean;
   /** Optional title shown in the sheet header. */
   title?: string;
   /** Optional confirm action (renders as accent ✓ in the right cluster). */
@@ -58,6 +65,7 @@ export function BottomSheet({
   visible,
   onClose,
   heightFraction = 0.86,
+  fullScreen,
   title,
   onConfirm,
   confirmDisabled,
@@ -66,7 +74,8 @@ export function BottomSheet({
   contentStyle,
 }: Props) {
   const t = useTheme();
-  const sheetHeight = SCREEN.height * heightFraction;
+  const insets = useSafeAreaInsets();
+  const sheetHeight = fullScreen ? SCREEN.height : SCREEN.height * heightFraction;
 
   const translateY = useSharedValue(sheetHeight);
   const overlayOpacity = useSharedValue(0);
@@ -151,6 +160,7 @@ export function BottomSheet({
             style={[
               styles.sheetWrap,
               { height: sheetHeight, shadowColor: t.colors.shadow },
+              fullScreen && styles.sheetWrapFull,
               sheetStyle,
             ]}
           >
@@ -160,9 +170,12 @@ export function BottomSheet({
             >
               <GlassSurface
                 variant="thick"
-                radius={t.radii.xl}
+                radius={fullScreen ? 0 : t.radii.xl}
                 style={styles.sheet}
-                innerStyle={styles.sheetInner}
+                innerStyle={[
+                  styles.sheetInner,
+                  fullScreen && { paddingTop: insets.top },
+                ]}
               >
                 <GestureDetector gesture={dragGesture}>
                   <View style={styles.handleHit}>
@@ -210,6 +223,11 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.25,
     shadowRadius: 32,
     elevation: 24,
+  },
+  sheetWrapFull: {
+    left: 0,
+    right: 0,
+    bottom: 0,
   },
   sheet: {
     flex: 1,

@@ -140,6 +140,31 @@ export interface TravelLeg {
 }
 
 /**
+ * One open→close interval in a venue's weekly schedule, mirroring the shape
+ * Google Places returns under `regularOpeningHours.periods`. `day` is
+ * 0 = Sunday … 6 = Saturday. A period whose `close` is omitted means the
+ * venue is open 24 hours from that `open` point (Google's "always open"
+ * representation). `close.day` may differ from `open.day` for venues that
+ * trade past midnight (a bar open Fri 18:00 → Sat 02:00).
+ */
+export interface VenueOpenPeriod {
+  open: { day: number; hour: number; minute: number };
+  close?: { day: number; hour: number; minute: number };
+}
+
+/**
+ * A venue's weekly opening schedule — enough to decide whether a planned
+ * visit (a date + time window) falls inside an open interval. Populated from
+ * Google Places during enrichment; absent for providers/venues without hours.
+ */
+export interface VenueOpeningHours {
+  /** Weekly open intervals. */
+  periods: VenueOpenPeriod[];
+  /** Google's human-readable lines ("Monday: 9:00 AM – 6:00 PM"), for display. */
+  weekdayDescriptions?: string[];
+}
+
+/**
  * A real-world venue attached to an item. Mirrors the kind of structured
  * data a grounded web search (Google Places / Gemini grounding) returns,
  * so this object can be populated either by the model's own knowledge now
@@ -162,6 +187,20 @@ export interface ItineraryPlace {
   priceLevel?: string;
   /** Free-form open/closed hint: "Open · Closes at 6.00 pm". */
   openStatus?: string;
+  /**
+   * Structured weekly opening hours, used to check whether a visit at the
+   * item's scheduled date + time actually fits inside open hours. Recomputed
+   * client-side as the schedule reflows on edits. Absent when the provider
+   * returned no hours (status is then treated as unknown — never flagged).
+   */
+  openingHours?: VenueOpeningHours;
+  /**
+   * True when this venue came from the user naming it explicitly (the planner
+   * set `place.userQuery`). Such venues are kept verbatim even if closed at the
+   * visit time — the UI shows a "consider changing" notice instead of the
+   * planner swapping them for an open alternative.
+   */
+  userNamed?: boolean;
   /** Geocoded coordinates, when resolvable. */
   coords?: { latitude: number; longitude: number };
   /**

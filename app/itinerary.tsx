@@ -35,7 +35,9 @@ import { useTheme } from '@/theme/useTheme';
 import type { ThemeColors } from '@/theme/colors';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
+import { usePlanSetupStore } from '@/store/usePlanSetupStore';
 import { HomePicker } from '@/components/HomePicker';
+import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
 import { Button } from '@/components/Button';
@@ -81,9 +83,12 @@ import {
   addMinutes,
   currentHHMM,
   formatDuration,
+  formatTime,
   minutesOfDay,
   todayISO,
 } from '@/utils/time';
+import { describeDay, isPastDay } from '@/utils/days';
+import { getVenueHoursStatus } from '@/lib/itinerary/hours';
 
 /**
  * Temporarily surfaces a small Fixed / Window / Flexible label on each plan
@@ -425,6 +430,19 @@ export default function ItineraryScreen() {
   const endOfDay = useHomeStore((s) => selectEndOfDay(s));
   const saveItinerary = useSavedItineraries((s) => s.save);
   const updateSavedItinerary = useSavedItineraries((s) => s.update);
+
+  // The day + start time chosen in the planner setup drawer (homepage "+" or
+  // the "When" row below). A stale past date heals to today so we never plan
+  // into the past.
+  const planDate = usePlanSetupStore((s) => s.date);
+  const planStartTime = usePlanSetupStore((s) => s.startTime);
+  const setPlanSelection = usePlanSetupStore((s) => s.setSelection);
+  const effectiveDate = isPastDay(planDate) ? todayISO() : planDate;
+  const [setupOpen, setSetupOpen] = useState(false);
+  const whenSummary = useMemo(() => {
+    const d = describeDay(effectiveDate);
+    return `${d.title}, ${d.dateLabel} · ${formatTime(planStartTime)}`;
+  }, [effectiveDate, planStartTime]);
 
   // Opening a saved plan from the homepage: hydrate it (once) so the screen
   // shows the preview straight away with the drawer already collapsed.
@@ -796,6 +814,39 @@ export default function ItineraryScreen() {
     [legMenuId, flatItems],
   );
 
+  // The located stops on either side of the venue being swapped. Walk the
+  // flat day outward from the target to the nearest items that actually
+  // have coordinates, falling back to home/origin at the day's edges (the
+  // day departs from and returns to home). Handing these to the swap sheet
+  // lets the search rank alternatives by how little they detour the route,
+  // instead of just "closest to the old pin" — which is what stops a swap
+  // from introducing a zig-zag.
+  const swapNeighbors = useMemo(() => {
+    if (!swapItem) return { prev: undefined, next: undefined };
+    const homeCoord = home
+      ? { latitude: home.latitude, longitude: home.longitude }
+      : undefined;
+    const idx = flatItems.findIndex((it) => it.id === swapItem.id);
+    if (idx === -1) return { prev: homeCoord, next: homeCoord };
+    let prev: { latitude: number; longitude: number } | undefined;
+    for (let i = idx - 1; i >= 0; i--) {
+      const c = flatItems[i]?.place?.coords;
+      if (c) {
+        prev = c;
+        break;
+      }
+    }
+    let next: { latitude: number; longitude: number } | undefined;
+    for (let i = idx + 1; i < flatItems.length; i++) {
+      const c = flatItems[i]?.place?.coords;
+      if (c) {
+        next = c;
+        break;
+      }
+    }
+    return { prev: prev ?? homeCoord, next: next ?? homeCoord };
+  }, [swapItem, flatItems, home]);
+
   const nowSectionIndex = useMemo(() => {
     if (!itinerary || !nowItemId) return -1;
     return itinerary.sections.findIndex((s) => s.items.some((it) => it.id === nowItemId));
@@ -995,9 +1046,13 @@ export default function ItineraryScreen() {
     resetTracking();
     snapTo(expandedTop); // show the skeleton full-height while we work
     try {
-      const result = await planItinerary(text, {
+      // Anchor the plan to the day + start time the user picked in the setup
+      // drawer. The date goes to the planner directly; the start time is woven
+      // into the prompt so the model lays the first block down around it.
+      const request = `I'm planning my day for ${effectiveDate}, and I want to start at ${planStartTime}.\n\n${text}`;
+      const result = await planItinerary(request, {
         context,
-        date: todayISO(),
+        date: effectiveDate,
         debug: true,
       });
       if (planSeqRef.current !== seq) return; // user reset / planned again
@@ -1122,6 +1177,7 @@ export default function ItineraryScreen() {
       const result = await planItinerary(request, {
         context,
         date: routed.date ?? todayISO(),
+        fast: true,
       });
       if (mySeq !== editSeqRef.current) return;
       if (!result.itinerary) return;
@@ -1282,7 +1338,7 @@ export default function ItineraryScreen() {
       try {
         const basis = describeItineraryForReplan(itinerary, input);
         const request = `${basis}\n\nAdjustment requested: ${text}`;
-        const result = await planItinerary(request, { context, date: todayISO() });
+        const result = await planItinerary(request, { context, date: todayISO(), fast: true });
         if (mySeq !== editSeqRef.current) return;
         if (result.itinerary) {
           const cascaded = cascadeTimes(result.itinerary);
@@ -1682,7 +1738,28 @@ export default function ItineraryScreen() {
                 )}
               </Card>
               <Card padded>
-           
+                <Pressable
+                  onPress={() => setSetupOpen(true)}
+                  style={({ pressed }) => [
+                    styles.homeSummary,
+                    pressed && { opacity: 0.6 },
+                  ]}
+                >
+                  <Ionicons name="calendar-outline" size={18} color={t.colors.accent} />
+                  <View style={{ flex: 1 }}>
+                    <Text variant="caption" tone="tertiary" uppercase weight="bold">
+                      Planning for
+                    </Text>
+                    <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                      {whenSummary}
+                    </Text>
+                  </View>
+                  <Ionicons
+                    name="chevron-down"
+                    size={18}
+                    color={t.colors.textSecondary}
+                  />
+                </Pressable>
                 <TextInput
                   style={[
                     styles.input,
@@ -1745,6 +1822,7 @@ export default function ItineraryScreen() {
                   key={section.id}
                   section={section}
                   first={si === 0}
+                  dayDate={itinerary.date}
                   index={si}
                   gapsById={gapsById}
                   continuationIds={continuationIds}
@@ -1926,6 +2004,9 @@ export default function ItineraryScreen() {
       <PlaceSwapSheet
         item={swapItem}
         city={itinerary?.city}
+        date={itinerary?.date}
+        prevCoords={swapNeighbors.prev}
+        nextCoords={swapNeighbors.next}
         onClose={() => setSwapItem(null)}
         onPick={(place: ItineraryPlace) => {
           const target = swapItem;
@@ -1997,6 +2078,17 @@ export default function ItineraryScreen() {
           setLegMenuId(null);
           applyEdit({ type: 'setDayTransportMode', mode });
         }}
+      />
+
+      <PlanSetupSheet
+        open={setupOpen}
+        onClose={() => setSetupOpen(false)}
+        onConfirm={(date, startTime) => {
+          setPlanSelection(date, startTime);
+          setSetupOpen(false);
+        }}
+        initialDate={effectiveDate}
+        initialTime={planStartTime}
       />
     </View>
   );
@@ -2159,6 +2251,7 @@ function RoundButton({
 function SectionBlock({
   section,
   first,
+  dayDate,
   continuationIds,
   index,
   gapsById,
@@ -2185,6 +2278,8 @@ function SectionBlock({
 }: {
   section: ItinerarySection;
   first: boolean;
+  /** The day's date ("YYYY-MM-DD"), used for the venue opening-hours check. */
+  dayDate?: string;
   continuationIds: Set<string>;
   index: number;
   gapsById: Record<string, number>;
@@ -2322,6 +2417,7 @@ function SectionBlock({
                 ) : (
                   <ItemCard
                     item={item}
+                    dayDate={dayDate}
                     isContinuation={continuationIds.has(item.id)}
                     onPressPlace={rearrangeMode ? undefined : () => onPressPlace(item)}
                     onOpenMenu={rearrangeMode ? undefined : () => onOpenMenu(item)}
@@ -3246,12 +3342,15 @@ function CommuteFallbackStep({
 
 function ItemCard({
   item,
+  dayDate,
   isContinuation,
   onPressPlace,
   onOpenMenu,
   hasConflict,
 }: {
   item: ItineraryItem;
+  /** The day's date ("YYYY-MM-DD"), used for the venue opening-hours check. */
+  dayDate?: string;
   /**
    * True when the previous item was at the SAME venue. We suppress the place
    * block (photo / name / rating / open status) so the same venue card doesn't
@@ -3285,6 +3384,11 @@ function ItemCard({
   const rating = typeof place?.rating === 'number' ? place.rating : undefined;
   // Condense price + category onto one muted line under the venue name.
   const metaBits = [place?.priceLevel, place?.category].filter(Boolean) as string[];
+  // Opening-hours check against the LIVE scheduled time — recomputed here (not
+  // baked server-side) because the schedule reflows as the user edits. Drives
+  // the open-status line and a "consider changing" notice when the venue is
+  // closed or closes before this visit ends. Unknown hours show nothing.
+  const hours = getVenueHoursStatus(place, dayDate, item.startTime, item.endTime);
 
   return (
     <Card padded>
@@ -3330,49 +3434,85 @@ function ItemCard({
       ) : null}
 
       {place ? (
-        <Pressable
-          onPress={onPressPlace}
-          disabled={!onPressPlace}
-          style={({ pressed }) => [styles.placeRow, pressed && onPressPlace && { opacity: 0.7 }]}
-        >
-          {place.photoUrl ? (
-            <Image
-              source={{ uri: place.photoUrl }}
-              style={[styles.thumb, { backgroundColor: t.colors.fill1 }]}
-            />
-          ) : null}
-          <View style={styles.placeBody}>
-            <Text variant="bodySm" weight="semibold" numberOfLines={1}>
-              {place.name}
-            </Text>
-            {rating !== undefined || metaBits.length ? (
-              <View style={styles.metaRow}>
-                {rating !== undefined ? (
-                  <>
-                    <Text variant="caption" tone="secondary" weight="medium">
-                      {rating.toFixed(1)}
-                    </Text>
-                    <Ionicons name="star" size={12} color={t.colors.highlightYellow} />
-                  </>
-                ) : null}
-                {metaBits.length ? (
-                  <Text variant="caption" tone="tertiary" numberOfLines={1} style={styles.metaText}>
-                    {`${rating !== undefined ? '·  ' : ''}${metaBits.join('  ·  ')}`}
-                  </Text>
-                ) : null}
-              </View>
+        <>
+          <Pressable
+            onPress={onPressPlace}
+            disabled={!onPressPlace}
+            style={({ pressed }) => [styles.placeRow, pressed && onPressPlace && { opacity: 0.7 }]}
+          >
+            {place.photoUrl ? (
+              <Image
+                source={{ uri: place.photoUrl }}
+                style={[styles.thumb, { backgroundColor: t.colors.fill1 }]}
+              />
             ) : null}
-            {place.openStatus ? <OpenStatus status={place.openStatus} /> : null}
-          </View>
-          {onPressPlace ? (
-            <Ionicons
-              name="chevron-forward"
-              size={18}
-              color={t.colors.textTertiary}
-              style={styles.placeChevron}
-            />
+            <View style={styles.placeBody}>
+              <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                {place.name}
+              </Text>
+              {rating !== undefined || metaBits.length ? (
+                <View style={styles.metaRow}>
+                  {rating !== undefined ? (
+                    <>
+                      <Text variant="caption" tone="secondary" weight="medium">
+                        {rating.toFixed(1)}
+                      </Text>
+                      <Ionicons name="star" size={12} color={t.colors.highlightYellow} />
+                    </>
+                  ) : null}
+                  {metaBits.length ? (
+                    <Text variant="caption" tone="tertiary" numberOfLines={1} style={styles.metaText}>
+                      {`${rating !== undefined ? '·  ' : ''}${metaBits.join('  ·  ')}`}
+                    </Text>
+                  ) : null}
+                </View>
+              ) : null}
+              {/* Prefer the live scheduled-time status; fall back to the
+                  server's openStatus string only when we have no structured
+                  hours to compute from. */}
+              {hours.status !== 'unknown' && hours.statusLabel ? (
+                <OpenStatus status={hours.statusLabel} />
+              ) : place.openStatus ? (
+                <OpenStatus status={place.openStatus} />
+              ) : null}
+            </View>
+            {onPressPlace ? (
+              <Ionicons
+                name="chevron-forward"
+                size={18}
+                color={t.colors.textTertiary}
+                style={styles.placeChevron}
+              />
+            ) : null}
+          </Pressable>
+          {hours.warning ? (
+            <View
+              style={[
+                styles.hoursWarn,
+                {
+                  backgroundColor:
+                    hours.status === 'closed' ? t.colors.dangerSoft : t.colors.warningSoft,
+                },
+              ]}
+            >
+              <Ionicons
+                name="alert-circle"
+                size={14}
+                color={hours.status === 'closed' ? t.colors.danger : t.colors.warning}
+              />
+              <Text
+                variant="caption"
+                weight="medium"
+                style={[
+                  styles.hoursWarnText,
+                  { color: hours.status === 'closed' ? t.colors.danger : t.colors.warning },
+                ]}
+              >
+                {hours.warning}
+              </Text>
+            </View>
           ) : null}
-        </Pressable>
+        </>
       ) : null}
     </Card>
   );
@@ -3551,6 +3691,18 @@ const styles = StyleSheet.create({
   openStatus: {
     fontSize: 13,
     fontWeight: '400',
+  },
+  hoursWarn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+  },
+  hoursWarnText: {
+    flex: 1,
   },
   flexBadge: {
     alignItems: 'center',

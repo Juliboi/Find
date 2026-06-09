@@ -32,6 +32,8 @@
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
+import { extractOpeningHours, type VenueOpeningHours } from '../_shared/hours.ts';
+
 interface UnifiedPlace {
   id: string;
   name: string;
@@ -45,6 +47,12 @@ interface UnifiedPlace {
   priceLevel: number | null;
   types: string[];
   openNow: boolean | null;
+  /**
+   * Structured weekly opening hours (Google provider only), so the place-swap
+   * sheet can judge whether a candidate is open for the item's SCHEDULED visit
+   * time, not just "open right now". Absent for Foursquare/OSM results.
+   */
+  openingHours?: VenueOpeningHours | null;
   /**
    * GPT-written ~1 sentence pitch for why this place is recommended.
    * Set by the AI re-rank pass; absent if OPENAI_API_KEY is missing
@@ -139,6 +147,61 @@ function haversineMeters(
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+// --------------------------------------------------------- route geometry
+//
+// When the caller is swapping a stop that sits BETWEEN two other located
+// stops (the itinerary place-swap browser), it passes the previous and
+// next stop coordinates. We use those to (a) bias the candidate pool to
+// the corridor between them and (b) rank by *detour* rather than raw
+// distance, so a replacement that's a short hop off the existing path
+// beats a "closer to the old pin" venue that forces a zig-zag.
+
+interface Coords {
+  latitude: number;
+  longitude: number;
+}
+
+/** Geographic midpoint (good enough at city scale; no need for great-circle). */
+function midpoint(a: Coords, b: Coords): Coords {
+  return {
+    latitude: (a.latitude + b.latitude) / 2,
+    longitude: (a.longitude + b.longitude) / 2,
+  };
+}
+
+function distM(a: Coords, b: Coords): number {
+  return haversineMeters(a.latitude, a.longitude, b.latitude, b.longitude);
+}
+
+/**
+ * Extra meters added to the day by routing through `c` instead of going
+ * straight from the previous stop to the next one:
+ *
+ *   detour = d(prev, c) + d(c, next) − d(prev, next)
+ *
+ * A venue sitting right on the prev→next line has ~0 detour; one off to
+ * the side that forces a backtrack has a large detour. This is the number
+ * that actually captures "don't zig-zag". Falls back to a single-sided
+ * distance when only one neighbour is known (first/last located stop), and
+ * returns null when there's no route context at all.
+ */
+function detourMeters(
+  prev: Coords | undefined,
+  next: Coords | undefined,
+  c: Coords,
+): number | null {
+  if (prev && next) {
+    return Math.max(0, distM(prev, c) + distM(c, next) - distM(prev, next));
+  }
+  if (prev) return distM(prev, c);
+  if (next) return distM(c, next);
+  return null;
+}
+
+function clampRadius(m: number): number {
+  return Math.min(10000, Math.max(200, Math.round(m)));
 }
 
 // --------------------------------------------------------- category mappings
@@ -345,12 +408,19 @@ interface ScoredCandidate extends UnifiedPlace {
   compositeScore: number;
   /** Which queries surfaced this place (for debugging). */
   matchedQueries: string[];
+  /**
+   * Extra meters this place adds versus going straight from the previous
+   * stop to the next one. Only set when the caller passed route context
+   * (prev/next coords); null otherwise. Drives both the composite score
+   * and the AI re-rank when present.
+   */
+  detourM: number | null;
 }
 
 async function searchGoogleOnce(
   query: string,
-  lat: number,
-  lon: number,
+  biasCenter: Coords,
+  distRef: Coords,
   radiusM: number,
   apiKey: string,
 ): Promise<UnifiedPlace[]> {
@@ -362,15 +432,17 @@ async function searchGoogleOnce(
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
-          'places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.types,places.rating,places.userRatingCount,places.priceLevel,places.photos,places.currentOpeningHours.openNow',
+          'places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.location,places.types,places.rating,places.userRatingCount,places.priceLevel,places.photos,places.currentOpeningHours.openNow,places.currentOpeningHours.periods,places.currentOpeningHours.weekdayDescriptions,places.regularOpeningHours.periods,places.regularOpeningHours.weekdayDescriptions',
       },
       body: JSON.stringify({
         textQuery: query,
         maxResultCount: 20,
         rankPreference: 'RELEVANCE',
+        // Bias to the corridor center (midpoint of prev/next stops) when
+        // the caller passed route context, otherwise the venue itself.
         locationBias: {
           circle: {
-            center: { latitude: lat, longitude: lon },
+            center: { latitude: biasCenter.latitude, longitude: biasCenter.longitude },
             radius: radiusM,
           },
         },
@@ -417,7 +489,11 @@ async function searchGoogleOnce(
             ? p.shortFormattedAddress
             : null) ??
           (typeof p.formattedAddress === 'string' ? p.formattedAddress : null),
-        distanceM: Math.round(haversineMeters(lat, lon, elLat, elLon)),
+        // Distance shown to the user stays relative to the venue being
+        // swapped (distRef) so "0.3 km" reads as "near the old spot".
+        distanceM: Math.round(
+          haversineMeters(distRef.latitude, distRef.longitude, elLat, elLon),
+        ),
         latitude: elLat,
         longitude: elLon,
         photoUrl,
@@ -438,13 +514,17 @@ async function searchGoogleOnce(
           typeof p?.currentOpeningHours?.openNow === 'boolean'
             ? p.currentOpeningHours.openNow
             : null,
+        openingHours: extractOpeningHours(p),
       };
       return place;
     }),
   );
 
   return (places.filter(Boolean) as UnifiedPlace[]).filter((p) => {
-    if (p.distanceM > radiusM * 1.5) return false;
+    // Cull on distance from the bias center (the corridor midpoint when
+    // route context is present), not the display distance.
+    const biasDist = distM(biasCenter, { latitude: p.latitude, longitude: p.longitude });
+    if (biasDist > radiusM * 1.5) return false;
     if (shouldRejectByTypes(query, p.types)) return false;
     return true;
   });
@@ -478,14 +558,34 @@ interface ScoreContext {
   place: UnifiedPlace;
   radiusM: number;
   everyday: boolean;
+  /**
+   * Extra meters added to the route by this candidate (see detourMeters).
+   * When present it REPLACES raw distance as the proximity signal — for a
+   * mid-route swap, "doesn't make me backtrack" matters more than "closest
+   * to the old pin".
+   */
+  detourM?: number | null;
 }
 
 function scoreCandidate(c: ScoreContext): number {
   const pos = 1 / (1 + c.bestPosition);
-  const decayConstant = c.everyday
-    ? Math.max(800, c.radiusM / 4)
-    : Math.max(1500, c.radiusM / 2);
-  const dist = Math.exp(-(c.place.distanceM / decayConstant));
+  // Proximity term. With route context we decay on detour (extra meters
+  // added to the path); without it, on raw distance from the venue.
+  let proximity: number;
+  if (c.detourM != null) {
+    // Detour decays faster than raw distance: even ~600 m of backtrack for
+    // an everyday stop is a meaningful zig-zag, so it should bite quickly.
+    const detourDecay = c.everyday
+      ? Math.max(500, c.radiusM / 6)
+      : Math.max(1000, c.radiusM / 3);
+    proximity = Math.exp(-(c.detourM / detourDecay));
+  } else {
+    const decayConstant = c.everyday
+      ? Math.max(800, c.radiusM / 4)
+      : Math.max(1500, c.radiusM / 2);
+    proximity = Math.exp(-(c.place.distanceM / decayConstant));
+  }
+  const dist = proximity;
   const rating = c.place.rating != null ? c.place.rating / 5 : 0;
   const reviewsRaw = c.place.ratingCount ?? 0;
   const reviews = reviewsRaw > 0
@@ -525,15 +625,16 @@ function scoreCandidate(c: ScoreContext): number {
 
 async function searchGoogleFanOut(
   queries: string[],
-  lat: number,
-  lon: number,
+  biasCenter: Coords,
+  distRef: Coords,
   radiusM: number,
   apiKey: string,
   everyday: boolean,
+  route: { prev?: Coords; next?: Coords } | undefined,
   candidatePoolSize = 20,
 ): Promise<{ candidates: ScoredCandidate[]; perQueryCounts: Record<string, number> }> {
   const settled = await Promise.allSettled(
-    queries.map((q) => searchGoogleOnce(q, lat, lon, radiusM, apiKey)),
+    queries.map((q) => searchGoogleOnce(q, biasCenter, distRef, radiusM, apiKey)),
   );
 
   const merged = new Map<string, ScoredCandidate>();
@@ -560,6 +661,10 @@ async function searchGoogleFanOut(
           matchCount: 1,
           matchedQueries: [q],
           compositeScore: 0,
+          detourM: detourMeters(route?.prev, route?.next, {
+            latitude: p.latitude,
+            longitude: p.longitude,
+          }),
         });
       }
     });
@@ -577,6 +682,7 @@ async function searchGoogleFanOut(
         place: c,
         radiusM,
         everyday,
+        detourM: c.detourM,
       }) + corroboration;
     return c;
   });
@@ -611,10 +717,13 @@ async function analyzeWithLLM(
   limit: number,
   apiKey: string,
   everyday: boolean,
+  routeAware: boolean,
 ): Promise<LLMPickResult> {
   // Compact representation. We only include what the model needs to
   // form a judgement — full coordinates and photo URLs would just
-  // burn tokens.
+  // burn tokens. `detourM` is only included when we have route context;
+  // it's the extra walking/driving the user takes on by slotting this
+  // venue between their previous and next stops.
   const compact = candidates.map((c) => ({
     id: c.id,
     name: c.name,
@@ -623,6 +732,7 @@ async function analyzeWithLLM(
     ratingCount: c.ratingCount,
     address: c.address,
     distanceM: c.distanceM,
+    ...(routeAware && c.detourM != null ? { detourM: Math.round(c.detourM) } : {}),
     openNow: c.openNow,
     priceLevel: c.priceLevel,
     matchedIn: c.matchedQueries.length,
@@ -696,6 +806,26 @@ matters less.
     (e.g. the only climbing wall in the area).
   • For destinations, do NOT prefer few picks. Show every well-
     validated option — the user is choosing where to commit.`}
+${routeAware
+  ? `
+ROUTING RULE (this OVERRIDES the proximity rule above):
+The user is swapping a stop that sits BETWEEN a fixed previous stop and
+a fixed next stop on their day. Each candidate carries a "detourM" field:
+the EXTRA meters added to their journey by routing through this venue
+instead of going straight from the previous stop to the next one.
+
+  • detourM is THE proximity signal here — not the "distanceM" field
+    (which is just distance from the old pin and may be misleading).
+  • Strongly prefer LOW detourM. A venue with a small detour that's
+    slightly lower-rated beats a darling that forces a long backtrack.
+  • Treat detourM ≤ 400 m as "right on the way" (free to include),
+    400–1200 m as "a minor detour" (fine when on-intent and well-rated),
+    and > 2000 m as a zig-zag the user is trying to AVOID — only include
+    it when there is no reasonable lower-detour option on-intent.
+  • Order picks by a blend of low detour + quality, closest-on-the-route
+    first. Never surface an unrealistic cross-town option when nearby
+    on-route venues exist.`
+  : ''}
 
 A "reasonable" venue means rating ≥3.8 (or unrated) AND not visibly
 inappropriate for the intent (e.g. don't pick a bar for "lunch").
@@ -799,6 +929,7 @@ async function searchGoogle(
   limit: number,
   apiKey: string,
   openaiKey: string | undefined,
+  route?: { prev?: Coords; next?: Coords },
 ): Promise<{
   provider: 'google';
   places: UnifiedPlace[];
@@ -807,6 +938,9 @@ async function searchGoogle(
     candidatePoolSize: number;
     aiUsed: boolean;
     aiFailureReason?: string;
+    routeAware?: boolean;
+    biasCenter?: Coords;
+    searchRadiusM?: number;
   };
 }> {
   // Everyday-vs-destination drives composite weighting, the AI's
@@ -814,13 +948,39 @@ async function searchGoogle(
   // everywhere.
   const everyday = isEverydayIntent(intent, queries);
 
+  // Route context (place-swap browser): bias the candidate pool to the
+  // CORRIDOR between the previous and next stops, not the old pin. This
+  // is what keeps a swap from surfacing cross-town venues that would
+  // make the day zig-zag. `distRef` stays the old venue so the distance
+  // shown in the UI still reads as "distance from the spot you replaced".
+  const current: Coords = { latitude: lat, longitude: lon };
+  const prev = route?.prev;
+  const next = route?.next;
+  const routeAware = !!(prev || next);
+
+  let biasCenter: Coords = current;
+  let searchRadius = radiusM;
+  if (prev && next) {
+    biasCenter = midpoint(prev, next);
+    // Widen just enough to cover both ends of the corridor plus a buffer
+    // so good on-route venues near either stop stay in the pool.
+    searchRadius = clampRadius(Math.max(radiusM, distM(prev, next) / 2 + 1200));
+  } else if (prev) {
+    biasCenter = midpoint(prev, current);
+    searchRadius = clampRadius(Math.max(radiusM, distM(prev, current) / 2 + 1200));
+  } else if (next) {
+    biasCenter = midpoint(next, current);
+    searchRadius = clampRadius(Math.max(radiusM, distM(next, current) / 2 + 1200));
+  }
+
   const { candidates, perQueryCounts } = await searchGoogleFanOut(
     queries,
-    lat,
-    lon,
-    radiusM,
+    biasCenter,
+    current,
+    searchRadius,
     apiKey,
     everyday,
+    routeAware ? { prev, next } : undefined,
   );
 
   if (candidates.length === 0) {
@@ -846,7 +1006,15 @@ async function searchGoogle(
   }
 
   // With OpenAI → ask the model to pick + reason.
-  const llm = await analyzeWithLLM(intent, queries, candidates, limit, openaiKey, everyday);
+  const llm = await analyzeWithLLM(
+    intent,
+    queries,
+    candidates,
+    limit,
+    openaiKey,
+    everyday,
+    routeAware,
+  );
   if (llm.picks.length === 0) {
     return {
       provider: 'google',
@@ -895,30 +1063,55 @@ async function searchGoogle(
   // up to 7.5 km — those are exactly the "yes I'll commute for this"
   // options the user wants to see surfaced.
 
-  const everydayProxLimit = everyday ? 2500 : 5000;
+  // The axis the safety net reasons about. With route context it's the
+  // DETOUR (extra meters added to the path); otherwise raw distance from
+  // the venue. detourById lets us look the value back up for AI picks,
+  // which have been stripped of scoring fields.
+  const detourById = new Map(candidates.map((c) => [c.id, c.detourM]));
+  const proximityOf = (id: string, distanceM: number): number => {
+    if (routeAware) {
+      const d = detourById.get(id);
+      if (d != null) return d;
+    }
+    return distanceM;
+  };
+
+  // Thresholds: detour bites sooner than absolute distance — a 1.5 km
+  // backtrack for an everyday stop is already a real zig-zag.
+  const proxLimit = routeAware
+    ? everyday
+      ? 1500
+      : 3000
+    : everyday
+    ? 2500
+    : 5000;
+  const dropLimit = routeAware ? (everyday ? 2200 : 4000) : 3000;
+
   const closePool = candidates.filter(
     (c) =>
-      c.distanceM <= everydayProxLimit &&
+      proximityOf(c.id, c.distanceM) <= proxLimit &&
       (c.rating === null || c.rating >= 4.0) &&
       c.openNow !== false,
   );
-  // Well-validated far pool — only used for non-everyday intents.
-  // These are venues the user would genuinely consider despite
-  // distance: high rating AND meaningful review count.
-  const wellValidatedFarPool = everyday
+  // Well-validated far pool — only used for non-everyday intents WITHOUT
+  // route context. When we have a corridor, surfacing a far-detour venue
+  // contradicts the whole point (anti-zig-zag), so we skip it.
+  const wellValidatedFarPool = everyday || routeAware
     ? []
     : candidates.filter(
         (c) =>
-          c.distanceM > everydayProxLimit &&
+          c.distanceM > proxLimit &&
           c.distanceM <= 7500 &&
           (c.rating ?? 0) >= 4.5 &&
           (c.ratingCount ?? 0) >= 200 &&
           c.openNow !== false,
       );
 
-  if (everyday && closePool.length > 0) {
-    // Drop AI picks beyond 3 km when close alternatives exist.
-    picked = picked.filter((p) => p.distanceM <= 3000);
+  // Drop AI picks that backtrack too far when on-route/close alternatives
+  // exist. For route-aware swaps this applies to BOTH intent types — a
+  // zig-zag is undesirable whether it's a café or a gym.
+  if (closePool.length > 0 && (everyday || routeAware)) {
+    picked = picked.filter((p) => proximityOf(p.id, p.distanceM) <= dropLimit);
   }
 
   // Top up from the close pool when AI under-included. For non-
@@ -962,12 +1155,15 @@ async function searchGoogle(
       perQueryCounts,
       candidatePoolSize: candidates.length,
       aiUsed: true,
+      routeAware,
+      biasCenter,
+      searchRadiusM: searchRadius,
     },
   };
 }
 
 function stripScoringFields(c: ScoredCandidate): UnifiedPlace {
-  const { bestPosition, matchCount, compositeScore, matchedQueries, ...rest } = c;
+  const { bestPosition, matchCount, compositeScore, matchedQueries, detourM, ...rest } = c;
   return rest;
 }
 
@@ -1262,6 +1458,10 @@ Deno.serve(async (req: Request) => {
     longitude?: number;
     radiusM?: number;
     limit?: number;
+    /** Previous located stop (place-swap browser) — anchors the corridor. */
+    prev?: { latitude?: number; longitude?: number } | null;
+    /** Next located stop (place-swap browser) — anchors the corridor. */
+    next?: { latitude?: number; longitude?: number } | null;
   };
   try {
     payload = await req.json();
@@ -1318,8 +1518,39 @@ Deno.serve(async (req: Request) => {
   );
   const limit = Math.min(20, Math.max(1, Number(payload.limit) || 6));
 
+  // Optional route context from the place-swap browser. Both stops are
+  // validated independently — a single bad coord just disables that side
+  // of the corridor rather than failing the whole request.
+  const parseCoords = (
+    c: { latitude?: number; longitude?: number } | null | undefined,
+  ): Coords | undefined => {
+    if (!c) return undefined;
+    const la = Number(c.latitude);
+    const lo = Number(c.longitude);
+    if (
+      !Number.isFinite(la) ||
+      !Number.isFinite(lo) ||
+      la < -90 ||
+      la > 90 ||
+      lo < -180 ||
+      lo > 180
+    ) {
+      return undefined;
+    }
+    return { latitude: la, longitude: lo };
+  };
+  const prevCoords = parseCoords(payload.prev);
+  const nextCoords = parseCoords(payload.next);
+
+  const routeKeyPart =
+    prevCoords || nextCoords
+      ? `|route=${prevCoords ? `${Math.round(prevCoords.latitude * 1000) / 1000},${Math.round(prevCoords.longitude * 1000) / 1000}` : '-'}>${nextCoords ? `${Math.round(nextCoords.latitude * 1000) / 1000},${Math.round(nextCoords.longitude * 1000) / 1000}` : '-'}`
+      : '';
+
   const cacheKey = serverCacheKey(
-    queries.join('|') + (intent && intent !== queries[0] ? `::${intent}` : ''),
+    queries.join('|') +
+      (intent && intent !== queries[0] ? `::${intent}` : '') +
+      routeKeyPart,
     lat,
     lon,
     radiusM,
@@ -1372,6 +1603,9 @@ Deno.serve(async (req: Request) => {
         limit,
         googleKey,
         openaiKey,
+        prevCoords || nextCoords
+          ? { prev: prevCoords, next: nextCoords }
+          : undefined,
       );
     } else if (fsqKey && category) {
       result = await searchFoursquare(
