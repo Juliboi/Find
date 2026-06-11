@@ -20,7 +20,7 @@ export interface SchedulerContext {
    */
   work?: LocationPin | null;
   endOfDay?: LocationPin | null;
-  currentLocation?: { latitude: number; longitude: number } | null;
+  currentLocation?: { latitude: number; longitude: number; label?: string | null } | null;
 
   // ----- Profile-derived personalisation (optional; planner-only) -----
   /** The user's name, so the planner can address them in the summary. */

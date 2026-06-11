@@ -142,7 +142,15 @@ export default function SettingsScreen() {
     .charAt(0)
     .toUpperCase();
 
+  // Jump straight to the matching onboarding step to edit a single preference;
+  // onboarding runs in "edit" mode and returns here on Save/Cancel.
+  const editPref = (key: 'rhythm' | 'car' | 'diet') => {
+    Haptics.selectionAsync().catch(() => undefined);
+    router.push({ pathname: '/onboarding', params: { edit: key } });
+  };
+
   const confirmSignOut = () => {
+    Haptics.selectionAsync().catch(() => undefined);
     Alert.alert('Sign out?', 'You can sign back in anytime.', [
       { text: 'Cancel', style: 'cancel' },
       {
@@ -237,6 +245,7 @@ export default function SettingsScreen() {
             iconColor={t.colors.warning}
             title="Wake up"
             subtitle="Seeds your default day start"
+            onPress={() => editPref('rhythm')}
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {wakeTime ? formatTime(wakeTime) : 'Not set'}
@@ -248,6 +257,7 @@ export default function SettingsScreen() {
             iconBg={t.colors.fill1}
             title="Bed time"
             subtitle="When you want to wind down"
+            onPress={() => editPref('rhythm')}
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {bedTime ? formatTime(bedTime) : 'Not set'}
@@ -264,6 +274,7 @@ export default function SettingsScreen() {
                 ? 'Driven only when it helps — toggle per day'
                 : 'Walking and transit between stops'
             }
+            onPress={() => editPref('car')}
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {hasCar ? 'Has a car' : 'No car'}
@@ -276,6 +287,7 @@ export default function SettingsScreen() {
             iconColor={t.colors.success}
             title="Dietary"
             subtitle="Filters food and drink stops"
+            onPress={() => editPref('diet')}
             trailing={
               <Text
                 variant="body"
@@ -339,14 +351,20 @@ export default function SettingsScreen() {
             iconColor={t.colors.accentText}
             title="Home"
             subtitle={home ? home.label : 'Set your home base'}
-            onPress={() => setAnchorSlot('home')}
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              setAnchorSlot('home');
+            }}
           />
           <Row
             icon="briefcase-outline"
             iconBg={t.colors.fill1}
             title="Work"
             subtitle={work ? work.label : 'Optional — for office plans'}
-            onPress={() => setAnchorSlot('work')}
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              setAnchorSlot('work');
+            }}
           />
         </Card>
 
@@ -368,7 +386,7 @@ export default function SettingsScreen() {
       <Sheet
         open={anchorSlot !== null}
         onClose={() => setAnchorSlot(null)}
-        heightFraction={0.82}
+        heightFraction={0.99}
         enableContentPanningGesture={false}
       >
         <BottomSheetScrollView

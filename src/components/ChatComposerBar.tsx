@@ -29,6 +29,12 @@ interface Props {
    * Fires only from the resting (unfocused) state.
    */
   onPlus: () => void;
+  /**
+   * Fired when the user sends non-empty text (taps the morphed "send" button or
+   * hits return). The field clears itself afterwards. Used to capture a quick
+   * errand/reminder. When omitted, "send" just dismisses the keyboard.
+   */
+  onSubmit?: (text: string) => void;
   placeholder?: string;
   /** Hide the bar entirely (useful for modal sub-screens). */
   hidden?: boolean;
@@ -55,6 +61,7 @@ const TIMING = { duration: 240, easing: Easing.out(Easing.cubic) };
  */
 export function ChatComposerBar({
   onPlus,
+  onSubmit,
   placeholder = 'Ask anything',
   hidden,
   style,
@@ -143,11 +150,25 @@ export function ChatComposerBar({
 
   if (hidden) return null;
 
+  const submit = () => {
+    const clean = text.trim();
+    if (!clean) {
+      Keyboard.dismiss();
+      return;
+    }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
+      () => undefined,
+    );
+    onSubmit?.(clean);
+    setText('');
+    Keyboard.dismiss();
+  };
+
   const onButtonPress = () => {
     if (focused) {
-      // The field is inert for now — "send" simply dismisses the keyboard,
-      // which returns the button to its resting "+" state.
-      Keyboard.dismiss();
+      // "Send": capture the typed text as an errand (or, with no handler / no
+      // text, just dismiss the keyboard, returning the button to its "+" rest).
+      submit();
       return;
     }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
@@ -194,8 +215,10 @@ export function ChatComposerBar({
                 setFocused(false);
                 animateTo(0);
               }}
+              onSubmitEditing={submit}
+              blurOnSubmit={false}
               style={[styles.input, { color: t.colors.textPrimary }]}
-              returnKeyType="default"
+              returnKeyType="send"
             />
             <Animated.View style={spacerStyle} />
           </GlassSurface>

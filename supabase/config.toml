@@ -6,6 +6,9 @@ verify_jwt = false
 [functions.find-places]
 verify_jwt = false
 
+[functions.search-places]
+verify_jwt = false
+
 [functions.compose-day]
 verify_jwt = false
 
@@ -16,4 +19,10 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.adjust-itinerary]
+verify_jwt = false
+
+[functions.parse-errand]
+verify_jwt = false
+
+[functions.weather]
 verify_jwt = false

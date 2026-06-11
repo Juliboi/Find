@@ -42,6 +42,8 @@ function minToHHMM(min: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+const DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
 /** 0 = Sunday … 6 = Saturday for a "YYYY-MM-DD" date (UTC to avoid TZ drift). */
 function weekdayOf(dateISO?: string | null): number | null {
   if (!dateISO) return null;
@@ -137,6 +139,46 @@ function visitFitsHours(
 }
 
 /**
+ * For a venue that's CLOSED at the visit time, finds the next moment it opens
+ * and formats it like Google Maps — "Opens 8:00 AM" when that's later the same
+ * day, "Opens 8:00 AM Thu" when it's a following day. Returns null when no
+ * opening lies ahead in the week (or hours/time data is missing).
+ */
+function nextOpenLabel(
+  hours: VenueOpeningHours | null | undefined,
+  dateISO: string | null | undefined,
+  startHHMM: string | null | undefined,
+): string | null {
+  if (!hours || !Array.isArray(hours.periods) || hours.periods.length === 0) return null;
+  const wd = weekdayOf(dateISO);
+  const startMin = hhmmToMin(startHHMM);
+  if (wd == null || startMin == null) return null;
+  const s = wd * 1440 + startMin;
+
+  const opens: number[] = [];
+  for (const p of hours.periods) {
+    const iv = periodToInterval(p);
+    if (iv) opens.push(iv.open);
+  }
+  if (opens.length === 0) return null;
+
+  // Smallest opening strictly after the visit start, wrapping once past the
+  // week boundary so a Sunday-morning reopen still wins on a Saturday night.
+  let best: number | null = null;
+  for (const off of [0, WEEK_MIN]) {
+    for (const o of opens) {
+      const oo = o + off;
+      if (oo > s && (best == null || oo < best)) best = oo;
+    }
+  }
+  if (best == null) return null;
+
+  const dow = Math.floor((best % WEEK_MIN) / 1440);
+  const time = formatTime(minToHHMM(best % 1440));
+  return dow === wd ? `Opens ${time}` : `Opens ${time} ${DAY_SHORT[dow]}`;
+}
+
+/**
  * Evaluates a place's hours against the item's scheduled visit window and
  * returns display-ready status + warning copy. `status: 'unknown'` (and no
  * warning) when the place has no hours data, so unknown venues are never
@@ -148,15 +190,31 @@ export function getVenueHoursStatus(
   startHHMM: string | undefined,
   endHHMM: string | undefined,
 ): VenueHoursStatus {
-  const fit = visitFitsHours(place?.openingHours, dateISO, startHHMM, endHHMM);
+  return getOpeningHoursStatus(place?.openingHours, dateISO, startHHMM, endHHMM);
+}
+
+/**
+ * Same as {@link getVenueHoursStatus} but takes the opening hours directly,
+ * so non-itinerary callers (e.g. the errand place card) can reuse the exact
+ * same open/closed + close-time logic without an `ItineraryPlace`.
+ */
+export function getOpeningHoursStatus(
+  openingHours: VenueOpeningHours | null | undefined,
+  dateISO: string | undefined,
+  startHHMM: string | undefined,
+  endHHMM: string | undefined,
+): VenueHoursStatus {
+  const fit = visitFitsHours(openingHours, dateISO, startHHMM, endHHMM);
   const closeLabel = fit.closeHHMM ? formatTime(fit.closeHHMM) : undefined;
 
   if (fit.status === 'open') {
+    // No close time on an "open" fit means the venue is open 24 hours — say so
+    // (like Google Maps) rather than a bare "Open".
     return {
       status: 'open',
       fits: true,
       closeHHMM: fit.closeHHMM,
-      statusLabel: closeLabel ? `Open · Closes ${closeLabel}` : 'Open',
+      statusLabel: closeLabel ? `Open · Closes ${closeLabel}` : 'Open 24 hours',
     };
   }
   if (fit.status === 'closingSoon') {
@@ -164,17 +222,18 @@ export function getVenueHoursStatus(
       status: 'closingSoon',
       fits: false,
       closeHHMM: fit.closeHHMM,
-      statusLabel: closeLabel ? `Closes ${closeLabel}` : 'Closes soon',
+      statusLabel: closeLabel ? `Closing soon · ${closeLabel}` : 'Closing soon',
       warning: closeLabel
         ? `Closes ${closeLabel} — before your visit ends. Consider changing.`
         : 'Closes during your visit. Consider changing.',
     };
   }
   if (fit.status === 'closed') {
+    const reopen = nextOpenLabel(openingHours, dateISO, startHHMM);
     return {
       status: 'closed',
       fits: false,
-      statusLabel: 'Closed at this time',
+      statusLabel: reopen ? `Closed · ${reopen}` : 'Closed at this time',
       warning: 'Closed at this time. Consider changing.',
     };
   }

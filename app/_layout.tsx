@@ -1,20 +1,21 @@
 import React, { useEffect } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import { StyleSheet } from 'react-native';
 import {
   Stack,
+  useGlobalSearchParams,
   useRootNavigationState,
   useRouter,
   useSegments,
 } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
-import { Ionicons } from '@expo/vector-icons';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import Animated, { FadeOut } from 'react-native-reanimated';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from '@/components/Text';
+import { WaveLoader } from '@/components/WaveLoader';
 import { useAuthStore } from '@/store/useAuthStore';
 
 // Hold the native splash until React has painted our themed splash overlay, so
@@ -32,6 +33,7 @@ void SplashScreen.preventAutoHideAsync();
  */
 function useAuthGate(): boolean {
   const segments = useSegments();
+  const params = useGlobalSearchParams<{ edit?: string }>();
   const router = useRouter();
   const navState = useRootNavigationState();
   const status = useAuthStore((s) => s.status);
@@ -49,6 +51,10 @@ function useAuthGate(): boolean {
   const seg0 = segments[0];
   const inAuth = seg0 === 'auth';
   const inOnboarding = seg0 === 'onboarding';
+  // Settings opens onboarding with `?edit=<key>` to tweak a single preference
+  // after onboarding is done — keep the gate from bouncing that back to home.
+  const editingPrefs =
+    inOnboarding && typeof params.edit === 'string' && params.edit.length > 0;
 
   const target: '/auth' | '/onboarding' | '/' | null = !ready
     ? null
@@ -60,7 +66,7 @@ function useAuthGate(): boolean {
         ? inOnboarding
           ? null
           : '/onboarding'
-        : inAuth || inOnboarding
+        : inAuth || (inOnboarding && !editingPrefs)
           ? '/'
           : null;
 
@@ -79,13 +85,10 @@ function Splash() {
       style={[styles.splash, { backgroundColor: t.colors.background }]}
       pointerEvents="auto"
     >
-      <View style={[styles.splashLogo, { backgroundColor: t.colors.accentSoft }]}>
-        <Ionicons name="sunny" size={40} color={t.colors.accentText} />
-      </View>
-      <Text variant="title2" weight="heavy" tight>
-        DayFlow
+      <WaveLoader width={236} height={128} />
+      <Text variant="title2" weight="heavy" tight style={styles.splashTitle}>
+        Diem
       </Text>
-      <ActivityIndicator color={t.colors.accent} style={{ marginTop: 12 }} />
     </Animated.View>
   );
 }
@@ -138,6 +141,7 @@ export default function RootLayout() {
               }}
             />
             <Stack.Screen name="itinerary" />
+            <Stack.Screen name="day-plans" />
           </Stack>
           {!settled ? <Splash /> : null}
         </BottomSheetModalProvider>
@@ -151,14 +155,8 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 12,
   },
-  splashLogo: {
-    width: 92,
-    height: 92,
-    borderRadius: 28,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 4,
+  splashTitle: {
+    marginTop: -8,
   },
 });

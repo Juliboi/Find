@@ -123,7 +123,10 @@ export default function AddPlanScreen() {
               </Text>
               {draft.length > 0 ? (
                 <Pressable
-                  onPress={clearDraft}
+                  onPress={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    clearDraft();
+                  }}
                   hitSlop={8}
                   style={({ pressed }) => [
                     styles.clearRow,
@@ -167,7 +170,10 @@ export default function AddPlanScreen() {
               />
               <Pressable
                 hitSlop={8}
-                onPress={() => removeDraft(index)}
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  removeDraft(index);
+                }}
                 style={({ pressed }) => [
                   styles.rowRemove,
                   { backgroundColor: t.colors.fill1 },
@@ -194,7 +200,14 @@ export default function AddPlanScreen() {
               </Text>
               <View style={styles.suggestionsRow}>
                 {EXAMPLE_PROMPTS.map((p) => (
-                  <Chip key={p} label={p} onPress={() => addDraft(p)} />
+                  <Chip
+                    key={p}
+                    label={p}
+                    onPress={() => {
+                      Haptics.selectionAsync().catch(() => undefined);
+                      addDraft(p);
+                    }}
+                  />
                 ))}
               </View>
             </View>

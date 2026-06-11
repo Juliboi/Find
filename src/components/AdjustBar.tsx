@@ -14,6 +14,7 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from './Text';
 
@@ -52,6 +53,9 @@ export function AdjustBar({ visible, busy, bottomInset, onSubmit }: Props) {
   const submit = () => {
     const v = text.trim();
     if (!v || busy) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(
+      () => undefined,
+    );
     setText('');
     Keyboard.dismiss();
     onSubmit(v);

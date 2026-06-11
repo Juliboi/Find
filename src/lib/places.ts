@@ -72,6 +72,34 @@ export async function getCurrentCoords(): Promise<Coords | null> {
   }
 }
 
+/**
+ * Like `getCurrentCoords`, but never shows the OS permission prompt: it only
+ * returns a fix when permission was *already* granted (e.g. via the place
+ * picker). Used by passive features such as the weather widget that shouldn't
+ * pop a permission dialog the moment the home screen loads. Returns null when
+ * permission hasn't been granted yet or the fix fails.
+ */
+export async function getCurrentCoordsIfPermitted(): Promise<Coords | null> {
+  if (cachedCoords && Date.now() - cachedCoords.at < COORDS_CACHE_MS) {
+    return cachedCoords.coords;
+  }
+  try {
+    const { granted } = await Location.getForegroundPermissionsAsync();
+    if (!granted) return null;
+    const pos = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.Balanced,
+    });
+    const coords: Coords = {
+      latitude: pos.coords.latitude,
+      longitude: pos.coords.longitude,
+    };
+    cachedCoords = { coords, at: Date.now() };
+    return coords;
+  } catch {
+    return null;
+  }
+}
+
 const PLACE_LOOKUP_PATTERNS = [
   /\bfind\b.*\bnearby\b/i,
   /\bfind\b.*\bnew one\b/i,

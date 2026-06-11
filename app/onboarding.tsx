@@ -4,6 +4,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import DateTimePicker, {
   type DateTimePickerEvent,
 } from '@react-native-community/datetimepicker';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
@@ -18,6 +19,19 @@ import { useProfileStore } from '@/store/useProfileStore';
 import { formatTime } from '@/utils/time';
 
 const STEP_COUNT = 5;
+
+/**
+ * Maps a settings "edit" deep-link to the onboarding step that owns that
+ * preference, so Settings can drop the user straight onto the same screen they
+ * filled out during onboarding to tweak a single answer.
+ */
+const EDIT_STEPS: Record<string, number> = {
+  name: 0,
+  home: 1,
+  rhythm: 2,
+  car: 3,
+  diet: 4,
+};
 
 /** Dietary tags offered as chips in onboarding (kept short + recognisable). */
 const DIET_OPTIONS = [
@@ -55,6 +69,7 @@ function toHHMM(d: Date): string {
 export default function OnboardingScreen() {
   const t = useTheme();
   const insets = useSafeAreaInsets();
+  const router = useRouter();
 
   const home = useHomeStore((s) => s.home);
   const saveOnboarding = useAuthStore((s) => s.saveOnboarding);
@@ -62,6 +77,18 @@ export default function OnboardingScreen() {
   const storedName = useProfileStore((s) => s.fullName);
   const storedWake = useProfileStore((s) => s.wakeTime);
   const storedBed = useProfileStore((s) => s.bedTime);
+  const storedHasCar = useProfileStore((s) => s.hasCar);
+  const storedDietary = useProfileStore((s) => s.dietary);
+  const storedDietaryNotes = useProfileStore((s) => s.dietaryNotes);
+
+  // When launched from Settings with `?edit=<key>`, we open on that single
+  // step in "edit one preference" mode: jump to its step, seed the existing
+  // answers, and swap the wizard footer for Cancel / Save instead of advancing
+  // through the rest of onboarding.
+  const params = useLocalSearchParams<{ edit?: string }>();
+  const editKey = typeof params.edit === 'string' ? params.edit : null;
+  const editStep = editKey != null ? EDIT_STEPS[editKey] : undefined;
+  const editing = editStep != null;
 
   const initialName =
     storedName ??
@@ -69,13 +96,21 @@ export default function OnboardingScreen() {
       ? (user.user_metadata.full_name as string)
       : '');
 
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState(editStep ?? 0);
   const [name, setName] = useState(initialName ?? '');
   const [wake, setWake] = useState<Date>(() => hhmmToTime(storedWake, 7));
   const [bed, setBed] = useState<Date>(() => hhmmToTime(storedBed, 23));
-  const [hasCar, setHasCar] = useState<boolean | null>(null);
-  const [dietary, setDietary] = useState<string[]>([]);
-  const [dietaryNotes, setDietaryNotes] = useState('');
+  // Seed the choice steps from the saved profile when editing so the current
+  // answer shows as selected; first-run keeps them unset to force a choice.
+  const [hasCar, setHasCar] = useState<boolean | null>(
+    editing ? storedHasCar : null,
+  );
+  const [dietary, setDietary] = useState<string[]>(
+    editing ? storedDietary : [],
+  );
+  const [dietaryNotes, setDietaryNotes] = useState(
+    editing ? (storedDietaryNotes ?? '') : '',
+  );
   const [androidPicker, setAndroidPicker] = useState<'wake' | 'bed' | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -111,7 +146,8 @@ export default function OnboardingScreen() {
     setStep((s) => Math.max(0, s - 1));
   };
 
-  const finish = async () => {
+  /** Upsert the whole profile from the current answers. Returns success. */
+  const persist = async (): Promise<boolean> => {
     setError(null);
     setSaving(true);
     try {
@@ -129,16 +165,36 @@ export default function OnboardingScreen() {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
         () => undefined,
       );
-      // The auth gate sees needsOnboarding flip to false and routes to home.
+      return true;
     } catch (err) {
       setError(
         err instanceof Error
           ? err.message
           : 'Could not save your profile. Please try again.',
       );
+      return false;
     } finally {
       setSaving(false);
     }
+  };
+
+  // First-run: the auth gate sees needsOnboarding flip to false and routes home.
+  const finish = () => {
+    void persist();
+  };
+
+  // Editing a single preference from Settings: save, then return to Settings
+  // rather than walking the rest of the onboarding wizard.
+  const saveEdit = async () => {
+    if (!canContinue) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    const ok = await persist();
+    if (ok) router.back();
+  };
+
+  const cancelEdit = () => {
+    Haptics.selectionAsync().catch(() => undefined);
+    router.back();
   };
 
   const onWakeChange = (_: DateTimePickerEvent, picked?: Date) => {
@@ -156,23 +212,47 @@ export default function OnboardingScreen() {
       edges={['top', 'bottom']}
     >
       <View style={[styles.header, { paddingHorizontal: t.spacing.xl }]}>
-        <View style={styles.progressRow}>
-          {Array.from({ length: STEP_COUNT }).map((_, i) => (
-            <View
-              key={i}
-              style={[
-                styles.progressSeg,
-                {
-                  backgroundColor:
-                    i <= step ? t.colors.accent : t.colors.fill2,
-                },
+        {editing ? (
+          <View style={styles.editHeader}>
+            <Pressable
+              onPress={cancelEdit}
+              hitSlop={10}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel"
+              style={({ pressed }) => [
+                styles.editClose,
+                { backgroundColor: t.colors.fill1 },
+                pressed && { opacity: 0.7 },
               ]}
-            />
-          ))}
-        </View>
-        <Text variant="micro" tone="tertiary" uppercase weight="bold">
-          Step {step + 1} of {STEP_COUNT}
-        </Text>
+            >
+              <Ionicons name="close" size={20} color={t.colors.textPrimary} />
+            </Pressable>
+            <Text variant="micro" tone="tertiary" uppercase weight="bold">
+              Edit preference
+            </Text>
+            <View style={styles.editClose} />
+          </View>
+        ) : (
+          <>
+            <View style={styles.progressRow}>
+              {Array.from({ length: STEP_COUNT }).map((_, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.progressSeg,
+                    {
+                      backgroundColor:
+                        i <= step ? t.colors.accent : t.colors.fill2,
+                    },
+                  ]}
+                />
+              ))}
+            </View>
+            <Text variant="micro" tone="tertiary" uppercase weight="bold">
+              Step {step + 1} of {STEP_COUNT}
+            </Text>
+          </>
+        )}
       </View>
 
       <ScrollView
@@ -223,8 +303,8 @@ export default function OnboardingScreen() {
             autoCapitalize="words"
             autoComplete="name"
             autoCorrect={false}
-            returnKeyType="next"
-            onSubmitEditing={goNext}
+            returnKeyType={editing ? 'done' : 'next'}
+            onSubmitEditing={editing ? () => void saveEdit() : goNext}
           />
         ) : null}
 
@@ -334,19 +414,41 @@ export default function OnboardingScreen() {
           },
         ]}
       >
-        {step > 0 ? (
-          <Button title="Back" variant="ghost" size="lg" onPress={goBack} />
+        {editing ? (
+          <>
+            <Button
+              title="Cancel"
+              variant="ghost"
+              size="lg"
+              onPress={cancelEdit}
+              disabled={saving}
+            />
+            <Button
+              title="Save"
+              size="lg"
+              onPress={saveEdit}
+              disabled={!canContinue || saving}
+              loading={saving}
+              style={styles.footerCta}
+            />
+          </>
         ) : (
-          <View style={{ flex: 1 }} />
+          <>
+            {step > 0 ? (
+              <Button title="Back" variant="ghost" size="lg" onPress={goBack} />
+            ) : (
+              <View style={{ flex: 1 }} />
+            )}
+            <Button
+              title={step === STEP_COUNT - 1 ? 'Finish' : 'Continue'}
+              size="lg"
+              onPress={goNext}
+              disabled={!canContinue || saving}
+              loading={saving}
+              style={styles.footerCta}
+            />
+          </>
         )}
-        <Button
-          title={step === STEP_COUNT - 1 ? 'Finish' : 'Continue'}
-          size="lg"
-          onPress={goNext}
-          disabled={!canContinue || saving}
-          loading={saving}
-          style={styles.footerCta}
-        />
       </View>
     </SafeAreaView>
   );
@@ -417,7 +519,10 @@ function TimeRow({
         />
       ) : (
         <Pressable
-          onPress={onAndroidPress}
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onAndroidPress();
+          }}
           style={[styles.timePill, { backgroundColor: t.colors.fill1 }]}
         >
           <Text variant="body" weight="bold" tone="accent">
@@ -507,7 +612,7 @@ function DietChip({
           backgroundColor: selected ? t.colors.accentSoft : t.colors.surface1,
           borderColor: selected ? t.colors.accent : t.colors.separator,
           borderWidth: selected ? 1.5 : StyleSheet.hairlineWidth,
-          borderRadius: t.radii.lg,
+          borderRadius: t.radii.pill,
         },
         pressed && { opacity: 0.85 },
       ]}
@@ -532,6 +637,18 @@ const styles = StyleSheet.create({
   progressRow: {
     flexDirection: 'row',
     gap: 6,
+  },
+  editHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  editClose: {
+    width: 32,
+    height: 32,
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   progressSeg: {
     flex: 1,
@@ -567,7 +684,7 @@ const styles = StyleSheet.create({
   timePill: {
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: 12,
+    borderRadius: 999,
   },
   choice: {
     flexDirection: 'row',

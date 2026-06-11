@@ -6,6 +6,8 @@ import { supabase } from '@/lib/supabase';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
+import { useErrandsStore } from '@/store/useErrandsStore';
+import { useSavedItineraries } from '@/store/useSavedItineraries';
 import {
   normalizeTime,
   type OnboardingInput,
@@ -69,6 +71,23 @@ function applyProfileToStores(row: ProfileRow) {
   if (wake) usePlanSetupStore.getState().setDayStartTime(wake);
 }
 
+/**
+ * Kick off the local-first cloud sync for a signed-in user: pull their errands
+ * and saved itineraries from Supabase and reconcile with the local cache. Fire-
+ * and-forget — the stores update themselves when the network settles, and stay
+ * fully usable in the meantime.
+ */
+function syncUserData(userId: string) {
+  void useErrandsStore.getState().syncFromRemote(userId);
+  void useSavedItineraries.getState().syncFromRemote(userId);
+}
+
+/** Wipe synced caches on sign-out so the next user never sees the last one's data. */
+function clearUserData() {
+  useErrandsStore.getState().reset();
+  useSavedItineraries.getState().reset();
+}
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   status: 'loading',
   session: null,
@@ -104,6 +123,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         status: 'signedIn',
       });
       await get().fetchProfile();
+      syncUserData(data.session.user.id);
     } else {
       set({ status: 'signedOut', profileLoaded: true });
     }
@@ -115,6 +135,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       if (!session) {
         useProfileStore.getState().reset();
         useHomeStore.getState().clearHome();
+        clearUserData();
         set({
           session: null,
           user: null,
@@ -137,6 +158,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       setTimeout(() => {
         void get().fetchProfile();
       }, 0);
+      // Pull this user's cloud data on a real sign-in / account switch. Skip
+      // same-user token refreshes (which also fire here) — they'd re-pull on a
+      // timer for no benefit; the store is already reconciled for this session.
+      if (!sameUser) syncUserData(session.user.id);
     });
   },
 
@@ -255,6 +280,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (supabase) await supabase.auth.signOut().catch(() => undefined);
     useProfileStore.getState().reset();
     useHomeStore.getState().clearHome();
+    clearUserData();
     set({
       session: null,
       user: null,

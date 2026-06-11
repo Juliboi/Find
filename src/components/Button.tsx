@@ -95,7 +95,7 @@ export function Button({
         {
           height: dims.height,
           paddingHorizontal: dims.padding,
-          borderRadius: radii.md,
+          borderRadius: radii.pill,
           backgroundColor: bg,
           borderColor,
           borderWidth,

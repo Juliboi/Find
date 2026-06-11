@@ -27,7 +27,7 @@ export interface Context {
   home?: LocationPin;
   work?: LocationPin;
   endOfDay?: LocationPin;
-  currentLocation?: { latitude: number; longitude: number };
+  currentLocation?: { latitude: number; longitude: number; label?: string };
 }
 
 export function haversineMeters(a: Coords, b: Coords): number {
@@ -404,6 +404,20 @@ async function computeRoute(
           dbg.sink?.push(altLine);
         });
       }
+
+      // The FULL, unprocessed Google Routes payload for this leg — the literal
+      // "commute response" BEFORE any of our transforms (mode pick, earliest-
+      // arrival selection, span-minutes, and the UI's clock rebasing) touch it.
+      // This is what disambiguates "Google gave us a bad/odd route" from "Google
+      // was right and our display logic shifted the times". Heavy, so it only
+      // rides along when ROUTE_DEBUG is on and is dropped client-side after log.
+      try {
+        const rawLine = `[route-raw] ${dbg.label} (${mode}): ${JSON.stringify(data)}`;
+        console.log(rawLine);
+        dbg.sink?.push(rawLine);
+      } catch {
+        // non-serialisable payload — keep the concise trace, skip the raw dump
+      }
     }
 
     return {
@@ -680,9 +694,21 @@ export async function routeAndSchedule(
       departureMin?: number | null;
     }[] = [];
 
-    let prev: RouteNode | null = homeCoords
-      ? { item: null, coords: homeCoords, isHome: true }
+    // The day's chain starts wherever the user actually begins: the explicit
+    // start location they picked in the planner setup drawer if present, else
+    // home. Anchoring to `currentLocation` keeps the FIRST commute honest for a
+    // day that doesn't begin at home (a hotel, a friend's place, the office).
+    const startCoords: Coords | null = context.currentLocation
+      ? { latitude: context.currentLocation.latitude, longitude: context.currentLocation.longitude }
+      : homeCoords;
+    const startLabel = context.currentLocation
+      ? context.currentLocation.label
+      : context.home?.label;
+    const startIsHome = !context.currentLocation && !!homeCoords;
+    let prev: RouteNode | null = startCoords
+      ? { item: null, coords: startCoords, isHome: startIsHome }
       : null;
+    let isFirstHop = true;
     for (const node of seq) {
       if (prev && haversineMeters(prev.coords, node.coords) > 25) {
         // The client already cascaded provisional start times onto the day, so
@@ -697,9 +723,12 @@ export async function routeAndSchedule(
           item: node.item,
           origin: prev.coords,
           dest: node.coords,
-          fromLabel: prev.isHome ? context.home?.label : undefined,
+          // Label the first hop with the day's start (home or the picked start
+          // location); later hops carry no fromLabel (they read the prev stop).
+          fromLabel: isFirstHop ? startLabel : undefined,
           departureMin,
         });
+        isFirstHop = false;
       } else {
         // Same spot as the previous anchor: no travel between them.
         if (node.item) node.item.travelFromPrev = null;

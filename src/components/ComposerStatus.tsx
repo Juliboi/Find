@@ -8,6 +8,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useDayStore } from '@/store/useDayStore';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from './Text';
@@ -145,7 +146,10 @@ export function ComposerStatus({ onDismissSummary }: Props) {
           {stage === 'summary' && onDismissSummary ? (
             <Pressable
               hitSlop={10}
-              onPress={onDismissSummary}
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                onDismissSummary?.();
+              }}
               accessibilityLabel="Dismiss summary"
               style={({ pressed }) => [
                 styles.dismiss,

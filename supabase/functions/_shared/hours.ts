@@ -207,9 +207,49 @@ export function format12h(hhmm?: string | null): string {
   return `${h12}:${String(m).padStart(2, '0')} ${period}`;
 }
 
+const DAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/**
+ * For a venue CLOSED at the visit time, the next moment it opens, formatted
+ * like Google Maps — "Opens 8:00 AM" when later the same day, "Opens 8:00 AM
+ * Thu" on a following day. Null when no opening lies ahead in the week.
+ */
+export function nextOpenLabel(
+  hours: VenueOpeningHours | null | undefined,
+  dateISO: string | null | undefined,
+  startHHMM: string | null | undefined,
+): string | null {
+  if (!hours || !Array.isArray(hours.periods) || hours.periods.length === 0) return null;
+  const wd = weekdayOf(dateISO);
+  const startMin = hhmmToMin(startHHMM);
+  if (wd == null || startMin == null) return null;
+  const s = wd * 1440 + startMin;
+
+  const opens: number[] = [];
+  for (const p of hours.periods) {
+    const iv = periodToInterval(p);
+    if (iv) opens.push(iv.open);
+  }
+  if (opens.length === 0) return null;
+
+  let best: number | null = null;
+  for (const off of [0, WEEK_MIN]) {
+    for (const o of opens) {
+      const oo = o + off;
+      if (oo > s && (best == null || oo < best)) best = oo;
+    }
+  }
+  if (best == null) return null;
+
+  const dow = Math.floor((best % WEEK_MIN) / 1440);
+  const time = format12h(minToHHMM(best % 1440));
+  return dow === wd ? `Opens ${time}` : `Opens ${time} ${DAY_SHORT[dow]}`;
+}
+
 /**
  * Builds the short "open status" string we store on a place for display
- * fallbacks, computed against the scheduled visit window.
+ * fallbacks, computed against the scheduled visit window. Mirrors the client's
+ * `getOpeningHoursStatus` copy (24-hour venues, "Closing soon", next-open).
  */
 export function openStatusForVisit(
   hours: VenueOpeningHours | null | undefined,
@@ -219,8 +259,12 @@ export function openStatusForVisit(
 ): string | null {
   const fit = visitFitsHours(hours, dateISO, startHHMM, endHHMM);
   const close = fit.closeHHMM ? format12h(fit.closeHHMM) : '';
-  if (fit.status === 'open') return close ? `Open · Closes ${close}` : 'Open';
-  if (fit.status === 'closingSoon') return close ? `Closes ${close}` : 'Closes soon';
-  if (fit.status === 'closed') return 'Closed at this time';
+  // An "open" fit with no close time means open 24 hours.
+  if (fit.status === 'open') return close ? `Open · Closes ${close}` : 'Open 24 hours';
+  if (fit.status === 'closingSoon') return close ? `Closing soon · ${close}` : 'Closing soon';
+  if (fit.status === 'closed') {
+    const reopen = nextOpenLabel(hours, dateISO, startHHMM);
+    return reopen ? `Closed · ${reopen}` : 'Closed at this time';
+  }
   return null;
 }

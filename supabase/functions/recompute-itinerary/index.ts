@@ -59,7 +59,14 @@ function normalizeContext(input: any): Context {
     const lat = Number(input.currentLocation.latitude);
     const lon = Number(input.currentLocation.longitude);
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      ctx.currentLocation = { latitude: lat, longitude: lon };
+      ctx.currentLocation = {
+        latitude: lat,
+        longitude: lon,
+        label:
+          typeof input.currentLocation.label === 'string'
+            ? input.currentLocation.label
+            : undefined,
+      };
     }
   }
   return ctx;

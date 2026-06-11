@@ -21,18 +21,48 @@ export interface GradientPalette {
   sweep: string[];
   /** Three blob colours for the wandering, aurora-like highlights. */
   blobs: string[];
+  /** The orbiting "light" (sun/moon) — a contrasting accent for this time of
+   * day. Falls back to a lightened first blob if omitted. */
+  glow?: string;
 }
 
 /** The default Gemini sweep: blue → indigo → violet → magenta → amber. */
 const GEMINI_PALETTE: GradientPalette = {
   sweep: ['#1BA1E3', '#5489D6', '#9B72CB', '#D96570', '#F49C46'],
   blobs: ['#9B72CB', '#1BA1E3', '#F49C46'],
+  glow: '#FFC56B',
 };
+
+/** Mix a hex colour toward white by `amount` (0–1), to brighten a glow so it
+ * reads against the colour field. */
+function lighten(hex: string, amount: number): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  const mix = (c: number) => Math.round(c + (255 - c) * amount);
+  const to2 = (n: number) => mix(n).toString(16).padStart(2, '0');
+  return `#${to2(r)}${to2(g)}${to2(b)}`;
+}
+
+/**
+ * Shape of the soft "shadow" that melts the colour field into the page. A very
+ * large, soft ellipse centred far *below* the banner gives the bottom fade a
+ * gentle circular profile that bows up in the middle — so the colour field
+ * scoops up slightly in the centre and dips a touch deeper at the side edges,
+ * without any concentrated dark spot. All values are multiples of the banner's
+ * width/height. Keep the centre far down (large `CENTER_Y`) and the radii wide
+ * for a soft curve; pull them in to make the scoop more pronounced.
+ */
+const CURVE_CENTER_Y = 1.6; // ellipse centre, well below the bottom edge
+const CURVE_RX = 2.6; // horizontal radius (× width)
+const CURVE_RY = 1.2; // vertical radius (× height)
 
 /**
  * The base colour field — an oversized diagonal sweep that slowly slides and
- * rotates so the whole palette appears to flow. It's drawn once and only its
- * transform is animated, so the movement runs entirely on the UI thread.
+ * rotates so the whole palette drifts gently. It's drawn once and only its
+ * transform is animated, so the movement runs entirely on the UI thread. Calm
+ * and smooth by design — the life comes from this gentle drift plus the blobs.
  */
 function MovingSweep({
   width,
@@ -173,6 +203,71 @@ function FloatingBlob({
   );
 }
 
+/**
+ * A soft circle of light that orbits slowly behind the header. Its clear
+ * circular path makes the motion easy to read, while the soft falloff keeps the
+ * field smooth. Only the transform animates, so it runs on the UI thread.
+ */
+function MovingCircle({
+  width,
+  height,
+  color,
+}: {
+  width: number;
+  height: number;
+  color: string;
+}) {
+  const size = Math.max(width, height) * 0.55;
+  const cx = width / 2;
+  const cy = height * 0.26;
+  const orbitX = width * 0.3;
+  const orbitY = height * 0.18;
+
+  const angle = useSharedValue(0);
+  useEffect(() => {
+    angle.value = withRepeat(
+      withTiming(Math.PI * 2, { duration: 13000, easing: Easing.linear }),
+      -1,
+      false,
+    );
+  }, [angle]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: orbitX * Math.cos(angle.value) },
+      { translateY: orbitY * Math.sin(angle.value) },
+    ],
+  }));
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[
+        {
+          position: 'absolute',
+          left: cx - size / 2,
+          top: cy - size / 2,
+          width: size,
+          height: size,
+        },
+        animatedStyle,
+      ]}
+    >
+      <Svg width={size} height={size}>
+        <Defs>
+          <RadialGradient id="orbit" cx="50%" cy="50%" r="50%">
+            <Stop offset="0%" stopColor={color} stopOpacity={0.6} />
+            <Stop offset="45%" stopColor={color} stopOpacity={0.3} />
+            <Stop offset="75%" stopColor={color} stopOpacity={0.08} />
+            <Stop offset="100%" stopColor={color} stopOpacity={0} />
+          </RadialGradient>
+        </Defs>
+        <Rect x="0" y="0" width={size} height={size} fill="url(#orbit)" />
+      </Svg>
+    </Animated.View>
+  );
+}
+
 interface Props {
   /** Total height of the header banner. */
   height: number;
@@ -239,15 +334,35 @@ export function GradientWave({ height, palette = GEMINI_PALETTE, style }: Props)
         duration={13000}
       />
 
-      {/* Long, smooth fade down into the page background. */}
+      {/* The "light" of this time of day (sun/moon), orbiting slowly so the
+          motion is easy to see while staying smooth. */}
+      <MovingCircle
+        width={width}
+        height={height}
+        color={palette.glow ?? lighten(palette.blobs[0], 0.45)}
+      />
+
+      {/* Long, smooth fade down into the page background. A very wide, soft
+          elliptical shadow centred far below the banner bows up gently in the
+          middle, so the colour field ends along a soft curve (scooped up a
+          little in the centre, deeper at the sides) — a smooth melt, not a hard
+          shadow, and not a straight horizontal line. */}
       <Svg width={width} height={height} style={StyleSheet.absoluteFill}>
         <Defs>
-          <LinearGradient id="vFade" x1="0%" y1="0%" x2="0%" y2="100%">
-            <Stop offset="0%" stopColor={bg} stopOpacity={0} />
-            <Stop offset="45%" stopColor={bg} stopOpacity={0} />
-            <Stop offset="75%" stopColor={bg} stopOpacity={0.55} />
-            <Stop offset="100%" stopColor={bg} stopOpacity={1} />
-          </LinearGradient>
+          <RadialGradient
+            id="vFade"
+            cx={width / 2}
+            cy={height * CURVE_CENTER_Y}
+            rx={width * CURVE_RX}
+            ry={height * CURVE_RY}
+            gradientUnits="userSpaceOnUse"
+          >
+            <Stop offset="0%" stopColor={bg} stopOpacity={1} />
+            <Stop offset="56%" stopColor={bg} stopOpacity={1} />
+            <Stop offset="74%" stopColor={bg} stopOpacity={0.55} />
+            <Stop offset="88%" stopColor={bg} stopOpacity={0.22} />
+            <Stop offset="100%" stopColor={bg} stopOpacity={0} />
+          </RadialGradient>
         </Defs>
         <Rect x="0" y="0" width={width} height={height} fill="url(#vFade)" />
       </Svg>

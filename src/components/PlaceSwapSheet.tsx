@@ -9,6 +9,7 @@ import {
 import Animated, { FadeIn } from 'react-native-reanimated';
 import { BottomSheetScrollView, BottomSheetTextInput } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 import { Sheet } from './Sheet';
@@ -135,7 +136,14 @@ export function PlaceSwapSheet({
               {item?.title ?? ''}
             </Text>
           </View>
-          <Pressable onPress={onClose} hitSlop={10} style={styles.close}>
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onClose();
+            }}
+            hitSlop={10}
+            style={styles.close}
+          >
             <Ionicons name="close" size={20} color={t.colors.textSecondary} />
           </Pressable>
         </View>
@@ -152,7 +160,13 @@ export function PlaceSwapSheet({
             returnKeyType="search"
           />
           {query ? (
-            <Pressable onPress={() => runSearch(query)} hitSlop={8}>
+            <Pressable
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                runSearch(query);
+              }}
+              hitSlop={8}
+            >
               <Ionicons name="arrow-forward-circle" size={22} color={t.colors.accent} />
             </Pressable>
           ) : null}
@@ -191,7 +205,10 @@ export function PlaceSwapSheet({
               return (
               <Animated.View key={p.id} entering={FadeIn.delay(Math.min(i * 40, 240))}>
                 <Pressable
-                  onPress={() => onPick(toItineraryPlace(p, emoji))}
+                  onPress={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    onPick(toItineraryPlace(p, emoji));
+                  }}
                   style={({ pressed }) => [
                     styles.card,
                     { borderColor: t.colors.separator },

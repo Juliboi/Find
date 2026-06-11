@@ -397,8 +397,16 @@ function buildPlannerPrompt(args: {
   car?: CarContext;
   dietary?: string[];
   dietaryNotes?: string;
+  /**
+   * "HH:MM" current local time, set ONLY when the day being planned is the
+   * user's today (so the day is already in progress). When present, the
+   * planner plans the REMAINDER of the day from now instead of replaying the
+   * morning. Absent for future days, which plan wake-to-sleep as usual.
+   */
+  now?: string;
 }): string {
   const home = args.home;
+  const inProgress = !!args.now;
   const homeBlock = home
     ? `- Home: "${home.label}" at latitude ${home.latitude}, longitude ${home.longitude}.`
     : '- The user has not pinned a home location. Keep venue picks generic and assume the day happens close to wherever they start.';
@@ -408,8 +416,13 @@ function buildPlannerPrompt(args: {
   const nameLine = args.userName
     ? `- The user's name is ${args.userName}. You may address them warmly by name in the title/summary, but never force it.`
     : '';
-  const rhythmLine =
-    args.wakeTime || args.bedTime
+  // It is already partway through today, so the wake time is irrelevant — only
+  // the wind-down/bed anchor still matters for where the remaining day ends.
+  const rhythmLine = inProgress
+    ? args.bedTime
+      ? `- The user usually winds down around ${args.bedTime}; end the plan with a wind-down/bed anchor near then.`
+      : ''
+    : args.wakeTime || args.bedTime
       ? `- Daily rhythm: the user usually ${
           args.wakeTime ? `wakes around ${args.wakeTime}` : 'wakes in the morning'
         } and ${
@@ -418,6 +431,10 @@ function buildPlannerPrompt(args: {
           args.bedTime ?? 'their usual bedtime'
         }.`
       : '';
+  // When the day is already underway, anchor the whole plan to "now" up front.
+  const nowLine = args.now
+    ? `- RIGHT NOW it is ${args.now} on ${args.date}: the day being planned is TODAY and is already in progress.`
+    : '';
   const dietLine =
     args.dietary && args.dietary.length > 0
       ? `- Dietary profile: ${args.dietary.join(', ')}.${
@@ -453,6 +470,7 @@ function buildPlannerPrompt(args: {
   const contextLines = [
     homeBlock,
     `- Today is ${args.date}.`,
+    nowLine,
     nameLine,
     rhythmLine,
     carLine,
@@ -460,6 +478,14 @@ function buildPlannerPrompt(args: {
   ]
     .filter(Boolean)
     .join('\n');
+
+  // Requirement #2 (day coverage) has two shapes. A future day is planned
+  // wake-to-sleep; today is ALREADY underway, so we plan only the remainder
+  // from "now" and never replay the morning (the "still creates the whole day"
+  // bug). Both keep the same gap-vs-break discipline for open stretches.
+  const coverageRule = inProgress
+    ? `2. The day is ALREADY UNDERWAY — it is currently ${args.now}. Plan ONLY the remaining part of today, beginning at the user's stated start time above (which is at or after ${args.now}). The FIRST block must start then — NEVER schedule anything earlier than ${args.now}, and do NOT replay parts of the day that have already happened (waking up, getting ready, breakfast/lunch already eaten). Plan only what still lies ahead. Still flow continuously with no holes: emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place for any open stretch of 20+ minutes; reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry).`
+    : `2. Cover the WHOLE day continuously — never leave invisible holes in the clock. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. When the day has genuine breathing room (time to relax, recharge, or do whatever they feel like), emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place — give 20+ minutes of slack its own gap block rather than padding other activities. Reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry); use "gap" for open, unstructured time the user can later name or fill themselves.`;
 
   const transportRule =
     car && car.owns && car.useToday
@@ -483,7 +509,7 @@ ${args.userText}
 
 REQUIREMENTS
 1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
-2. Cover the WHOLE day continuously — never leave invisible holes in the clock. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. When the day has genuine breathing room (time to relax, recharge, or do whatever they feel like), emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place — give 20+ minutes of slack its own gap block rather than padding other activities. Reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry); use "gap" for open, unstructured time the user can later name or fill themselves.
+${coverageRule}
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
 ${venueRule}
 5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
@@ -1332,7 +1358,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  let payload: { request?: string; date?: string; context?: any; fast?: boolean };
+  let payload: { request?: string; date?: string; now?: string; context?: any; fast?: boolean };
   try {
     payload = await req.json();
   } catch {
@@ -1343,6 +1369,9 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Missing `request` text.' }, 400);
   }
   const date = typeof payload.date === 'string' ? payload.date : todayISO();
+  // Current local time, sent by the client only when planning today — drives
+  // the "plan from now, don't replay the morning" path in the prompt.
+  const now = isHHMM(payload.now) ? payload.now : undefined;
   const context = normalizeContext(payload.context);
   // Re-plans of an existing day ask for the cheaper/faster grounded model.
   const fast = payload.fast === true;
@@ -1354,6 +1383,7 @@ Deno.serve(async (req: Request) => {
     userText: request,
     home: context.home ?? null,
     date,
+    now,
     grounded: GROUNDING_ENABLED,
     userName: context.userName,
     wakeTime: context.wakeTime,

@@ -59,7 +59,11 @@ export function HomePicker({ title, slot = 'home', flat }: Props) {
   const pin = slot === 'home' ? home : work;
   const setPin = (next: LocationPin) =>
     slot === 'home' ? setHome(next) : setWork(next);
-  const clearPin = () => (slot === 'home' ? clearHome() : clearWork());
+  const clearPin = () => {
+    Haptics.selectionAsync().catch(() => undefined);
+    if (slot === 'home') clearHome();
+    else clearWork();
+  };
   const resolvedTitle = title ?? (slot === 'home' ? 'Home' : 'Work');
 
   const [query, setQuery] = useState('');

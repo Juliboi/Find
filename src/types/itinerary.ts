@@ -299,6 +299,15 @@ export interface Itinerary {
   /** Where the day departs from (the user's address / home). */
   origin?: string;
   /**
+   * Where THIS plan's day actually begins, baked in when the plan is created.
+   * A saved day re-routes its first leg from this fixed origin (home, a hotel,
+   * a friend's place) instead of inheriting whatever start the global planner-
+   * setup drawer happens to hold now — which is how a "from home" day silently
+   * turned into a short walk once the user picked a different start elsewhere.
+   * Absent on older plans → recompute falls back to home.
+   */
+  startLocation?: { label?: string; latitude: number; longitude: number } | null;
+  /**
    * Primary city the day takes place in, e.g. "Olomouc, Czechia". Used to
    * disambiguate venue names when grounding places against Google.
    */

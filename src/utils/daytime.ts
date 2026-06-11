@@ -54,24 +54,34 @@ export function getDayPartLabel(part: DayPart): string {
  * blue midday, golden afternoon, fiery sunset, deep indigo night.
  */
 export const DAYTIME_PALETTES: Record<DayPart, GradientPalette> = {
+  // Rising sun: a warm golden light against the peachy-pink dawn.
   morning: {
     sweep: ['#FFC9A3', '#FF9E80', '#F77FA1', '#B98DD6'],
     blobs: ['#FFB07C', '#F77FA1', '#FFD9A0'],
+    glow: '#FFB84D',
   },
+  // High sun: a brilliant warm white that pops against the clear blue sky.
   noon: {
     sweep: ['#74C7F5', '#4FA3E8', '#5E86DE', '#93B7F0'],
     blobs: ['#5BB0F0', '#86D2F5', '#9FB8F0'],
+    glow: '#FFF1CC',
   },
+  // Golden-hour sun: a deeper amber, warm against the cooling blue.
   afternoon: {
     sweep: ['#5FBDEB', '#7FA8DC', '#E8B36E', '#F3CB5C'],
     blobs: ['#6FB6E8', '#F2C266', '#E89B6E'],
+    glow: '#FF9E52',
   },
+  // Setting sun: a luminous gold burning through the fiery sky.
   sunset: {
     sweep: ['#FF9E64', '#FF6B6B', '#D14D8B', '#7B5EA7'],
     blobs: ['#FF7E5F', '#FF5E84', '#8E5AA8'],
+    glow: '#FFD56B',
   },
+  // Moon: a cool, pale silver-blue glowing against the deep indigo night.
   night: {
     sweep: ['#4458C9', '#5A47A8', '#7A4FB0', '#2A2E63'],
     blobs: ['#4F63D2', '#7A4FB0', '#314AA0'],
+    glow: '#C9D4FF',
   },
 };

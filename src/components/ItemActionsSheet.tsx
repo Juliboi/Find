@@ -9,6 +9,7 @@ import {
 import { BottomSheetView } from '@gorhom/bottom-sheet';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 import { Sheet } from './Sheet';
@@ -83,7 +84,14 @@ export function ItemActionsSheet({
               {item?.title ?? ''}
             </Text>
           </View>
-          <Pressable onPress={onClose} hitSlop={10} style={styles.close}>
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onClose();
+            }}
+            hitSlop={10}
+            style={styles.close}
+          >
             <Ionicons name="close" size={20} color={t.colors.textSecondary} />
           </Pressable>
         </View>
@@ -105,7 +113,10 @@ export function ItemActionsSheet({
               return (
                 <Pressable
                   key={d}
-                  onPress={() => onAdjustDuration(d)}
+                  onPress={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    onAdjustDuration(d);
+                  }}
                   style={({ pressed }) => [
                     styles.preset,
                     {
@@ -195,7 +206,10 @@ function ActionRow({
   const color = destructive ? t.colors.danger : t.colors.textPrimary;
   return (
     <Pressable
-      onPress={onPress}
+      onPress={() => {
+        Haptics.selectionAsync().catch(() => undefined);
+        onPress();
+      }}
       style={({ pressed }) => [
         styles.row,
         { borderTopColor: t.colors.separator },
@@ -258,7 +272,7 @@ const styles = StyleSheet.create({
   preset: {
     minWidth: 56,
     height: 36,
-    borderRadius: 10,
+    borderRadius: 999,
     borderWidth: StyleSheet.hairlineWidth,
     alignItems: 'center',
     justifyContent: 'center',

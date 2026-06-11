@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Pressable, StyleSheet, Switch, View } from 'react-native';
 import { BottomSheetView } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '@/theme/useTheme';
 import { Sheet } from './Sheet';
@@ -52,6 +53,7 @@ export function LegModeSheet({ item, onClose, onPickLegMode, onPickDayMode }: Pr
   }, [open, item?.id]);
 
   const pick = (mode: ItineraryTravelMode) => {
+    Haptics.selectionAsync().catch(() => undefined);
     if (applyToDay) onPickDayMode(mode);
     else onPickLegMode(mode);
   };
@@ -68,7 +70,14 @@ export function LegModeSheet({ item, onClose, onPickLegMode, onPickDayMode }: Pr
               {item?.title ?? ''}
             </Text>
           </View>
-          <Pressable onPress={onClose} hitSlop={10} style={styles.close}>
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onClose();
+            }}
+            hitSlop={10}
+            style={styles.close}
+          >
             <Ionicons name="close" size={20} color={t.colors.textSecondary} />
           </Pressable>
         </View>
@@ -120,7 +129,10 @@ export function LegModeSheet({ item, onClose, onPickLegMode, onPickDayMode }: Pr
           </View>
           <Switch
             value={applyToDay}
-            onValueChange={setApplyToDay}
+            onValueChange={(v) => {
+              Haptics.selectionAsync().catch(() => undefined);
+              setApplyToDay(v);
+            }}
             trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
           />
         </View>

@@ -255,7 +255,10 @@ export default function AuthScreen() {
               </Text>
             </View>
             <Pressable
-              onPress={() => setSheetOpen(false)}
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                setSheetOpen(false);
+              }}
               hitSlop={10}
               style={[styles.close, { backgroundColor: t.colors.fill1 }]}
               accessibilityLabel="Close"
@@ -339,6 +342,7 @@ export default function AuthScreen() {
 
           <Pressable
             onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
               setError(null);
               setNotice(null);
               setMode((m) => (m === 'signIn' ? 'signUp' : 'signIn'));

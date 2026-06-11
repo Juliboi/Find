@@ -35,6 +35,12 @@ export interface ItineraryResult {
 interface PlanItineraryOptions {
   context?: SchedulerContext;
   date?: string;
+  /**
+   * "HH:MM" current local time. Pass it ONLY when `date` is the user's today,
+   * so the planner schedules the REST of the day from now instead of replaying
+   * the morning. Omit for future days (they plan wake-to-sleep as usual).
+   */
+  now?: string;
   debug?: boolean;
   /**
    * Re-planning an EXISTING day (an adjust-field escalation or an auto-replan
@@ -319,6 +325,21 @@ function sanitizeSection(
   };
 }
 
+/** Validates a baked per-plan start pin; returns undefined when unusable so the
+ *  key is omitted (recompute then falls back to home rather than a bad origin). */
+function sanitizeStartLocation(
+  v: any,
+): { label?: string; latitude: number; longitude: number } | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const lat = Number(v.latitude);
+  const lon = Number(v.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return undefined;
+  const label = asString(v.label);
+  return label
+    ? { label, latitude: lat, longitude: lon }
+    : { latitude: lat, longitude: lon };
+}
+
 export function sanitizeItinerary(data: any): Itinerary | null {
   if (!data || typeof data !== 'object') return null;
   if (!Array.isArray(data.sections)) return null;
@@ -330,12 +351,16 @@ export function sanitizeItinerary(data: any): Itinerary | null {
     if (section) sections.push(section);
   }
   if (sections.length === 0) return null;
+  const startLocation = sanitizeStartLocation(data.startLocation);
   return {
     id: uid('itin'),
     title: asString(data.title) ?? 'Your day',
     summary: asString(data.summary),
     date: asString(data.date) ?? todayISO(),
     origin: asString(data.origin),
+    // Only carry a valid pin — omitting the key (rather than writing undefined)
+    // keeps the recompute merge from clobbering an input plan's baked start.
+    ...(startLocation ? { startLocation } : {}),
     city: asString(data.city),
     sections,
   };
@@ -366,6 +391,7 @@ export async function planItinerary(
   if (isSupabaseConfigured && supabase) {
     const body: Record<string, unknown> = { request: text };
     if (options.date) body.date = options.date;
+    if (options.now) body.now = options.now;
     if (options.fast) body.fast = true;
     const ctx = buildContextPayload(options.context);
     if (ctx) body.context = ctx;

@@ -7,6 +7,7 @@ import {
   type ViewStyle,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { GlassSurface } from './Glass';
 import { Text } from './Text';
@@ -106,9 +107,18 @@ export function TopBar({
 
 function ActionButton({ icon, onPress, accessibilityLabel, accent }: TopBarAction) {
   const { colors } = useTheme();
+  // Plain nav actions (back / close / bell) get a light selection tick here.
+  // Accent actions are the primary confirm (e.g. ✓) and own a firmer impact in
+  // their own handler, so we don't double up on those.
+  const handlePress = onPress
+    ? () => {
+        if (!accent) Haptics.selectionAsync().catch(() => undefined);
+        onPress();
+      }
+    : undefined;
   return (
     <Pressable
-      onPress={onPress}
+      onPress={handlePress}
       hitSlop={6}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel}

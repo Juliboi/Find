@@ -50,6 +50,16 @@ function buildContextPayload(
       longitude: ctx.endOfDay.longitude,
     };
   }
+  // The day's real starting point (picked in the planner setup drawer). Without
+  // it the router anchors the first leg to home, so a day that starts elsewhere
+  // (a hotel, a friend's place) mis-times its opening commute.
+  if (ctx.currentLocation) {
+    out.currentLocation = {
+      latitude: ctx.currentLocation.latitude,
+      longitude: ctx.currentLocation.longitude,
+      label: ctx.currentLocation.label ?? undefined,
+    };
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -108,7 +118,15 @@ export async function recomputeItinerary(
     const cleaned = sanitizeItinerary(data);
     if (!cleaned) return { itinerary, refreshed: false };
     return {
-      itinerary: { ...itinerary, ...cleaned, id: itinerary.id },
+      // The server never echoes the plan's baked start, so carry it across
+      // explicitly — otherwise the merge would drop where the day begins and
+      // the next recompute would fall back to home.
+      itinerary: {
+        ...itinerary,
+        ...cleaned,
+        id: itinerary.id,
+        startLocation: itinerary.startLocation ?? cleaned.startLocation,
+      },
       refreshed: true,
     };
   } catch {

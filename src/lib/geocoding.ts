@@ -6,7 +6,14 @@
  * - Requires a descriptive User-Agent per Nominatim's usage policy. React
  *   Native sets one automatically on iOS/Android, but we also add a `Referer`
  *   header so the request looks legitimate.
+ *
+ * For interactive pickers we prefer Google Places (via the `search-places`
+ * edge function) — see `autocompletePlaces` / `resolvePlace` at the bottom of
+ * this file — and only fall back to Nominatim when Google isn't configured.
  */
+
+import { isSupabaseConfigured, supabase } from '@/lib/supabase';
+import type { VenueOpeningHours } from '@/types/itinerary';
 
 export interface GeocodeHit {
   /** Pretty display label, e.g. "Pařížská 30, Praha". */
@@ -89,4 +96,183 @@ export async function reverseGeocode(
   } catch {
     return null;
   }
+}
+
+/**
+ * Reverse-geocodes `(lat, lon)` to just the locality name (city / town /
+ * village), e.g. "Prague". Falls back through coarser admin levels so even
+ * remote coordinates resolve to *something* human. Used by the weather widget
+ * to label "where" without showing a full street address. Returns null when
+ * the service can't resolve the coordinate.
+ */
+export async function reverseGeocodeCity(
+  latitude: number,
+  longitude: number,
+): Promise<string | null> {
+  // zoom=10 biases Nominatim toward the city level rather than the building.
+  const url = `${NOMINATIM_BASE}/reverse?lat=${latitude}&lon=${longitude}&format=jsonv2&addressdetails=1&zoom=10`;
+  try {
+    const res = await fetch(url, { headers: commonHeaders() });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || data.error) return null;
+    const a = data.address ?? {};
+    return (
+      a.city ||
+      a.town ||
+      a.village ||
+      a.municipality ||
+      a.suburb ||
+      a.county ||
+      a.state ||
+      a.country ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+// --------------------------------------------------------------- place search
+//
+// Google-backed address + place autocomplete via the `search-places` edge
+// function. This is what the location pickers use: it finds BOTH named venues
+// and plain street addresses with forgiving, typo-tolerant matching (the same
+// behaviour as the Google Maps search box). When Google isn't configured the
+// helpers transparently fall back to Nominatim so the picker still works.
+
+export interface PlacePrediction {
+  /** Opaque id passed back to `resolvePlace` to fetch coordinates. */
+  placeId: string;
+  /** Headline, e.g. "Blue Bottle Coffee" or "Pírkova". */
+  primary: string;
+  /** Context line, e.g. "316 California St, San Francisco" (may be empty). */
+  secondary: string;
+}
+
+export interface ResolvedPlace {
+  label: string;
+  latitude: number;
+  longitude: number;
+  /** Google place id, kept so callers can re-fetch fresh details later. */
+  placeId?: string | null;
+  /** Long-lived CDN photo URL (Google provider only). */
+  photoUrl?: string | null;
+  /** 0–5 average rating + how many reviews back it. */
+  rating?: number | null;
+  ratingCount?: number | null;
+  /** 1–4 price level where known. */
+  priceLevel?: number | null;
+  /** Whether the venue is open at resolve time (live; do not persist). */
+  openNow?: boolean | null;
+  /** Stable weekly opening hours, for "open at the errand's time" display. */
+  openingHours?: VenueOpeningHours | null;
+}
+
+// Nominatim fallback encodes the coordinates straight into the placeId so
+// `resolvePlace` can return them without another network round-trip.
+const NOMINATIM_PREFIX = 'osm:';
+
+/**
+ * Forgiving type-ahead for addresses and places. Biases results toward
+ * `center` (the user's location) when provided. `sessionToken` should be a
+ * stable random string for the duration of one edit session so Google bills
+ * the autocomplete + details calls as a single session.
+ */
+export async function autocompletePlaces(
+  input: string,
+  center?: { latitude: number; longitude: number } | null,
+  sessionToken?: string,
+): Promise<PlacePrediction[]> {
+  const q = input.trim();
+  if (q.length < 3) return [];
+
+  if (isSupabaseConfigured && supabase) {
+    try {
+      const { data, error } = await supabase.functions.invoke('search-places', {
+        body: {
+          input: q,
+          latitude: center?.latitude,
+          longitude: center?.longitude,
+          sessionToken,
+        },
+      });
+      const provider = (data as any)?.provider;
+      const predictions = (data as any)?.predictions;
+      if (!error && provider === 'google' && Array.isArray(predictions)) {
+        return predictions
+          .filter((p: any) => p?.placeId && p?.primary)
+          .map((p: any) => ({
+            placeId: String(p.placeId),
+            primary: String(p.primary),
+            secondary: typeof p.secondary === 'string' ? p.secondary : '',
+          }));
+      }
+      // provider === 'none' or any error → fall through to Nominatim.
+    } catch {
+      // network/edge error → fall through to Nominatim.
+    }
+  }
+
+  const hits = await searchAddresses(q, 6);
+  return hits.map((h) => ({
+    placeId: `${NOMINATIM_PREFIX}${h.latitude},${h.longitude}|${h.label}`,
+    primary: h.label,
+    secondary: '',
+  }));
+}
+
+/** Resolves a prediction from `autocompletePlaces` to a concrete location. */
+export async function resolvePlace(
+  placeId: string,
+  sessionToken?: string,
+): Promise<ResolvedPlace | null> {
+  if (placeId.startsWith(NOMINATIM_PREFIX)) {
+    const rest = placeId.slice(NOMINATIM_PREFIX.length);
+    const sep = rest.indexOf('|');
+    const coords = sep >= 0 ? rest.slice(0, sep) : rest;
+    const label = sep >= 0 ? rest.slice(sep + 1) : 'Selected location';
+    const [latS, lonS] = coords.split(',');
+    const latitude = Number(latS);
+    const longitude = Number(lonS);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+    return { label: label || 'Selected location', latitude, longitude };
+  }
+
+  if (isSupabaseConfigured && supabase) {
+    try {
+      const { data, error } = await supabase.functions.invoke('search-places', {
+        body: { placeId, sessionToken },
+      });
+      const place = (data as any)?.place;
+      if (
+        !error &&
+        place &&
+        typeof place.latitude === 'number' &&
+        typeof place.longitude === 'number'
+      ) {
+        return {
+          label:
+            typeof place.label === 'string' ? place.label : 'Selected location',
+          latitude: place.latitude,
+          longitude: place.longitude,
+          placeId: typeof place.placeId === 'string' ? place.placeId : null,
+          photoUrl: typeof place.photoUrl === 'string' ? place.photoUrl : null,
+          rating: typeof place.rating === 'number' ? place.rating : null,
+          ratingCount:
+            typeof place.ratingCount === 'number' ? place.ratingCount : null,
+          priceLevel:
+            typeof place.priceLevel === 'number' ? place.priceLevel : null,
+          openNow: typeof place.openNow === 'boolean' ? place.openNow : null,
+          openingHours:
+            place.openingHours && Array.isArray(place.openingHours.periods)
+              ? (place.openingHours as VenueOpeningHours)
+              : null,
+        };
+      }
+    } catch {
+      // ignore — caller treats null as "couldn't resolve".
+    }
+  }
+  return null;
 }

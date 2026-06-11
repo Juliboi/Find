@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { todayISO } from '@/utils/time';
 import { roundedNowHHMM } from '@/utils/days';
+import type { LocationPin } from '@/store/useHomeStore';
 
 /**
  * Default "day start" time used to seed the time selector for any day that
@@ -12,11 +13,32 @@ import { roundedNowHHMM } from '@/utils/days';
  */
 export const DEFAULT_DAY_START_TIME = '09:00';
 
+/** Sensible fallback day-end when the profile has no bedtime yet. */
+export const DEFAULT_DAY_END_TIME = '21:00';
+
+/**
+ * The full "how does this day look?" selection produced by the planner setup
+ * drawer: the day itself, the start/end times, and the start/end locations.
+ */
+export interface DayPlanSelection {
+  date: string;
+  startTime: string;
+  startLocation: LocationPin | null;
+  endTime: string;
+  endLocation: LocationPin | null;
+}
+
 interface PlanSetupState {
   /** The day the user is planning, "YYYY-MM-DD". */
   date: string;
   /** The time the day starts, "HH:MM" 24h. */
   startTime: string;
+  /** Where the day starts. Defaults (in the drawer) to the live GPS location. */
+  startLocation: LocationPin | null;
+  /** The time the day should wrap up, "HH:MM" 24h. */
+  endTime: string;
+  /** Where the day ends. Defaults (in the drawer) to home. */
+  endLocation: LocationPin | null;
   /** Configurable default start-of-day, used to seed non-today days. */
   dayStartTime: string;
   /**
@@ -28,6 +50,8 @@ interface PlanSetupState {
 
   /** Persist a confirmed day + start time from the planner setup drawer. */
   setSelection: (date: string, startTime: string) => void;
+  /** Persist the full day plan (day, start/end times, start/end locations). */
+  setDayPlan: (selection: DayPlanSelection) => void;
   /** Update the default day-start time (used for future days). */
   setDayStartTime: (hhmm: string) => void;
   /** Toggle whether the car is in play for the day being planned. */
@@ -45,9 +69,20 @@ export const usePlanSetupStore = create<PlanSetupState>()(
     (set) => ({
       date: todayISO(),
       startTime: roundedNowHHMM(),
+      startLocation: null,
+      endTime: DEFAULT_DAY_END_TIME,
+      endLocation: null,
       dayStartTime: DEFAULT_DAY_START_TIME,
       useCarToday: true,
       setSelection: (date, startTime) => set({ date, startTime }),
+      setDayPlan: (selection) =>
+        set({
+          date: selection.date,
+          startTime: selection.startTime,
+          startLocation: selection.startLocation,
+          endTime: selection.endTime,
+          endLocation: selection.endLocation,
+        }),
       setDayStartTime: (dayStartTime) => set({ dayStartTime }),
       setUseCarToday: (useCarToday) => set({ useCarToday }),
     }),

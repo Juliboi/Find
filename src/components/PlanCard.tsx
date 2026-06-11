@@ -148,6 +148,14 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
 
   const resetStep = () => setStep({ kind: 'chips' });
 
+  // The user-driven "back / cancel" affordances reset the step *and* give a
+  // tap tick; the bare `resetStep` is reused internally (e.g. after picking a
+  // place) where a second haptic would double up, so it stays silent.
+  const goBack = () => {
+    Haptics.selectionAsync().catch(() => undefined);
+    resetStep();
+  };
+
   // Tracks whether we've already kicked off an automatic place search
   // for this plan instance. Without this, every re-render would re-fire
   // the request — and stepping back to 'chips' (via picking a place
@@ -248,6 +256,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
   };
 
   const pickPlace = (place: NearbyPlace) => {
+    Haptics.selectionAsync().catch(() => undefined);
     resetStep();
     // Two paths depending on plan status:
     //   - needs_clarification: go through resolveClarification — it
@@ -286,6 +295,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
 
   const confirmTime = () => {
     if (step.kind !== 'time_picker') return;
+    Haptics.selectionAsync().catch(() => undefined);
     const hh = step.date.getHours().toString().padStart(2, '0');
     const mm = step.date.getMinutes().toString().padStart(2, '0');
     const hhmm = `${hh}:${mm}`;
@@ -296,7 +306,10 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
   return (
     <Card padded style={styles.card}>
       <Pressable
-        onPress={() => setExpanded((v) => !v)}
+        onPress={() => {
+          Haptics.selectionAsync().catch(() => undefined);
+          setExpanded((v) => !v);
+        }}
         hitSlop={2}
         style={({ pressed }) => [pressed && { opacity: 0.85 }]}
       >
@@ -351,7 +364,10 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
             {onRemove ? (
               <Pressable
                 hitSlop={10}
-                onPress={() => onRemove(plan.id)}
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  onRemove(plan.id);
+                }}
                 accessibilityLabel="Remove plan"
                 style={({ pressed }) => [
                   styles.removeBtn,
@@ -393,7 +409,10 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
             <Chip
               label="Find nearby"
               icon="search-outline"
-              onPress={runPlaceSearch}
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                void runPlaceSearch();
+              }}
             />
           </View>
         </View>
@@ -459,7 +478,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
               </Text>
             </Pressable>
           ))}
-          <Pressable hitSlop={6} onPress={resetStep}>
+          <Pressable hitSlop={6} onPress={goBack}>
             <Text variant="caption" tone="accent" weight="semibold">
               ← Back
             </Text>
@@ -488,9 +507,10 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
               ))}
               <Chip
                 label="Skip"
-                onPress={() =>
-                  onResolveClarification?.(plan.id, 'Not specified')
-                }
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  onResolveClarification?.(plan.id, 'Not specified');
+                }}
               />
             </View>
           ) : null}
@@ -509,7 +529,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
               <Text variant="caption" tone="accent" weight="semibold">
                 Tap a place to pick it:
               </Text>
-              {step.places.map((place) => (
+                {step.places.map((place) => (
                 <Pressable
                   key={place.id}
                   onPress={() => pickPlace(place)}
@@ -597,7 +617,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
                   </Text>
                 </Pressable>
               ))}
-              <Pressable hitSlop={6} onPress={resetStep}>
+              <Pressable hitSlop={6} onPress={goBack}>
                 <Text variant="caption" tone="accent" weight="semibold">
                   ← Back to suggestions
                 </Text>
@@ -627,7 +647,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
                   </Text>
                 </View>
               ) : null}
-              <Pressable hitSlop={6} onPress={resetStep}>
+              <Pressable hitSlop={6} onPress={goBack}>
                 <Text variant="caption" tone="accent" weight="semibold">
                   ← Back to suggestions
                 </Text>
@@ -652,7 +672,7 @@ export function PlanCard({ plan, onResolveClarification, onRemove }: Props) {
               {Platform.OS === 'ios' ? (
                 <View style={styles.suggestionsRow}>
                   <Chip label="Use this time" onPress={confirmTime} />
-                  <Chip label="Cancel" onPress={resetStep} />
+                  <Chip label="Cancel" onPress={goBack} />
                 </View>
               ) : null}
             </View>

@@ -99,11 +99,11 @@ export function Sheet({
         style={[
           style,
           styles.background,
-          { backgroundColor: t.colors.surface1, borderColor: t.colors.separator },
+          { backgroundColor: t.colors.background, borderColor: t.colors.separator },
         ]}
       />
     ),
-    [t.colors.surface1, t.colors.separator],
+    [t.colors.background, t.colors.separator],
   );
 
   return (

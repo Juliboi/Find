@@ -10,7 +10,6 @@ import {
   ScrollView,
   StyleSheet,
   Text as RNText,
-  TextInput,
   useWindowDimensions,
   View,
 } from 'react-native';
@@ -37,11 +36,20 @@ import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
 import { useProfileStore } from '@/store/useProfileStore';
-import { HomePicker } from '@/components/HomePicker';
+import {
+  useErrandsStore,
+  groupErrands,
+  errandStatus,
+  type Errand,
+  type ErrandInput,
+} from '@/store/useErrandsStore';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
-import { Button } from '@/components/Button';
+import { ErrandRow } from '@/components/ErrandRow';
+import { ErrandDrawer } from '@/components/ErrandDrawer';
+import { PlanComposer } from '@/components/PlanComposer';
+import type { ErrandDraft } from '@/lib/ai/parseErrand';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
 import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
@@ -61,6 +69,13 @@ import {
 } from '@/lib/itinerary/edits';
 import { parseAdjustCommand } from '@/lib/itinerary/adjustCommand';
 import { compactItinerary, logItineraryEdit } from '@/lib/itinerary/debugLog';
+import {
+  absCommuteWindow,
+  buildAbsoluteTimeline,
+  isArrivalMarker,
+  toAbsoluteNow,
+  type AbsSpan,
+} from '@/lib/itinerary/timeline';
 import { AdjustBar } from '@/components/AdjustBar';
 import { PlaceSwapSheet } from '@/components/PlaceSwapSheet';
 import { ItemActionsSheet } from '@/components/ItemActionsSheet';
@@ -114,6 +129,39 @@ const SAMPLE_PROMPT =
   'sightsee the historic centre, watch the afternoon show-jumping competition, ' +
   'and find a great place for drinks before the train home.';
 
+/** A blank errand draft used to seed the (edit-only) errand drawer. */
+const EMPTY_ERRAND_DRAFT: ErrandDraft = {
+  title: '',
+  date: null,
+  startTime: null,
+  endTime: null,
+  address: null,
+  notes: null,
+};
+
+/** Map a stored errand onto the draft shape the errand drawer edits, carrying
+ *  the resolved place data so the pinned location/photo/hours survive a round
+ *  trip through the editor. */
+function errandToDraft(e: Errand): ErrandDraft {
+  return {
+    title: e.title,
+    date: e.date ?? null,
+    startTime: e.startTime ?? null,
+    endTime: e.endTime ?? null,
+    durationMin: e.durationMin ?? null,
+    address: e.address ?? null,
+    latitude: e.latitude ?? null,
+    longitude: e.longitude ?? null,
+    placeId: e.placeId ?? null,
+    photoUrl: e.photoUrl ?? null,
+    rating: e.rating ?? null,
+    ratingCount: e.ratingCount ?? null,
+    priceLevel: e.priceLevel ?? null,
+    openingHours: e.openingHours ?? null,
+    notes: e.notes ?? null,
+  };
+}
+
 const SPRING = { damping: 22, stiffness: 220, mass: 0.7 };
 
 /**
@@ -140,147 +188,6 @@ const CARD_RADIUS = 18;
 
 /** How dim a past (already-elapsed) block is rendered. */
 const PAST_OPACITY = 0.4;
-
-/**
- * Absolute (midnight-unwrapped) start/end for one block, in minutes measured
- * from the plan's first morning. Times after midnight keep climbing past 1440
- * so a late-night plan that rolls over (22:20 → 01:00) stays monotonic instead
- * of wrapping the after-midnight blocks back to tiny morning minutes.
- */
-interface AbsSpan {
-  start: number | null;
-  end: number;
-}
-
-interface AbsTimeline {
-  byId: Record<string, AbsSpan>;
-  /** Absolute minute the day starts (first block's start); null if untimed. */
-  dayStart: number | null;
-  /** Absolute minute the day ends (latest block end); equals dayStart if empty. */
-  dayEnd: number;
-}
-
-/**
- * Lift a plan's "HH:MM" times onto one continuous timeline so a day that
- * crosses midnight stays ordered. Walking blocks in order, any start that
- * reads EARLIER than the previous one means the clock rolled past midnight, so
- * every time from there on gains a full day (+1440). A same-day plan never
- * trips the rollover, so its absolute minutes equal its raw minutes — behaviour
- * is unchanged for the common case.
- */
-function buildAbsoluteTimeline(items: ItineraryItem[]): AbsTimeline {
-  const byId: Record<string, AbsSpan> = {};
-  let prevStart: number | null = null;
-  let dayStart: number | null = null;
-  let dayEnd = Number.NEGATIVE_INFINITY;
-  for (const it of items) {
-    const rawStart = minutesOfDay(it.startTime);
-    let start: number | null = null;
-    if (rawStart != null) {
-      let s = rawStart;
-      while (prevStart != null && s < prevStart) s += 1440;
-      start = s;
-      prevStart = s;
-      if (dayStart == null) dayStart = s;
-    }
-    const rawEnd = minutesOfDay(it.endTime);
-    let end: number;
-    if (rawEnd != null) {
-      let e = rawEnd;
-      // Anchor the end to its own start so a block that itself spans midnight
-      // (23:50 → 00:10) reads as 10 minutes, not a day backwards.
-      const base = start ?? prevStart;
-      while (base != null && e < base) e += 1440;
-      end = e;
-    } else if (start != null) {
-      end = start + (it.durationMinutes ?? 0);
-    } else {
-      end = Number.POSITIVE_INFINITY;
-    }
-    if (Number.isFinite(end)) dayEnd = Math.max(dayEnd, end);
-    byId[it.id] = { start, end };
-  }
-  return {
-    byId,
-    dayStart,
-    dayEnd: Number.isFinite(dayEnd) ? dayEnd : dayStart ?? 0,
-  };
-}
-
-/**
- * Place the live wall clock on the same unwrapped axis as `buildAbsoluteTimeline`.
- *
- * A plan stored as bare "HH:MM" carries no date, so a time like "01:00" is
- * ambiguous: it could be the small hours of a night that's still unfolding, or
- * roughly a day away. We resolve it by snapping `now` to whichever 24h cycle
- * sits CLOSEST to the plan's [dayStart, dayEnd] window — if the clock already
- * falls inside the plan we take it verbatim, otherwise we try ±a day and keep
- * the nearest. Two cases this gets right that a naive raw compare didn't:
- *   - A plan living ENTIRELY after midnight (a 00:30 → 03:00 night out) reads as
- *     UPCOMING while it's still 22:xx the evening before, instead of 22:xx >
- *     03:00 wrongly marking the whole thing finished (→ every block greyed).
- *   - It still flips to "done" once the clock genuinely passes the plan.
- */
-function toAbsoluteNow(rawNow: number, dayStart: number | null, dayEnd: number): number {
-  if (dayStart == null) return rawNow;
-  const distToPlan = (x: number) =>
-    x < dayStart ? dayStart - x : x > dayEnd ? x - dayEnd : 0;
-  let best = rawNow;
-  let bestDist = distToPlan(rawNow);
-  // A plan never spans more than a day, so the right cycle is at most ±1 away.
-  for (const shift of [-1440, 1440]) {
-    const d = distToPlan(rawNow + shift);
-    if (d < bestDist) {
-      best = rawNow + shift;
-      bestDist = d;
-    }
-  }
-  return best;
-}
-
-/**
- * The router appends a synthetic "Back home" block when the day ends away from
- * home. Its `startTime` is the ARRIVAL time, not a departure — the opposite of
- * a real `travel` block (a train ride where startTime is when you board). We
- * key off the explicit `arrival` flag on fresh plans, and fall back to the
- * shape (a travel item carrying a leg but no end/duration) so trips saved
- * before the flag existed still render correctly on reload.
- */
-function isArrivalMarker(it: ItineraryItem): boolean {
-  if (it.arrival) return true;
-  return (
-    it.kind === 'travel' &&
-    !!it.travelFromPrev &&
-    !it.endTime &&
-    !it.durationMinutes
-  );
-}
-
-/**
- * The window you are actually IN TRANSIT on the leg feeding `item`, in ABSOLUTE
- * (midnight-unwrapped) minutes `[depart, arrive]`. This is what lets the
- * progress head track the commute and the active hop glow while you're en
- * route, exactly like a normal block does — and it stays correct across
- * midnight because `arrive` comes from the unwrapped timeline.
- *
- * Returns null when the item has no incoming leg, no known start, or IS itself
- * the journey (a real `kind: 'travel'` ride) — there the card, not the
- * connector, represents the trip. Arrival markers ("Back home") keep a window
- * because their leg home is a connector and their `startTime` is the arrival.
- */
-function absCommuteWindow(
-  item: ItineraryItem,
-  byId: Record<string, AbsSpan>,
-): { depart: number; arrive: number } | null {
-  const leg = item.travelFromPrev;
-  if (!leg) return null;
-  if (item.kind === 'travel' && !isArrivalMarker(item)) return null;
-  const arrive = byId[item.id]?.start;
-  if (arrive == null) return null;
-  const depart = arrive - leg.minutes;
-  if (!(depart < arrive)) return null;
-  return { depart, arrive };
-}
 
 /**
  * One measured hop of a commute: its real clock window (`t0`→`t1`, minutes of
@@ -445,9 +352,19 @@ export default function ItineraryScreen() {
   // into the past.
   const planDate = usePlanSetupStore((s) => s.date);
   const planStartTime = usePlanSetupStore((s) => s.startTime);
-  const setPlanSelection = usePlanSetupStore((s) => s.setSelection);
+  const planStartLocation = usePlanSetupStore((s) => s.startLocation);
+  const planEndTime = usePlanSetupStore((s) => s.endTime);
+  const planEndLocation = usePlanSetupStore((s) => s.endLocation);
+  const setDayPlan = usePlanSetupStore((s) => s.setDayPlan);
   const effectiveDate = isPastDay(planDate) ? todayISO() : planDate;
   const [setupOpen, setSetupOpen] = useState(false);
+  // Which step the setup drawer opens to: 0 = pick the day, 1 = start & end.
+  const [setupStep, setSetupStep] = useState<0 | 1>(0);
+  const openSetup = (stepTo: 0 | 1) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setSetupStep(stepTo);
+    setSetupOpen(true);
+  };
   const whenSummary = useMemo(() => {
     const d = describeDay(effectiveDate);
     return `${d.title}, ${d.dateLabel} · ${formatTime(planStartTime)}`;
@@ -469,7 +386,7 @@ export default function ItineraryScreen() {
     return scrubHomePlacesFromSaved(saved, home);
   }, [params.id, home]);
 
-  const [input, setInput] = useState(SAMPLE_PROMPT);
+  const [input, setInput] = useState('');
   const [itinerary, setItinerary] = useState<Itinerary | null>(preloaded);
   const [usedAi, setUsedAi] = useState(!!preloaded);
   // `loading` covers the BLOCKING planning call only — while it's true the
@@ -498,9 +415,6 @@ export default function ItineraryScreen() {
   const [nowMin, setNowMin] = useState(() => minutesOfDay(currentHHMM()) ?? 0);
   const [sheetExpanded, setSheetExpanded] = useState(!preloaded);
   const [phase, setPhase] = useState(0);
-  // Keep the home anchor collapsed so the prompt field leads (and isn't pushed
-  // under the keyboard). Auto-expand only when there's no home set yet.
-  const [homeExpanded, setHomeExpanded] = useState(!home);
 
   // --- live editing state ---------------------------------------------------
   // True while an edit is being applied (route refresh / AI re-plan in flight).
@@ -525,6 +439,115 @@ export default function ItineraryScreen() {
   const [rearrangeMode, setRearrangeMode] = useState(false);
   // Live "what will this move cost" readout while a row is lifted (null at rest).
   const [dragImpact, setDragImpact] = useState<ReorderImpact | null>(null);
+
+  // ----- Errands shown as the drawer's main content (pre-plan) -------------
+  // The day's errands lead, then a catch-all "Anytime" group, shown purely as
+  // reference for the day you're about to plan. Rows aren't editable here (and
+  // never strike through) — the round check just toggles done. New errands are
+  // captured from the home screen.
+  const errands = useErrandsStore((s) => s.items);
+  const toggleErrandDone = useErrandsStore((s) => s.toggleDone);
+  const updateErrand = useErrandsStore((s) => s.update);
+  const removeErrand = useErrandsStore((s) => s.remove);
+  const reopenErrand = useErrandsStore((s) => s.reopen);
+  const setErrandsPlanned = useErrandsStore((s) => s.setPlanned);
+  // Edit-drawer state — tapping an errand row opens it in (edit-only) mode.
+  const [errandDrawerOpen, setErrandDrawerOpen] = useState(false);
+  const [errandSeed, setErrandSeed] = useState<ErrandDraft>(EMPTY_ERRAND_DRAFT);
+  const [errandRawText, setErrandRawText] = useState('');
+  const [errandSeedKey, setErrandSeedKey] = useState('errand-0');
+  const [editErrandId, setEditErrandId] = useState<string | null>(null);
+
+  // Errands the user ticked to fold into THIS plan. We don't auto-inject any of
+  // them — selection is explicit — and they're woven into the planner request on
+  // "Plan my day", then cleared once a plan lands.
+  const [selectedErrandIds, setSelectedErrandIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  // The planned day we last seeded the selection for, plus which of that day's
+  // errands we've already auto-selected. Together they let us preselect the
+  // day's errands — and fold in any added or hydrated later — without ever
+  // re-adding ones the user has unticked. See `seedSelectedErrands`.
+  const errandSeedDateRef = useRef<string | null>(null);
+  const seenDayErrandsRef = useRef<Set<string>>(new Set());
+  const toggleErrandSelected = (id: string) =>
+    setSelectedErrandIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Active candidates are open errands only; planned/done ones drop into the
+  // Completed group below. `groupErrands` does the status split + sorting and
+  // floats the day being planned to the front of the scheduled bucket.
+  const todayIso = todayISO();
+  const errandGroups = useMemo(
+    () => groupErrands(errands, { focusDate: effectiveDate, today: todayIso }),
+    [errands, effectiveDate, todayIso],
+  );
+  // The drawer plans ONE day, so its scheduled group is just that day's open
+  // errands (other days live on the home list); anytime + completed follow.
+  const dayErrands = useMemo(
+    () => errandGroups.scheduled.filter((e) => e.date === effectiveDate),
+    [errandGroups, effectiveDate],
+  );
+  const anytimeErrands = errandGroups.anytime;
+  const completedErrands = errandGroups.completed;
+  const [showCompletedErrands, setShowCompletedErrands] = useState(false);
+
+  // Open dated errands for the planned day are the user's clear intent, so they
+  // get preselected. `groupErrands` already excludes done/planned ones.
+  const dayErrandIds = useMemo(() => dayErrands.map((e) => e.id), [dayErrands]);
+
+  // (Re)seed the fold-into-plan selection to exactly the day's own errands,
+  // resetting the "seen" set so the new day starts fresh. Used on a day change
+  // and to re-preselect for a fresh planning pass after a reset.
+  const seedSelectedErrands = useCallback(() => {
+    errandSeedDateRef.current = effectiveDate;
+    seenDayErrandsRef.current = new Set(dayErrandIds);
+    setSelectedErrandIds(new Set(dayErrandIds));
+  }, [dayErrandIds, effectiveDate]);
+
+  // Preselect the planned day's errands so the user needn't tick each by hand.
+  // On a day change we seed from scratch; within a day we fold in any errands
+  // that appear later (added, or hydrated from storage after the first pass)
+  // the first time we see them — but never re-add ones the user has unticked,
+  // since those are already marked "seen".
+  useEffect(() => {
+    if (errandSeedDateRef.current !== effectiveDate) {
+      seedSelectedErrands();
+      return;
+    }
+    const fresh = dayErrandIds.filter((id) => !seenDayErrandsRef.current.has(id));
+    if (fresh.length === 0) return;
+    fresh.forEach((id) => seenDayErrandsRef.current.add(id));
+    setSelectedErrandIds((prev) => {
+      const next = new Set(prev);
+      fresh.forEach((id) => next.add(id));
+      return next;
+    });
+  }, [effectiveDate, dayErrandIds, seedSelectedErrands]);
+
+  const onEditErrand = (errand: Errand) => {
+    // No haptic here: ErrandRow's body tap already fires the selection tick, so
+    // firing again would double up (matches the home screen's onEditErrand).
+    setEditErrandId(errand.id);
+    setErrandRawText(errand.rawText);
+    setErrandSeed(errandToDraft(errand));
+    setErrandSeedKey(`errand-${errand.id}-${errand.updatedAt}`);
+    setErrandDrawerOpen(true);
+  };
+
+  const onSaveErrand = (patch: ErrandInput) => {
+    if (editErrandId) updateErrand(editErrandId, patch);
+    setErrandDrawerOpen(false);
+  };
+
+  const onDeleteErrand = () => {
+    if (editErrandId) removeErrand(editErrandId);
+    setErrandDrawerOpen(false);
+  };
 
   // Cycle the status copy while planning so the wait feels alive.
   useEffect(() => {
@@ -580,13 +603,25 @@ export default function ItineraryScreen() {
   const legStepsRef = useRef<Record<string, StepRect[]>>({});
   const tabOffsetsRef = useRef<number[]>([]);
 
+  // The day's end anchor: the per-day end address chosen in the setup drawer
+  // wins over the persistent home/end-of-day pin so a "drinks downtown, crash
+  // at a friend's" day routes to the right finish.
+  const effectiveEndOfDay = planEndLocation ?? endOfDay;
+
   // Memoised so it's stable across renders — effects that depend on `context`
   // (auto-refresh, log dumper) only re-fire when the underlying pins actually
   // change, not on every parent re-render.
   const context = useMemo<SchedulerContext>(
     () => ({
       home,
-      endOfDay,
+      endOfDay: effectiveEndOfDay,
+      currentLocation: planStartLocation
+        ? {
+            latitude: planStartLocation.latitude,
+            longitude: planStartLocation.longitude,
+            label: planStartLocation.label,
+          }
+        : undefined,
       userName,
       wakeTime: profileWakeTime,
       bedTime: profileBedTime,
@@ -597,7 +632,8 @@ export default function ItineraryScreen() {
     }),
     [
       home,
-      endOfDay,
+      effectiveEndOfDay,
+      planStartLocation,
       userName,
       profileWakeTime,
       profileBedTime,
@@ -608,11 +644,37 @@ export default function ItineraryScreen() {
     ],
   );
 
-  // Saved trips planned BEFORE real routing existed (everything in the body
-  // is `estimated: true` with no polylines) get one auto-refresh per session
-  // the first time the user opens them. Heals existing broken trips like the
-  // one with Petřiny ⇄ Pekařova nonsense without forcing a delete+regenerate
-  // dance. Keyed by saved id so it only fires once per trip per session.
+  // A recompute/route context whose START is THIS plan's own baked origin
+  // (`itinerary.startLocation`) rather than the global planner-setup pick. A
+  // saved day therefore always re-routes its first leg from where it was
+  // planned to begin (home, a hotel, a friend's place), instead of silently
+  // inheriting wherever the setup drawer was last left — the bug that turned a
+  // "from home" day into a short walk once a different start was picked. Plans
+  // without a baked start (older ones) send no currentLocation, so the server
+  // falls back to home.
+  const contextFor = useCallback(
+    (itin: Itinerary | null | undefined): SchedulerContext => ({
+      ...context,
+      currentLocation: itin?.startLocation
+        ? {
+            latitude: itin.startLocation.latitude,
+            longitude: itin.startLocation.longitude,
+            label: itin.startLocation.label ?? null,
+          }
+        : null,
+    }),
+    [context],
+  );
+
+  // One self-heal per saved trip per session, on first open. Two cases qualify:
+  //   1. Trips planned BEFORE real routing existed (every leg `estimated: true`
+  //      with no polyline) — the original "Petřiny ⇄ Pekařova nonsense" heal.
+  //   2. Trips with NO baked `startLocation` (planned before per-plan starts) —
+  //      their cached first leg may still run from a stale global start (the
+  //      "walk from Sokolovská instead of home" bug). Re-routing with this
+  //      plan's context sends no current-location, so the server re-anchors the
+  //      day to home; we then bake home in so it converges and never re-heals.
+  // Keyed by saved id so it fires at most once per trip per session.
   const autoRefreshedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const id = params.id;
@@ -628,25 +690,38 @@ export default function ItineraryScreen() {
     const allEstimated = legs.every(
       (leg) => leg.estimated === true && !leg.polyline,
     );
-    if (!allEstimated) return;
+    const needsStartHeal = !preloaded.startLocation;
+    if (!allEstimated && !needsStartHeal) return;
 
     autoRefreshedRef.current.add(id);
     const seq = ++planSeqRef.current;
     // `routesRefining` instead of `loading` — the saved day is already on
     // screen and we don't want a full planning skeleton to flash over it.
     setRoutesRefining(true);
-    recomputeItinerary(preloaded, context)
+    recomputeItinerary(preloaded, contextFor(preloaded))
       .then((result) => {
         if (planSeqRef.current !== seq) return;
         if (result.refreshed) {
-          setItinerary(result.itinerary);
-          updateSavedItinerary(id, result.itinerary);
+          // Bake the resolved start so the heal sticks: keep an existing one,
+          // else stamp home (the origin this plan was just re-routed from).
+          const healed = result.itinerary.startLocation
+            ? result.itinerary
+            : {
+                ...result.itinerary,
+                startLocation: {
+                  label: home.label,
+                  latitude: home.latitude,
+                  longitude: home.longitude,
+                },
+              };
+          setItinerary(healed);
+          updateSavedItinerary(id, healed);
         }
       })
       .finally(() => {
         if (planSeqRef.current === seq) setRoutesRefining(false);
       });
-  }, [params.id, preloaded, home, context, updateSavedItinerary]);
+  }, [params.id, preloaded, home, contextFor, updateSavedItinerary]);
 
   // Dev-only snapshot dumper. Fires whenever the day loads or any edit
   // reshapes the itinerary, so you can read the structured state from Metro
@@ -1061,9 +1136,11 @@ export default function ItineraryScreen() {
     timeFillY.value = 0;
   };
 
-  const planIt = async () => {
-    const text = input.trim();
+  const planIt = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
+    // Keep the latest prompt around — it's the basis for any later replan.
+    if (overrideText !== undefined && text !== input) setInput(text);
     Haptics.selectionAsync().catch(() => undefined);
     // Anything that was already in flight is no longer relevant; bump the seq
     // so a slow recompute from a previous plan can't slot itself in after
@@ -1075,13 +1152,52 @@ export default function ItineraryScreen() {
     resetTracking();
     snapTo(expandedTop); // show the skeleton full-height while we work
     try {
-      // Anchor the plan to the day + start time the user picked in the setup
-      // drawer. The date goes to the planner directly; the start time is woven
-      // into the prompt so the model lays the first block down around it.
-      const request = `I'm planning my day for ${effectiveDate}, and I want to start at ${planStartTime}.\n\n${text}`;
+      // Anchor the plan to the day + start/end the user picked in the setup
+      // drawer. The date goes to the planner directly; the start/end times and
+      // places are woven into the prompt so the model lays the first block down
+      // around them and routes the day to the right finish.
+      const startWhere = planStartLocation?.label
+        ? ` from ${planStartLocation.label}`
+        : '';
+      const endWhere = planEndLocation?.label
+        ? ` at ${planEndLocation.label}`
+        : '';
+      // Fold in only the errands the user explicitly ticked in the drawer (never
+      // auto-injected). Done ones are skipped; each line hands the model the
+      // title plus whatever slots are known so it can time/place the stop.
+      const chosenErrands = errands.filter(
+        (e) => selectedErrandIds.has(e.id) && !e.done,
+      );
+      const errandsBlock = chosenErrands.length
+        ? `\n\nAlso work these errands into the day:\n${chosenErrands
+            .map((e) => {
+              const bits: string[] = [];
+              if (e.startTime) {
+                bits.push(e.endTime ? `${e.startTime}–${e.endTime}` : `at ${e.startTime}`);
+              } else if (e.durationMin) {
+                // No fixed time, but a length estimate — tell the model how much
+                // of a gap to reserve for it.
+                bits.push(`~${formatDuration(e.durationMin)}`);
+              }
+              if (e.address) bits.push(`at ${e.address}`);
+              if (e.notes) bits.push(e.notes);
+              return `- ${e.title}${bits.length ? ` (${bits.join(', ')})` : ''}`;
+            })
+            .join('\n')}`
+        : '';
+      // When planning TODAY, the day is already underway: send the planner the
+      // current time so it plans the rest of the day from now (not the morning),
+      // and never let the stated start time sit in the past.
+      const planningToday = effectiveDate === todayISO();
+      const localNow = currentHHMM();
+      const nowArg = planningToday ? localNow : undefined;
+      const startForPrompt =
+        planningToday && planStartTime < localNow ? localNow : planStartTime;
+      const request = `I'm planning my day for ${effectiveDate}. I want to start at ${startForPrompt}${startWhere} and finish by ${planEndTime}${endWhere}.\n\n${text}${errandsBlock}`;
       const result = await planItinerary(request, {
         context,
         date: effectiveDate,
+        now: nowArg,
         debug: true,
       });
       if (planSeqRef.current !== seq) return; // user reset / planned again
@@ -1094,6 +1210,17 @@ export default function ItineraryScreen() {
         return;
       }
 
+      // Bake the chosen start into the plan so reopening/editing it later always
+      // routes the first leg from the same origin — not from wherever the global
+      // planner-setup drawer is pointed at the time.
+      if (planStartLocation) {
+        itin.startLocation = {
+          label: planStartLocation.label,
+          latitude: planStartLocation.latitude,
+          longitude: planStartLocation.longitude,
+        };
+      }
+
       // OPTIMISTIC SHOW. Save and render the model output the instant Gemini
       // returns, so the user sees their day 2-5 seconds sooner. Routing then
       // runs in the BACKGROUND (no await on this code path — see below) and
@@ -1103,6 +1230,16 @@ export default function ItineraryScreen() {
       const id = saveItinerary(itin);
       setSavedId(id);
       setItinerary(itin);
+      // The chosen errands are now folded into this plan: mark them "Planned"
+      // (they move to the Completed group; pull one back to re-include it) and
+      // clear the ticks so a later replan doesn't re-add a stale selection.
+      if (chosenErrands.length) {
+        setErrandsPlanned(
+          chosenErrands.map((e) => e.id),
+          effectiveDate,
+        );
+      }
+      setSelectedErrandIds(new Set());
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
         () => undefined,
       );
@@ -1114,7 +1251,7 @@ export default function ItineraryScreen() {
       // the seq guard knows to bail if a newer plan started while we wait.
       setLoading(false);
       setRoutesRefining(true);
-      void recomputeItinerary(itin, context)
+      void recomputeItinerary(itin, contextFor(itin))
         .then((refreshed) => {
           if (planSeqRef.current !== seq) return;
           if (!refreshed.refreshed) return;
@@ -1150,6 +1287,9 @@ export default function ItineraryScreen() {
     setLegMenuId(null);
     setRearrangeMode(false);
     resetTracking();
+    // Re-preselect the day's errands so the fresh planning pass starts the same
+    // way a first visit does (planning cleared the selection on success).
+    seedSelectedErrands();
     snapTo(expandedTop);
   };
 
@@ -1204,16 +1344,22 @@ export default function ItineraryScreen() {
       const request = `${basis}\n\n${constraint}`;
 
       const result = await planItinerary(request, {
-        context,
+        context: contextFor(routed),
         date: routed.date ?? todayISO(),
         fast: true,
       });
       if (mySeq !== editSeqRef.current) return;
       if (!result.itinerary) return;
 
+      // A replan keeps the day's original starting point.
+      result.itinerary.startLocation = routed.startLocation;
+
       // Route the fresh plan for real (time-aware) legs before it lands, then
       // re-cascade on the client (keeping the planner's anchors authoritative).
-      const { itinerary: rerouted } = await recomputeItinerary(result.itinerary, context);
+      const { itinerary: rerouted } = await recomputeItinerary(
+        result.itinerary,
+        contextFor(result.itinerary),
+      );
       if (mySeq !== editSeqRef.current) return;
       const cascaded = fitGapsToAnchors(applyRoutedLegs(result.itinerary, rerouted));
       setItinerary(cascaded.itinerary);
@@ -1232,7 +1378,7 @@ export default function ItineraryScreen() {
         () => undefined,
       );
     },
-    [context, input, persist, showUndo],
+    [contextFor, input, persist, showUndo],
   );
 
   /**
@@ -1291,7 +1437,7 @@ export default function ItineraryScreen() {
       try {
         const { itinerary: refreshed, refreshed: didRefresh } = await recomputeItinerary(
           current,
-          context,
+          contextFor(current),
         );
         // Drop the response if a newer edit has been dispatched in the
         // meantime; otherwise we'd silently undo the user's latest tweak.
@@ -1346,7 +1492,7 @@ export default function ItineraryScreen() {
         if (mySeq === editSeqRef.current) setEditBusy(false);
       }
     },
-    [itinerary, persist, showUndo, context, escalateReplan],
+    [itinerary, persist, showUndo, contextFor, escalateReplan],
   );
   /** Convenience: most callers only have one op. */
   const applyEdit = useCallback((op: EditOp) => applyOps([op]), [applyOps]);
@@ -1367,9 +1513,15 @@ export default function ItineraryScreen() {
       try {
         const basis = describeItineraryForReplan(itinerary, input);
         const request = `${basis}\n\nAdjustment requested: ${text}`;
-        const result = await planItinerary(request, { context, date: todayISO(), fast: true });
+        const result = await planItinerary(request, {
+          context: contextFor(itinerary),
+          date: todayISO(),
+          fast: true,
+        });
         if (mySeq !== editSeqRef.current) return;
         if (result.itinerary) {
+          // A replan keeps the day's original starting point.
+          result.itinerary.startLocation = itinerary.startLocation;
           const cascaded = cascadeTimes(result.itinerary);
           setItinerary(cascaded.itinerary);
           setConflicts(cascaded.conflicts);
@@ -1391,7 +1543,7 @@ export default function ItineraryScreen() {
         if (mySeq === editSeqRef.current) setEditBusy(false);
       }
     },
-    [itinerary, input, context, persist, showUndo],
+    [itinerary, input, contextFor, persist, showUndo],
   );
 
   // Free-text adjustments — three-stage funnel:
@@ -1584,6 +1736,14 @@ export default function ItineraryScreen() {
     ? itinerary.title
     : sections[activeSectionIndex]?.title ?? itinerary.title;
 
+  // Group header for the day's errands, e.g. "Today · Jun 10" / "Sat · Jun 14".
+  const dayMeta = describeDay(effectiveDate);
+  const dayGroupLabel = `${dayMeta.title} · ${dayMeta.dateLabel}`;
+  const startLabel = planStartLocation?.label ?? 'Current location';
+  // The compact when/where controls + errands view share the "no plan yet"
+  // state; once a plan exists the timeline + AdjustBar take over.
+  const showPlanLanding = !itinerary && !loading;
+
   return (
     <View style={[styles.container, { backgroundColor: t.colors.background }]}>
       <TripMap
@@ -1600,7 +1760,7 @@ export default function ItineraryScreen() {
         style={[
           styles.sheet,
           sheetStyle,
-          { backgroundColor: t.colors.surface1, borderColor: t.colors.separator },
+          { backgroundColor: t.colors.background, borderColor: t.colors.separator },
         ]}
       >
         <GestureDetector gesture={pan}>
@@ -1659,6 +1819,41 @@ export default function ItineraryScreen() {
               ) : null}
             </View>
 
+            {showPlanLanding ? (
+              <View style={styles.whenRow}>
+                <Pressable
+                  onPress={() => openSetup(0)}
+                  style={({ pressed }) => [
+                    styles.whenChip,
+                    { backgroundColor: t.colors.fill1 },
+                    pressed && { opacity: 0.6 },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Change the day and start time"
+                >
+                  <Ionicons name="calendar-outline" size={14} color={t.colors.accent} />
+                  <Text variant="caption" weight="semibold" numberOfLines={1} style={styles.whenChipText}>
+                    {whenSummary}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => openSetup(1)}
+                  style={({ pressed }) => [
+                    styles.whenChip,
+                    { backgroundColor: t.colors.fill1 },
+                    pressed && { opacity: 0.6 },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Change the start and end address"
+                >
+                  <Ionicons name="navigate-circle-outline" size={14} color={t.colors.accent} />
+                  <Text variant="caption" weight="semibold" numberOfLines={1} style={styles.whenChipText}>
+                    {startLabel}
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
+
             {sections.length > 0 ? (
               <ScrollView
                 ref={tabsRef}
@@ -1715,8 +1910,9 @@ export default function ItineraryScreen() {
           contentContainerStyle={{
             paddingHorizontal: showRail ? 0 : t.spacing.lg,
             paddingTop: 8,
-            // Leave room for the floating adjust bar so the last card clears it.
-            paddingBottom: insets.bottom + (itinerary ? 132 : 80),
+            // Leave room for the floating bottom bar (adjust / plan composer)
+            // so the last row always clears it.
+            paddingBottom: insets.bottom + (itinerary ? 132 : 104),
           }}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
@@ -1729,92 +1925,51 @@ export default function ItineraryScreen() {
           {loading ? (
             <PlanningSkeleton />
           ) : !itinerary ? (
-            <View style={{ gap: 16 }}>
-              <Card padded>
-                {homeExpanded ? (
-                  <View style={{ gap: 12 }}>
-                    <HomePicker title="Home" flat />
-                    <Button
-                      title="Done"
-                      variant="tonal"
-                      size="md"
-                      onPress={() => setHomeExpanded(false)}
-                    />
-                  </View>
-                ) : (
-                  <Pressable
-                    onPress={() => setHomeExpanded(true)}
-                    style={({ pressed }) => [
-                      styles.homeSummary,
-                      pressed && { opacity: 0.6 },
-                    ]}
-                  >
-                    <Ionicons name="location" size={18} color={t.colors.accent} />
-                    <View style={{ flex: 1 }}>
-                      <Text variant="caption" tone="tertiary" uppercase weight="bold">
-                        Starting from
-                      </Text>
-                      <Text variant="bodySm" weight="semibold" numberOfLines={1}>
-                        {home?.label ?? 'Tap to set your home'}
-                      </Text>
-                    </View>
-                    <Ionicons
-                      name="settings-outline"
-                      size={18}
-                      color={t.colors.textSecondary}
-                    />
-                  </Pressable>
-                )}
-              </Card>
-              <Card padded>
-                <Pressable
-                  onPress={() => setSetupOpen(true)}
-                  style={({ pressed }) => [
-                    styles.homeSummary,
-                    pressed && { opacity: 0.6 },
-                  ]}
-                >
-                  <Ionicons name="calendar-outline" size={18} color={t.colors.accent} />
-                  <View style={{ flex: 1 }}>
-                    <Text variant="caption" tone="tertiary" uppercase weight="bold">
-                      Planning for
-                    </Text>
-                    <Text variant="bodySm" weight="semibold" numberOfLines={1}>
-                      {whenSummary}
-                    </Text>
-                  </View>
-                  <Ionicons
-                    name="chevron-down"
-                    size={18}
-                    color={t.colors.textSecondary}
-                  />
-                </Pressable>
-                <TextInput
-                  style={[
-                    styles.input,
-                    {
-                      backgroundColor: t.colors.fill1,
-                      color: t.colors.textPrimary,
-                      borderRadius: t.radii.md,
-                      marginTop: 12,
-                    },
-                  ]}
-                  placeholder="e.g. day trip to Olomouc: deep work, meet a friend, the horses, drinks"
-                  placeholderTextColor={t.colors.textTertiary}
-                  value={input}
-                  onChangeText={setInput}
-                  multiline
-                  textAlignVertical="top"
+            <View style={styles.errandsWrap}>
+              {dayErrands.length + anytimeErrands.length > 0 ? (
+                <Text variant="caption" tone="tertiary" style={styles.errandsSelectHint}>
+                  Tap an errand to add it into this plan · tap the arrow to edit.
+                </Text>
+              ) : null}
+              <ErrandGroup
+                label={dayGroupLabel}
+                count={dayErrands.length}
+                items={dayErrands}
+                emptyHint="Nothing for this day yet — add errands from home, then plan below."
+                onEdit={onEditErrand}
+                onToggle={toggleErrandDone}
+                selectedIds={selectedErrandIds}
+                onToggleSelect={toggleErrandSelected}
+              />
+              <ErrandGroup
+                label="Anytime"
+                count={anytimeErrands.length}
+                items={anytimeErrands}
+                emptyHint="No loose errands waiting."
+                onEdit={onEditErrand}
+                onToggle={toggleErrandDone}
+                selectedIds={selectedErrandIds}
+                onToggleSelect={toggleErrandSelected}
+              />
+              {completedErrands.length > 0 ? (
+                <ErrandGroup
+                  label="Completed"
+                  count={completedErrands.length}
+                  items={completedErrands}
+                  emptyHint=""
+                  onEdit={onEditErrand}
+                  onToggle={toggleErrandDone}
+                  completed
+                  today={todayIso}
+                  onReopen={reopenErrand}
+                  collapsible
+                  collapsed={!showCompletedErrands}
+                  onToggleCollapse={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    setShowCompletedErrands((v) => !v);
+                  }}
                 />
-                <Button
-                  title="Plan my day"
-                  onPress={planIt}
-                  loading={loading}
-                  disabled={input.trim().length === 0}
-                  style={{ marginTop: 12 }}
-                  fullWidth
-                />
-              </Card>
+              ) : null}
               {errorMsg ? (
                 <Card padded style={{ borderColor: t.colors.danger, borderWidth: 1 }}>
                   <Text variant="bodySm" tone="danger">
@@ -1869,9 +2024,18 @@ export default function ItineraryScreen() {
                   }
                   rearrangeMode={rearrangeMode}
                   onEnterRearrange={enterRearrange}
-                  onPressPlace={(it) => setSwapItem(it)}
-                  onOpenMenu={(it) => setMenuItemId(it.id)}
-                  onPressLeg={(it) => setLegMenuId(it.id)}
+                  onPressPlace={(it) => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    setSwapItem(it);
+                  }}
+                  onOpenMenu={(it) => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    setMenuItemId(it.id);
+                  }}
+                  onPressLeg={(it) => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    setLegMenuId(it.id);
+                  }}
                   onAddGap={(beforeId, minutes) => addGap({ beforeId, minutes })}
                   onSectionLayout={(y) => {
                     sectionOffsetsRef.current[si] = y;
@@ -1898,7 +2062,10 @@ export default function ItineraryScreen() {
               {debug ? (
                 <Card padded style={{ marginTop: 18, marginLeft: RAIL.contentLeft }}>
                   <Pressable
-                    onPress={() => setShowDebug((v) => !v)}
+                    onPress={() => {
+                      Haptics.selectionAsync().catch(() => undefined);
+                      setShowDebug((v) => !v);
+                    }}
                     style={({ pressed }) => [pressed && { opacity: 0.6 }]}
                   >
                     <View style={styles.debugHeader}>
@@ -2030,6 +2197,15 @@ export default function ItineraryScreen() {
         onSubmit={submitAdjust}
       />
 
+      {/* The plan composer takes the bottom while there's no plan yet; once a
+          day is built the AdjustBar above replaces it. */}
+      <PlanComposer
+        visible={showPlanLanding}
+        busy={loading}
+        placeholder="Describe your day — e.g. deep work, lunch with a friend, then drinks"
+        onSubmit={(text) => planIt(text)}
+      />
+
       <PlaceSwapSheet
         item={swapItem}
         city={itinerary?.city}
@@ -2112,13 +2288,131 @@ export default function ItineraryScreen() {
       <PlanSetupSheet
         open={setupOpen}
         onClose={() => setSetupOpen(false)}
-        onConfirm={(date, startTime) => {
-          setPlanSelection(date, startTime);
+        onConfirm={(selection) => {
+          setDayPlan(selection);
           setSetupOpen(false);
         }}
         initialDate={effectiveDate}
         initialTime={planStartTime}
+        initialStep={setupStep}
       />
+
+      <ErrandDrawer
+        open={errandDrawerOpen}
+        onClose={() => setErrandDrawerOpen(false)}
+        draft={errandSeed}
+        rawText={errandRawText}
+        parsing={false}
+        seedKey={errandSeedKey}
+        mode="edit"
+        onSave={onSaveErrand}
+        onDelete={onDeleteErrand}
+      />
+    </View>
+  );
+}
+
+/**
+ * One group in the pre-plan drawer view: a small uppercase header with a count
+ * pill, then the day's (or anytime) errands rendered as tappable rows. Empty
+ * groups fall back to a soft dashed hint so the section structure stays legible.
+ */
+function ErrandGroup({
+  label,
+  count,
+  items,
+  emptyHint,
+  onEdit,
+  onToggle,
+  selectedIds,
+  onToggleSelect,
+  completed = false,
+  today,
+  onReopen,
+  collapsible = false,
+  collapsed = false,
+  onToggleCollapse,
+}: {
+  label: string;
+  count: number;
+  items: Errand[];
+  emptyHint: string;
+  /** Tap a row body to open it for editing. */
+  onEdit: (errand: Errand) => void;
+  onToggle: (id: string) => void;
+  /** When provided, rows become selectable (tap the circle to fold into plan). */
+  selectedIds?: Set<string>;
+  onToggleSelect?: (id: string) => void;
+  /** Completed mode: rows show a status tag + pull-back, and aren't selectable. */
+  completed?: boolean;
+  today?: string;
+  onReopen?: (id: string) => void;
+  /** Collapsible header (used by the Completed group). */
+  collapsible?: boolean;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+}) {
+  const t = useTheme();
+  const selectable = !completed && !!onToggleSelect;
+  return (
+    <View style={styles.errandGroup}>
+      <Pressable
+        disabled={!collapsible}
+        onPress={onToggleCollapse}
+        accessibilityRole={collapsible ? 'button' : undefined}
+        style={styles.errandGroupHead}
+      >
+        <Text
+          variant="micro"
+          uppercase
+          weight="bold"
+          tone="secondary"
+          style={{ letterSpacing: 1.2 }}
+        >
+          {label}
+        </Text>
+        {count > 0 ? (
+          <View style={[styles.errandCountPill, { backgroundColor: t.colors.fill1 }]}>
+            <Text variant="micro" weight="bold" tone="secondary">
+              {count}
+            </Text>
+          </View>
+        ) : null}
+        {collapsible ? (
+          <Ionicons
+            name={collapsed ? 'chevron-down' : 'chevron-up'}
+            size={15}
+            color={t.colors.textTertiary}
+          />
+        ) : null}
+      </Pressable>
+      {collapsed ? null : items.length > 0 ? (
+        <Card tier="surface2" style={styles.errandsCard}>
+          {items.map((errand, i) => (
+            <ErrandRow
+              key={errand.id}
+              errand={errand}
+              onPress={completed ? undefined : () => onEdit(errand)}
+              onToggleDone={() => onToggle(errand.id)}
+              showSeparator={i < items.length - 1}
+              dimWhenDone={false}
+              selectable={selectable}
+              selected={selectedIds?.has(errand.id) ?? false}
+              onToggleSelect={
+                selectable ? () => onToggleSelect?.(errand.id) : undefined
+              }
+              status={completed && today ? errandStatus(errand, today) : undefined}
+              onReopen={completed && onReopen ? () => onReopen(errand.id) : undefined}
+            />
+          ))}
+        </Card>
+      ) : (
+        <View style={[styles.errandEmpty, { borderColor: t.colors.separator }]}>
+          <Text variant="caption" tone="tertiary">
+            {emptyHint}
+          </Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -2183,12 +2477,25 @@ function ConflictBanner({
         </Text>
       </View>
       <View style={styles.conflictActions}>
-        <Pressable onPress={() => onResolve(head)} hitSlop={6}>
+        <Pressable
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onResolve(head);
+          }}
+          hitSlop={6}
+        >
           <Text variant="caption" weight="bold" style={{ color: t.colors.warning }}>
             {action}
           </Text>
         </Pressable>
-        <Pressable onPress={onDismiss} hitSlop={8} style={styles.conflictDismiss}>
+        <Pressable
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onDismiss();
+          }}
+          hitSlop={8}
+          style={styles.conflictDismiss}
+        >
           <Ionicons name="close" size={16} color={t.colors.textSecondary} />
         </Pressable>
       </View>
@@ -2238,12 +2545,25 @@ function ReplanChip({
         </Text>
       </View>
       <View style={styles.conflictActions}>
-        <Pressable onPress={onConfirm} hitSlop={6}>
+        <Pressable
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onConfirm();
+          }}
+          hitSlop={6}
+        >
           <Text variant="caption" weight="bold" style={{ color: t.colors.accent }}>
             Ask the planner →
           </Text>
         </Pressable>
-        <Pressable onPress={onDismiss} hitSlop={8} style={styles.conflictDismiss}>
+        <Pressable
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onDismiss();
+          }}
+          hitSlop={8}
+          style={styles.conflictDismiss}
+        >
           <Ionicons name="close" size={16} color={t.colors.textSecondary} />
         </Pressable>
       </View>
@@ -2263,7 +2583,10 @@ function RoundButton({
   const t = useTheme();
   return (
     <Pressable
-      onPress={onPress}
+      onPress={() => {
+        Haptics.selectionAsync().catch(() => undefined);
+        onPress();
+      }}
       accessibilityLabel={label}
       hitSlop={8}
       style={({ pressed }) => [
@@ -2826,7 +3149,14 @@ function GapRow({
   const t = useTheme();
   return (
     <Pressable
-      onPress={onPress}
+      onPress={
+        onPress
+          ? () => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onPress();
+            }
+          : undefined
+      }
       disabled={!onPress}
       style={({ pressed }) => [
         styles.connRow,
@@ -3079,15 +3409,13 @@ function TravelLegRow({
   const hasSteps = steps.length > 0;
   const label = TRAVEL_MODE_LABEL[leg.mode] ?? 'travel';
 
-  // Per-hop clock, REBASED so the journey starts at the leg's actual `leaveBy`.
-  //
-  // Transit steps carry Google's REAL board/alight times (`departAt`/`arriveAt`),
-  // but those are ABSOLUTE and tied to WHEN the route was queried (usually
-  // "depart now"). On a leg the planner later slots elsewhere in the day they
-  // read hours off — a 01:15 trip showing 23:52 buses — which also stranded the
-  // live highlight, since the hops then fell outside the leg's own window. So we
-  // keep the journey's real SHAPE (ride lengths AND the platform waits between
-  // hops) but slide the whole sequence onto the leg's departure.
+  // Per-hop clock. Transit steps carry Google's REAL board/alight times
+  // (`departAt`/`arriveAt`) for the leg's actual planned departure slot, so by
+  // default we show those verbatim — "145 at 12:29" is the bus that truly runs,
+  // and any platform wait is real. Only when there's no scheduled hop to anchor
+  // to (a pure-walk leg) or the schedule lands implausibly far from where the
+  // day places this leg (the old "queried at NOW, hours off" failure) do we fall
+  // back to keeping just the journey's SHAPE and sliding it onto `leaveBy`.
   const leaveByMin = minutesOfDay(leaveBy);
   const firstTimed = steps.findIndex((s) => minutesOfDay(s.departAt) != null);
   // 1) Lay every hop on Google's own unwrapped axis: scheduled hops pin to their
@@ -3117,15 +3445,37 @@ function TravelLegRow({
     const g1 = gFrame[i + 1].g0;
     gFrame[i] = { g0: g1 - (steps[i].durationMinutes ?? 0), g1 };
   }
-  // 2) Shift so the first hop lands on `leaveBy`. With no scheduled hop to anchor
-  //    against (a trivial all-walk leg) this still chains from leaveBy; with no
-  //    leaveBy at all we leave Google's frame untouched.
-  const anchorTo = leaveByMin ?? (gFrame.length ? gFrame[0].g0 : 0);
+  // 2) Prefer Google's REAL schedule; rebase onto `leaveBy` only as a fallback.
+  //    We WANT to show the vehicle that genuinely departs ("145 at 12:29"), not
+  //    a synthetic "leaveBy + walk" time. Google's board/alight times are sound
+  //    now because the server queries each leg for its real planned departure
+  //    slot (a past slot is rolled forward whole weeks so the time-of-day still
+  //    matches the live timetable). We fall back to sliding onto `leaveBy` only
+  //    for a pure-walk leg (nothing scheduled to anchor to) or when the returned
+  //    schedule sits implausibly far from where the day places this leg — the
+  //    stale "queried at NOW, hours off" case this rebasing was first added for.
+  const realFirst = firstTimed >= 0 ? gFrame[firstTimed].g0 : null;
+  const circDist = (a: number, b: number) => {
+    const d = Math.abs(a - b) % 1440;
+    return Math.min(d, 1440 - d);
+  };
+  const usingReal =
+    realFirst != null &&
+    (leaveByMin == null || circDist(((realFirst % 1440) + 1440) % 1440, leaveByMin) <= 90);
+  // Real times → keep Google's frame exactly where it is (shift 0). Fallback →
+  // slide the whole sequence so the first hop lands on `leaveBy`.
+  const anchorTo = usingReal ? gFrame[0].g0 : (leaveByMin ?? (gFrame.length ? gFrame[0].g0 : 0));
   const shift = anchorTo - (gFrame.length ? gFrame[0].g0 : 0);
   const stepTimes = gFrame.map((gf) => ({
     start: addMinutes('00:00', gf.g0 + shift),
     end: addMinutes('00:00', gf.g1 + shift),
   }));
+  // Keep the panel header consistent with whichever clock we're showing: when
+  // using real times the honest "Leave by" is the start of the first hop and the
+  // duration is the real door-to-door span, not the cascade's slack-padded one.
+  const realSpan = gFrame.length ? gFrame[gFrame.length - 1].g1 - gFrame[0].g0 : 0;
+  const headerLeaveBy = usingReal && stepTimes.length ? stepTimes[0].start : leaveBy;
+  const headerMinutes = usingReal && realSpan > 0 ? realSpan : leg.minutes;
 
   // Hop times on the rail's ABSOLUTE (midnight-unwrapped) axis. First unwrap the
   // hops among themselves (a journey can roll past midnight: alight 00:32 after
@@ -3242,19 +3592,19 @@ function TravelLegRow({
         }}
       >
         <View style={styles.commuteHeader}>
-          {leaveBy ? (
+          {headerLeaveBy ? (
             <>
               <Ionicons name="time-outline" size={12} color={c.accent} />
               <RNText style={[styles.commuteLeave, { color: c.accent }]}>
-                {`Leave by ${leaveBy}`}
+                {`Leave by ${headerLeaveBy}`}
               </RNText>
               <RNText style={[styles.commuteMeta, { color: c.textTertiary }]}>
-                {`  ·  ${formatLegMinutes(leg.minutes)}`}
+                {`  ·  ${formatLegMinutes(headerMinutes)}`}
               </RNText>
             </>
           ) : (
             <RNText style={[styles.commuteMeta, { color: c.textSecondary }]}>
-              {`${formatLegMinutes(leg.minutes)} ${label}`}
+              {`${formatLegMinutes(headerMinutes)} ${label}`}
             </RNText>
           )}
           {onPress ? (
@@ -3642,16 +3992,57 @@ const styles = StyleSheet.create({
       android: { elevation: 4 },
     }),
   },
-  input: {
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 16,
-    minHeight: 110,
+  whenRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingTop: 12,
   },
-  homeSummary: {
+  whenChip: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 6,
+    paddingVertical: 7,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+  },
+  whenChipText: {
+    flexShrink: 1,
+  },
+  errandsWrap: {
+    gap: 18,
+  },
+  errandsSelectHint: {
+    marginTop: -4,
+    marginBottom: -6,
+    paddingHorizontal: 2,
+  },
+  errandGroup: {
+    gap: 10,
+  },
+  errandGroupHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 4,
+  },
+  errandCountPill: {
+    minWidth: 20,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    alignItems: 'center',
+  },
+  errandsCard: {
+    paddingHorizontal: 2,
+  },
+  errandEmpty: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderStyle: 'dashed',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 14,
+    alignItems: 'center',
   },
   sectionHeader: {
     gap: 2,
@@ -3945,7 +4336,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 2,
     borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: 8,
+    borderRadius: 999,
     paddingVertical: 3,
     paddingHorizontal: 7,
   },

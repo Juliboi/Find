@@ -7,6 +7,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 
 /**
@@ -266,7 +267,14 @@ function StopMarker({
   return (
     <Marker
       coordinate={{ latitude: stop.latitude, longitude: stop.longitude }}
-      onPress={onPress}
+      onPress={
+        onPress
+          ? () => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onPress();
+            }
+          : undefined
+      }
       anchor={{ x: 0.5, y: 0.5 }}
       tracksViewChanges={tracks}
       zIndex={stop.kind === 'waypoint' ? 1 : 2}
