@@ -19,7 +19,13 @@ import { Text } from '@/components/Text';
 import { WaveLoader } from '@/components/WaveLoader';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
-import { configureNotifications, isDailyReviewResponse } from '@/lib/notifications';
+import {
+  configureNotifications,
+  isDailyReviewResponse,
+  isPlanReadyResponse,
+  planReadySavedId,
+} from '@/lib/notifications';
+import { InAppNotification } from '@/components/InAppNotification';
 
 // Hold the native splash until React has painted our themed splash overlay, so
 // the home screen can't flash through before the first auth redirect lands.
@@ -101,7 +107,20 @@ function useNotificationsBootstrap(): void {
   useEffect(() => {
     const sub = Notifications.addNotificationResponseReceivedListener(
       (response) => {
-        if (isDailyReviewResponse(response)) router.navigate('/');
+        if (isDailyReviewResponse(response)) {
+          router.navigate('/');
+          return;
+        }
+        // A finished-plan push: open straight to the built day when we know
+        // its id, otherwise just surface the home screen where the card lives.
+        if (isPlanReadyResponse(response)) {
+          const savedId = planReadySavedId(response);
+          if (savedId) {
+            router.navigate({ pathname: '/itinerary', params: { id: savedId } });
+          } else {
+            router.navigate('/');
+          }
+        }
       },
     );
     return () => sub.remove();
@@ -177,6 +196,7 @@ export default function RootLayout() {
             <Stack.Screen name="day-plans" />
           </Stack>
           {!settled ? <Splash /> : null}
+          <InAppNotification />
         </BottomSheetModalProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>

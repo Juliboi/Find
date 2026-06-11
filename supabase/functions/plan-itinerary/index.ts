@@ -339,6 +339,19 @@ function nameSimilar(a: string, b: string): boolean {
   return union > 0 && inter / union >= 0.5;
 }
 
+// Parcel lockers / pickup points masquerade as the venue type in a Places
+// search — a "pharmacy" query surfaces a BENU "výdejní box", a "groceries" one
+// a Zásilkovna/Z-BOX/AlzaBox locker. You can't actually shop or pick up a
+// counter order there, so they must never win a self-pick. Tuned to known
+// CZ/SK locker brands + generic "pickup/parcel box" wording; deliberately does
+// NOT match a bare "box" (a CrossFit/bouldering "box" is a real gym).
+const PARCEL_LOCKER_RE =
+  /(v[ýy]dejn[íi]\s*(box|m[íi]sto|automat)|z[áa]silkovna|\bz-?box\b|alza\s?box|bal[íi]kovna|packeta|paczkomat|(parcel|pickup|package)\s*(box|shop|locker|point)|smart\s?box)/i;
+
+function isParcelLocker(name: string): boolean {
+  return !!name && PARCEL_LOCKER_RE.test(name);
+}
+
 function extractJsonObject(text: string): any | null {
   if (!text) return null;
   const fenced = text.replace(/```json\s*|\s*```/g, '');
@@ -486,7 +499,7 @@ function buildPlannerPrompt(args: {
   // corridor-aware picker downstream chooses the real, on-route venue — which
   // is what stops a freshly planned day zig-zagging across the city.
   const selfPickRule =
-    ' SELF-PICKED VENUES: when the user did NOT name the place (YOU are choosing it), do NOT commit to one specific distant branch. Set place.pinned: false, set place.searchQuery to the venue TYPE in 2–4 words ("specialty coffee shop", "24h pharmacy", "bouldering gym", "vegan lunch spot"), and set place.area to the neighbourhood it should sit in ("Karlín", "near Anděl"). Still include place.name (a real example you know) and approximate place.coords as a HINT for WHERE in the city it belongs — the app then resolves the real, on-route venue near that area. Keep searchQuery generic enough to match several venues, never a single brand.';
+    ' SELF-PICKED VENUES: when the user did NOT name a specific place (YOU are choosing it), or named only a BRAND/chain without a branch ("a Max Fitness", "a Billa"), do NOT commit to one specific branch. Set place.pinned: false, set place.searchQuery to the venue TYPE in 2–4 words ("specialty coffee shop", "24h pharmacy", "bouldering gym", "vegan lunch spot"), and set place.area to the neighbourhood it should sit in ("Karlín", "near Anděl"). Still include place.name (a real example you know) and approximate place.coords as a HINT for WHERE in the city it belongs — the app then resolves the real, on-route, currently-open venue near that area. Keep searchQuery generic enough to match several venues, never a single branch. ALWAYS emit this place block for ANY stop that physically happens at a venue — even a quick errand (pick up a prescription, grab a coffee, buy groceries); never leave such a stop with no place. CRUCIAL: the app swaps in the real branch AND recomputes the route to it, so anything you write naming a guessed branch will contradict the venue actually pinned. Keep the whole item generic: the TITLE, the DESCRIPTION, and any travel wording must refer to the spot by TYPE and relative position ("grab toothpaste at a pharmacy by the gym", "morning workout at the gym", "head to a café near the office") — do NOT put a specific shop, mall, branch, street or metro-stop name in the title, description, travel labels or transit steps for a self-picked/brand venue. When you must relate a self-picked stop to another stop, name that other stop BY ITS ROLE ("near the gym", "by the café", "close to the office") — NEVER by a neighbourhood, mall or street, because those other stops may themselves be app-picked and land elsewhere, so a named area in the prose contradicts the real route (e.g. write "grab toothpaste at a pharmacy near the gym", never "a pharmacy at OC Krakov").';
   const areaOrderRule =
     ' ROUTE SHAPE: order the located stops so the day flows through neighbourhoods coherently — cluster stops that are near each other and avoid crossing the city and doubling back. A tight, low-travel route matters more than a marginally better-known venue farther away.';
   const venueRule = args.grounded
@@ -538,7 +551,7 @@ REQUIREMENTS
 ${coverageRule}
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
 ${venueRule}
-5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
+5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg. PHONE / ADMIN ERRANDS — anything whose actual action is a call, text, email, online booking, reservation or scheduling ("call Bernard", "reserve a new therapy session", "book a table", "schedule a haircut") is done from wherever the user already is: treat it as AT-HOME and OMIT the "place" field. A place, clinic, neighbourhood or person mentioned in such an errand names WHAT it is about (which therapist, which restaurant) — it is NOT a destination to travel to, so never route the user there or emit a travel leg for it.
 6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
@@ -1202,28 +1215,51 @@ async function pickOnCorridor(args: {
             distanceM: homeC ? Math.round(distM(homeC, coords)) : 0,
             rating: c.rating,
             ratingCount: c.ratingCount,
-            openNow: c.openNow,
+            // Open state AT THE PLANNED VISIT TIME (from visitFitsHours), never
+            // Google's live "open right now" flag — otherwise the real wall
+            // clock, not the day being planned, would nudge venue ranking.
+            openNow:
+              fit.status === 'closed' ? false : fit.status === 'open' ? true : null,
           },
           radiusM: radius,
           everyday,
           detourM,
         }),
       };
-    })
-    .filter((x) => {
-      // Pick the right branch of a named brand; drop visibly bad and the
-      // implausibly-far (a same-named venue resolved in the wrong city).
-      if (brand && !nameSimilar(x.c.name, brand)) return false;
-      if (x.c.rating != null && x.c.rating < 3.8) return false;
-      if (homeC && haversineMeters(x.coords, homeC) > MAX_PLAUSIBLE_VENUE_M) return false;
-      return true;
     });
-  if (scored.length === 0) return null;
+  // Drop the unusable: parcel lockers / pickup boxes (you can't shop there),
+  // visibly-bad ratings, and the implausibly-far (a same-named venue resolved
+  // in the wrong city).
+  // Quality floor: for everyday commodity errands (pharmacy, grocery, café) the
+  // nearby low-rated chain is exactly what you want — proximity beats stars, so
+  // only screen out the genuinely awful. Destinations you travel to (gym,
+  // museum) keep a real bar. A Dr.Max at 3.0★ next door must NOT lose to a 4.5★
+  // pharmacy 40 min across town.
+  const ratingFloor = everyday ? 2.5 : 3.8;
+  const notLockerOrFar = (x) =>
+    !isParcelLocker(x.c.name) &&
+    !(homeC && haversineMeters(x.coords, homeC) > MAX_PLAUSIBLE_VENUE_M);
+  let viable = scored.filter(
+    (x) => notLockerOrFar(x) && !(x.c.rating != null && x.c.rating < ratingFloor),
+  );
+  // If the quality bar emptied the (route-aware) pool, keep the on-corridor
+  // candidates anyway rather than returning null — null drops the stop to the
+  // non-route-aware home lookup, which is how the pharmacy ended up 40 min away.
+  if (viable.length === 0) viable = scored.filter(notLockerOrFar);
+  // Prefer the user-named brand's on-route branch — but if NONE of its branches
+  // surfaced on this corridor, fall back to the best real venue of the same
+  // TYPE rather than returning null. Returning null drops the stop to the
+  // caller's home-biased lookup of the model's guess, which is exactly how a
+  // gym ended up "pinned at home"; a real on-corridor venue is what the user
+  // asked for ("anywhere, as long as it fits the route and is a real place").
+  const branded = brand ? viable.filter((x) => nameSimilar(x.c.name, brand)) : viable;
+  const eligible = branded.length > 0 ? branded : viable;
+  if (eligible.length === 0) return null;
 
   // Prefer venues open for the WHOLE visit; never let unknown hours exclude a
   // candidate. Drop only the definitively-closed unless that's all we have.
-  const usable = scored.filter((x) => x.status !== 'closed');
-  const pool = usable.length > 0 ? usable : scored;
+  const usable = eligible.filter((x) => x.status !== 'closed');
+  const pool = usable.length > 0 ? usable : eligible;
   pool.sort((a, b) => {
     if (a.fits !== b.fits) return a.fits ? -1 : 1;
     return b.score - a.score;
@@ -1498,11 +1534,16 @@ async function enrichItinerary(
     const rep = g.slots[0];
     const record = g.record;
     if (!record) {
-      // Couldn't verify the venue. A model coord that sits absurdly far from
-      // home is almost certainly hallucinated (the "routed 61 km away" bug) —
-      // drop it so routing doesn't draw a phantom cross-country leg; the stop
-      // falls back to unlocated instead of teleporting the whole day.
-      if (homeC && rep.coords && haversineMeters(rep.coords, homeC) > MAX_PLAUSIBLE_VENUE_M) {
+      // Couldn't verify the venue. Drop the model's coord when keeping it would
+      // mislead: (a) it sits absurdly far from home (the "routed 61 km away"
+      // hallucination) so routing won't draw a phantom cross-country leg; or
+      // (b) it's a venue WE were meant to pick (not a user-pinned address) yet
+      // the guess sits right on top of home — that renders as a "gym pinned at
+      // home" phantom. Either way the stop falls back to unlocated instead.
+      const c = rep.coords;
+      const farAway = !!(homeC && c && haversineMeters(c, homeC) > MAX_PLAUSIBLE_VENUE_M);
+      const onTopOfHome = !!(homeC && c && !g.pinned && haversineMeters(c, homeC) < 150);
+      if (farAway || onTopOfHome) {
         for (const { item } of g.slots) {
           if (item.place && typeof item.place === 'object') item.place.coords = undefined;
         }

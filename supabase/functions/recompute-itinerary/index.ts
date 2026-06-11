@@ -80,7 +80,7 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: 'Method not allowed' }, 405);
   }
 
-  let payload: { itinerary?: any; context?: any; timezone?: any; now?: any };
+  let payload: { itinerary?: any; context?: any; timezone?: any; now?: any; optimize?: any };
   try {
     payload = await req.json();
   } catch {
@@ -93,6 +93,9 @@ Deno.serve(async (req: Request) => {
   }
   const context = normalizeContext(payload.context);
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
+  // Only fresh plans send `optimize: true`; edits/refreshes omit it so a user's
+  // hand-arranged order is never reshuffled underneath them.
+  const optimizeOrder = payload.optimize === true;
 
   // Time-aware routing inputs (optional): the client's IANA zone + "now" let us
   // price each transit/driving leg for its real departure slot instead of the
@@ -117,7 +120,7 @@ Deno.serve(async (req: Request) => {
       itinerary,
       context,
       googleKey,
-      { stripTravel: true, appendBackHome: true },
+      { stripTravel: true, appendBackHome: true, optimizeOrder },
       timing,
     );
   } catch (e) {

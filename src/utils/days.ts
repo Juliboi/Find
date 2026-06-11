@@ -1,4 +1,5 @@
 import { todayISO } from './time';
+import { devNow } from '@/store/useDevClockStore';
 
 /**
  * A single selectable day in the "which day are you planning?" wheel. Carries
@@ -61,7 +62,7 @@ function describe(d: Date, todayIso: string, tomorrowIso: string): DayOption {
  * wheel — "today" sits first so it can be the pre-selected default, with the
  * rest of the week following.
  */
-export function upcomingWeek(count = 7, from: Date = new Date()): DayOption[] {
+export function upcomingWeek(count = 7, from: Date = devNow()): DayOption[] {
   const base = new Date(from.getFullYear(), from.getMonth(), from.getDate());
   const todayIso = isoOf(base);
   const tomorrow = new Date(base);
@@ -79,7 +80,7 @@ export function upcomingWeek(count = 7, from: Date = new Date()): DayOption[] {
 
 /** Human description for an arbitrary stored ISO date (today/tomorrow aware). */
 export function describeDay(iso: string): DayOption {
-  const base = new Date();
+  const base = devNow();
   const todayIso = isoOf(new Date(base.getFullYear(), base.getMonth(), base.getDate()));
   const tomorrow = new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
   return describe(dateFromISO(iso), todayIso, isoOf(tomorrow));
@@ -91,7 +92,7 @@ export function describeDay(iso: string): DayOption {
  * 23:55 so rounding never spills into the next day.
  */
 export function roundedNowHHMM(step = 5): string {
-  const d = new Date();
+  const d = devNow();
   let mins = d.getHours() * 60 + d.getMinutes();
   mins = Math.round(mins / step) * step;
   mins = Math.min(mins, 23 * 60 + 55);

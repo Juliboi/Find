@@ -35,11 +35,13 @@ import {
 } from '@/store/useErrandsStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { useWeatherStore } from '@/store/useWeatherStore';
+import { usePlanJobsStore } from '@/store/usePlanJobsStore';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from '@/components/Text';
 import { GlassSurface } from '@/components/Glass';
 import { GradientWave } from '@/components/GradientWave';
 import { ChatComposerBar } from '@/components/ChatComposerBar';
+import { PlanBuildingCard } from '@/components/PlanBuildingCard';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { ErrandDrawer } from '@/components/ErrandDrawer';
 import { ErrandRow } from '@/components/ErrandRow';
@@ -176,6 +178,15 @@ export default function HomeScreen() {
   );
   const otherTodayCount = Math.max(0, todayPlans.length - 1);
 
+  // A day still building in the background (the user kicked off a plan and was
+  // sent back here). Takes over the card with a live skeleton until it lands —
+  // see the card branch below. We surface the most recent in-flight build
+  // regardless of its date: the card speaks for itself ("Building your plan")
+  // and a future-day build still deserves visible progress here.
+  const buildingJob = usePlanJobsStore((s) =>
+    s.jobs.find((j) => j.status === 'building'),
+  );
+
   // ----- Errands -----
   const errands = useErrandsStore((s) => s.items);
   const addErrand = useErrandsStore((s) => s.add);
@@ -292,7 +303,8 @@ export default function HomeScreen() {
     void Notifications.clearLastNotificationResponseAsync();
   }, [lastNotificationResponse]);
 
-  // Build the single adaptive card: planning → up-next → recent trip → prompt.
+  // Build the single adaptive card: building → planning → up-next → recent
+  // trip → prompt.
   let cardOnPress: (() => void) | undefined;
   let cardA11y: string | undefined;
   let cardBody: React.ReactNode;
@@ -300,8 +312,18 @@ export default function HomeScreen() {
   // headline — only for the live saved plan, which carries timed blocks +
   // commutes the peek can read.
   let cardPeek: React.ReactNode = null;
+  // When set, replaces the standard row+peek with a bespoke card body (the
+  // background-build skeleton).
+  let cardFullBody: React.ReactNode = null;
 
-  if (isWorking) {
+  if (buildingJob) {
+    cardOnPress = () => {
+      Haptics.selectionAsync().catch(() => undefined);
+      router.push({ pathname: '/itinerary', params: { jobId: buildingJob.id } });
+    };
+    cardA11y = 'Building your plan — tap to watch it come together';
+    cardFullBody = <PlanBuildingCard job={buildingJob} />;
+  } else if (isWorking) {
     cardBody = (
       <>
         <ActivityIndicator color={t.colors.accent} />
@@ -498,8 +520,12 @@ export default function HomeScreen() {
               style={[styles.card, { shadowColor: t.colors.shadow }]}
               innerStyle={styles.cardInner}
             >
-              <View style={styles.cardRow}>{cardBody}</View>
-              {cardPeek}
+              {cardFullBody ?? (
+                <>
+                  <View style={styles.cardRow}>{cardBody}</View>
+                  {cardPeek}
+                </>
+              )}
             </GlassSurface>
           </Pressable>
 

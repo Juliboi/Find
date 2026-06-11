@@ -15,6 +15,14 @@ import { minutesOfDay } from '@/utils/time';
 /** Discriminator carried in a notification's `data`, used to route taps. */
 export const DAILY_REVIEW_KIND = 'daily-review';
 
+/**
+ * Discriminator for the "your plan finished building" nudge. Fired from the
+ * device the moment a backgrounded plan job resolves (see usePlanJobsStore) —
+ * the in-app toast covers the foreground case, so this only ever shows when
+ * Diem isn't the active app.
+ */
+export const PLAN_READY_KIND = 'plan-ready';
+
 /** Stable identifier so we can reschedule/cancel the daily nudge idempotently. */
 const DAILY_REVIEW_ID = 'diem.daily-review';
 
@@ -116,4 +124,51 @@ export function isDailyReviewResponse(
   return (
     response?.notification.request.content.data?.kind === DAILY_REVIEW_KIND
   );
+}
+
+/**
+ * Immediately deliver a "your plan is ready" notification. Used by the plan
+ * job runner when a day finishes building while Diem is backgrounded (the
+ * foreground case is handled by the in-app toast instead, so the two never
+ * double up). Requests permission if it hasn't been decided yet, then posts
+ * with a `null` trigger so the OS shows it right away. Carries the saved
+ * itinerary id in `data` so a tap can open straight to the finished day.
+ */
+export async function notifyPlanReady(opts: {
+  title: string;
+  savedId?: string;
+}): Promise<void> {
+  if (Platform.OS === 'web') return;
+  const granted = await ensureNotificationPermission();
+  if (!granted) return;
+  const name = opts.title.trim() || 'Your day plan';
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: `${name} is ready`,
+      body: 'Your day is all mapped out — tap to take a look.',
+      data: { kind: PLAN_READY_KIND, savedId: opts.savedId },
+    },
+    // `null` fires it right away. Android falls back to its default channel
+    // for immediate posts, which is fine for a one-off "it's done" nudge.
+    trigger: null,
+  }).catch(() => undefined);
+}
+
+/** True when a tapped notification is a finished-plan nudge. */
+export function isPlanReadyResponse(
+  response: Notifications.NotificationResponse | null | undefined,
+): boolean {
+  return response?.notification.request.content.data?.kind === PLAN_READY_KIND;
+}
+
+/**
+ * The saved itinerary id carried by a finished-plan notification, if any, so
+ * the tap handler can route straight to the built day.
+ */
+export function planReadySavedId(
+  response: Notifications.NotificationResponse | null | undefined,
+): string | undefined {
+  if (!isPlanReadyResponse(response)) return undefined;
+  const id = response?.notification.request.content.data?.savedId;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }

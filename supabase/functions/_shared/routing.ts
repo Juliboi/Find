@@ -10,6 +10,8 @@
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
+import { visitFitsHours, type VenueOpeningHours } from './hours.ts';
+
 export type TravelMode = 'walk' | 'bike' | 'transit' | 'drive';
 
 export interface Coords {
@@ -603,6 +605,239 @@ function stripAiTravelItems(parsed: any): void {
   );
 }
 
+/**
+ * Deterministic travel-minimiser — the "least-travel baseline" the AI's own
+ * ordering can't be trusted to find. The model decides WHAT to do (and roughly
+ * when); this decides the ORDER of the movable venue stops so the day's real
+ * travel is as small as possible. Hybrid by design:
+ *
+ *   - Fixed commitments (a booked lunch, a class) keep their slot and time.
+ *   - At-home routines and locationless stops (skincare, reading, calls,
+ *     reservations) stay exactly where the model placed them.
+ *   - Only FLEXIBLE, located venue stops (gym, pharmacy, a self-picked café)
+ *     are reordered — each dropped into the cheapest gap of the
+ *     start → … → home chain (straight-line) that keeps it OPEN at the
+ *     projected time. That is what lets "do the pharmacy on the way home" win
+ *     without sending you to a shut store.
+ *
+ * Side-effecting: rewrites `parsed.sections` in place, preserving each
+ * section's size + label, and only when the saving is meaningful (else the
+ * model's order is left untouched to avoid churn). Runs BEFORE leg routing in
+ * `routeAndSchedule`, so the existing real-leg + clock cascade re-times the new
+ * order for free. Best-effort — wrapped by the caller so it can never break a
+ * recompute.
+ */
+export function optimizeStopOrder(parsed: any, context: Context): void {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+
+  const homeC: Coords | null = context.home
+    ? { latitude: context.home.latitude, longitude: context.home.longitude }
+    : null;
+  // The chain begins where the day actually starts (a picked start location,
+  // else home) and ends at the day's end pin (else home) — same anchors the
+  // real router uses, so the geometry we minimise matches the legs we'll draw.
+  const startC: Coords | null = context.currentLocation
+    ? {
+        latitude: context.currentLocation.latitude,
+        longitude: context.currentLocation.longitude,
+      }
+    : homeC;
+  const endC: Coords | null = context.endOfDay
+    ? { latitude: context.endOfDay.latitude, longitude: context.endOfDay.longitude }
+    : homeC;
+  const dateISO: string | null = typeof parsed.date === 'string' ? parsed.date : null;
+
+  // The travel coord of an item — a real venue pin, or HOME for an explicit
+  // at-home block. Mirrors the `seq` logic in routeAndSchedule.
+  const coordOf = (item: any): Coords | null => {
+    const pc = item?.place?.coords;
+    if (pc && Number.isFinite(pc.latitude) && Number.isFinite(pc.longitude)) {
+      return { latitude: pc.latitude, longitude: pc.longitude };
+    }
+    if (homeC && item?.locationStrategy === 'at_home') return homeC;
+    return null;
+  };
+
+  // A stop we're allowed to move: a real located venue that is neither a hard
+  // fixed commitment nor an at-home activity.
+  const isMovable = (item: any): boolean => {
+    const pc = item?.place?.coords;
+    if (!pc || !Number.isFinite(pc.latitude) || !Number.isFinite(pc.longitude)) return false;
+    if (item?.flexibility === 'fixed') return false;
+    if (item?.locationStrategy === 'at_home') return false;
+    return true;
+  };
+
+  const flat = flattenItems(parsed);
+  if (flat.length < 2) return;
+  const movables = flat.filter(isMovable);
+  if (movables.length === 0) {
+    // Visible in `supabase functions logs recompute-itinerary`. If you see this
+    // on a day with real errands, the venues never resolved coords (or are all
+    // fixed/at-home), so there is nothing the reorder is allowed to move.
+    console.log('[optimizeStopOrder] no movable venue stops → order unchanged');
+    return;
+  }
+
+  // Total straight-line travel of an item order: start → coord nodes → end.
+  const chainCost = (list: any[]): number => {
+    const pts: Coords[] = [];
+    if (startC) pts.push(startC);
+    for (const it of list) {
+      const c = coordOf(it);
+      if (c) pts.push(c);
+    }
+    if (endC) pts.push(endC);
+    let sum = 0;
+    for (let i = 1; i < pts.length; i++) sum += haversineMeters(pts[i - 1], pts[i]);
+    return sum;
+  };
+
+  // Projected clock at a list gap = end of the nearest preceding timed item,
+  // else start of the nearest following one. Coarse on purpose: enough to
+  // reject a slot where the venue is hard-closed; the cascade fixes exact
+  // times afterwards.
+  const projectedStart = (order: any[], gap: number): number | null => {
+    for (let i = gap - 1; i >= 0; i--) {
+      const e = parseHHMM(order[i]?.endTime) ?? parseHHMM(order[i]?.startTime);
+      if (e != null) return e;
+    }
+    for (let i = gap; i < order.length; i++) {
+      const s = parseHHMM(order[i]?.startTime);
+      if (s != null) return s;
+    }
+    return null;
+  };
+
+  const openAtGap = (item: any, order: any[], gap: number): boolean => {
+    const hours: VenueOpeningHours | undefined = item?.place?.openingHours;
+    if (!hours) return true; // unknown hours → never block a placement
+    const start = projectedStart(order, gap);
+    if (start == null) return true;
+    const dur = itemDuration(item);
+    const fit = visitFitsHours(hours, dateISO, fmtHHMM(start), fmtHHMM(start + dur));
+    return fit.status !== 'closed';
+  };
+
+  // Insert `m` into the cheapest gap of `order`, preferring gaps where it stays
+  // open; returns the chosen index. Reused by build + local-search passes.
+  const bestGapFor = (order: any[], m: any): number => {
+    let bestGap = order.length;
+    let bestCost = Infinity;
+    let bestOpen = false;
+    for (let gap = 0; gap <= order.length; gap++) {
+      const trial = order.slice(0, gap).concat([m], order.slice(gap));
+      const cost = chainCost(trial);
+      const open = openAtGap(m, order, gap);
+      // Feasible (open) slots beat closed ones; ties broken by least travel.
+      const better = (open && !bestOpen) || (open === bestOpen && cost < bestCost);
+      if (better) {
+        bestGap = gap;
+        bestCost = cost;
+        bestOpen = open;
+      }
+    }
+    return bestGap;
+  };
+
+  // 1) Cheapest-insertion: start from the immovable skeleton and drop each
+  //    movable (in original time order, for a stable result) into its best gap.
+  const skeleton = flat.filter((it) => !isMovable(it));
+  const pending = movables
+    .slice()
+    .sort((a, b) => (parseHHMM(a?.startTime) ?? 0) - (parseHHMM(b?.startTime) ?? 0));
+  const order = skeleton.slice();
+  for (const m of pending) order.splice(bestGapFor(order, m), 0, m);
+
+  // 2) Local-search cleanup (relocate): pull each movable and reinsert it at
+  //    its current-best gap; repeat while it helps. Stop count is tiny, so a
+  //    few passes converge to an effectively optimal order.
+  for (let pass = 0; pass < 4; pass++) {
+    let improved = false;
+    for (const m of movables) {
+      const at = order.indexOf(m);
+      if (at < 0) continue;
+      order.splice(at, 1);
+      const gap = bestGapFor(order, m);
+      if (gap !== at) improved = true;
+      order.splice(gap, 0, m);
+    }
+    if (!improved) break;
+  }
+
+  // A movable counts as "closed" when its venue's hours reject a visit at its
+  // projected time in `list` — neighbours decide the time, the stop itself is
+  // excluded. Lets the guardrail tell a pure reshuffle from one that actually
+  // rescues a stop from a shut-store slot.
+  const visitClosed = (list: any[], i: number): boolean => {
+    const item = list[i];
+    const hours: VenueOpeningHours | undefined = item?.place?.openingHours;
+    if (!hours) return false;
+    let start: number | null = null;
+    for (let j = i - 1; j >= 0; j--) {
+      const e = parseHHMM(list[j]?.endTime) ?? parseHHMM(list[j]?.startTime);
+      if (e != null) {
+        start = e;
+        break;
+      }
+    }
+    if (start == null) {
+      for (let j = i + 1; j < list.length; j++) {
+        const s = parseHHMM(list[j]?.startTime);
+        if (s != null) {
+          start = s;
+          break;
+        }
+      }
+    }
+    if (start == null) return false;
+    const dur = itemDuration(item);
+    return visitFitsHours(hours, dateISO, fmtHHMM(start), fmtHHMM(start + dur)).status === 'closed';
+  };
+  const countClosed = (list: any[]): number => {
+    let n = 0;
+    for (let i = 0; i < list.length; i++) if (isMovable(list[i]) && visitClosed(list, i)) n++;
+    return n;
+  };
+
+  // Guardrail: adopt the new order when it cuts travel meaningfully (≥10% or
+  // ≥500 m) OR when it rescues a stop from a closed-hours slot without bloating
+  // travel (≤800 m worse) — otherwise keep the model's order so we never churn
+  // the day for a few metres.
+  const before = chainCost(flat);
+  const after = chainCost(order);
+  const saved = before - after;
+  const travelWin = saved > 0 && (saved >= before * 0.1 || saved >= 500);
+  const hoursWin = countClosed(order) < countClosed(flat) && after <= before + 800;
+  const titlesOf = (l: any[]) => l.map((it) => it?.title ?? '?').join(' → ');
+  if (!travelWin && !hoursWin) {
+    // The reorder ran but the AI's order was already (near-)optimal, so we kept
+    // it to avoid churn. "Same results every time" with this line = working as
+    // intended for that day, NOT a stale deploy.
+    console.log(
+      `[optimizeStopOrder] kept AI order — movables=${movables.length} ` +
+        `${Math.round(before)}m→${Math.round(after)}m saved=${Math.round(saved)}m (below threshold)`,
+    );
+    return;
+  }
+  console.log(
+    `[optimizeStopOrder] REORDERED — movables=${movables.length} ` +
+      `${Math.round(before)}m→${Math.round(after)}m saved=${Math.round(saved)}m ` +
+      `[${travelWin ? 'travel' : ''}${travelWin && hoursWin ? '+' : ''}${hoursWin ? 'hours' : ''}] :: ${titlesOf(order)}`,
+  );
+
+  // Write the new order back, preserving each section's size + label. The
+  // client re-derives orderIndex from position on recompute, and the cascade
+  // below re-times the day, so reordering the items is all that's needed.
+  let k = 0;
+  for (const sec of parsed.sections) {
+    if (!sec || !Array.isArray(sec.items)) continue;
+    const n = sec.items.length;
+    sec.items = order.slice(k, k + n);
+    k += n;
+  }
+}
+
 /** Routes one hop, attaching the transit step breakdown, with a fallback. */
 async function computeLeg(
   origin: Coords,
@@ -657,7 +892,7 @@ export async function routeAndSchedule(
   parsed: any,
   context: Context,
   apiKey: string | undefined,
-  opts: { stripTravel?: boolean; appendBackHome?: boolean } = {},
+  opts: { stripTravel?: boolean; appendBackHome?: boolean; optimizeOrder?: boolean } = {},
   timing: RouteTiming = {},
 ): Promise<void> {
   if (!parsed || !Array.isArray(parsed.sections)) return;
@@ -667,6 +902,18 @@ export async function routeAndSchedule(
 
   // Drop any stray AI-emitted "travel" cards; we draw travel ourselves.
   if (stripTravel) stripAiTravelItems(parsed);
+
+  // Deterministic least-travel reorder of the movable venue stops — gated to
+  // fresh plans only (never edits/refreshes). Runs BEFORE the legs are routed
+  // and the clock is cascaded, so the new order is timed for free below.
+  // Best-effort: a failure here must never break routing.
+  if (opts.optimizeOrder) {
+    try {
+      optimizeStopOrder(parsed, context);
+    } catch (e) {
+      console.error('[routeAndSchedule] optimizeStopOrder skipped:', e);
+    }
+  }
 
   // 1) Travel legs (needs a Google key to route with). Each hop's endpoints
   //    are already known (from the place coords), so the hops don't depend on

@@ -55,6 +55,7 @@ export default function DayPlansScreen() {
 
   const items = useSavedItineraries((s) => s.items);
   const activate = useSavedItineraries((s) => s.activate);
+  const remove = useSavedItineraries((s) => s.remove);
   const plans = useMemo(() => plansForDate(items, today), [items, today]);
   const active = useMemo(() => activePlanForDate(items, today), [items, today]);
 
@@ -78,6 +79,31 @@ export default function DayPlansScreen() {
               Haptics.NotificationFeedbackType.Success,
             ).catch(() => undefined);
             router.back();
+          },
+        },
+      ],
+    );
+  };
+
+  const onDelete = (plan: SavedItinerary) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    Alert.alert(
+      'Delete this plan?',
+      `\u201C${plan.title}\u201D will be permanently removed.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            // Pop back to home when this was the last plan for the day, so the
+            // user isn't left staring at an empty "Today's plans" screen.
+            const isLast = plansForDate(items, today).length <= 1;
+            remove(plan.id);
+            Haptics.notificationAsync(
+              Haptics.NotificationFeedbackType.Success,
+            ).catch(() => undefined);
+            if (isLast) router.back();
           },
         },
       ],
@@ -195,6 +221,24 @@ export default function DayPlansScreen() {
                       </Text>
                     </Pressable>
                   )}
+
+                  <Pressable
+                    onPress={() => onDelete(plan)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Delete ${plan.title}`}
+                    hitSlop={8}
+                    style={({ pressed }) => [
+                      styles.deleteBtn,
+                      { backgroundColor: t.colors.dangerSoft },
+                      pressed && { opacity: 0.7 },
+                    ]}
+                  >
+                    <Ionicons
+                      name="trash-outline"
+                      size={16}
+                      color={t.colors.danger}
+                    />
+                  </Pressable>
                 </View>
               </Card>
             );
@@ -242,6 +286,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
   },
   activeBadge: {
     flexDirection: 'row',
@@ -252,6 +297,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 8,
     borderRadius: 999,
+  },
+  deleteBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   empty: {
     alignItems: 'center',
