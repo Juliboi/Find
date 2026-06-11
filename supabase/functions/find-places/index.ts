@@ -33,6 +33,13 @@
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
 import { extractOpeningHours, type VenueOpeningHours } from '../_shared/hours.ts';
+import {
+  detourMeters,
+  distM,
+  isEverydayIntent,
+  midpoint,
+  scoreCandidate,
+} from '../_shared/venuePick.ts';
 
 interface UnifiedPlace {
   id: string;
@@ -163,42 +170,8 @@ interface Coords {
   longitude: number;
 }
 
-/** Geographic midpoint (good enough at city scale; no need for great-circle). */
-function midpoint(a: Coords, b: Coords): Coords {
-  return {
-    latitude: (a.latitude + b.latitude) / 2,
-    longitude: (a.longitude + b.longitude) / 2,
-  };
-}
-
-function distM(a: Coords, b: Coords): number {
-  return haversineMeters(a.latitude, a.longitude, b.latitude, b.longitude);
-}
-
-/**
- * Extra meters added to the day by routing through `c` instead of going
- * straight from the previous stop to the next one:
- *
- *   detour = d(prev, c) + d(c, next) − d(prev, next)
- *
- * A venue sitting right on the prev→next line has ~0 detour; one off to
- * the side that forces a backtrack has a large detour. This is the number
- * that actually captures "don't zig-zag". Falls back to a single-sided
- * distance when only one neighbour is known (first/last located stop), and
- * returns null when there's no route context at all.
- */
-function detourMeters(
-  prev: Coords | undefined,
-  next: Coords | undefined,
-  c: Coords,
-): number | null {
-  if (prev && next) {
-    return Math.max(0, distM(prev, c) + distM(c, next) - distM(prev, next));
-  }
-  if (prev) return distM(prev, c);
-  if (next) return distM(c, next);
-  return null;
-}
+// `midpoint`, `distM` and `detourMeters` live in ../_shared/venuePick.ts so the
+// planner and this swap browser score corridors with identical math.
 
 function clampRadius(m: number): number {
   return Math.min(10000, Math.max(200, Math.round(m)));
@@ -553,66 +526,7 @@ async function searchGoogleOnce(
 //   ─ Quality weighs more (rating 0.30, reviews 0.15).
 //   ─ Gentler decay: max(1500m, radius/2) constant.
 
-interface ScoreContext {
-  bestPosition: number;
-  place: UnifiedPlace;
-  radiusM: number;
-  everyday: boolean;
-  /**
-   * Extra meters added to the route by this candidate (see detourMeters).
-   * When present it REPLACES raw distance as the proximity signal — for a
-   * mid-route swap, "doesn't make me backtrack" matters more than "closest
-   * to the old pin".
-   */
-  detourM?: number | null;
-}
-
-function scoreCandidate(c: ScoreContext): number {
-  const pos = 1 / (1 + c.bestPosition);
-  // Proximity term. With route context we decay on detour (extra meters
-  // added to the path); without it, on raw distance from the venue.
-  let proximity: number;
-  if (c.detourM != null) {
-    // Detour decays faster than raw distance: even ~600 m of backtrack for
-    // an everyday stop is a meaningful zig-zag, so it should bite quickly.
-    const detourDecay = c.everyday
-      ? Math.max(500, c.radiusM / 6)
-      : Math.max(1000, c.radiusM / 3);
-    proximity = Math.exp(-(c.detourM / detourDecay));
-  } else {
-    const decayConstant = c.everyday
-      ? Math.max(800, c.radiusM / 4)
-      : Math.max(1500, c.radiusM / 2);
-    proximity = Math.exp(-(c.place.distanceM / decayConstant));
-  }
-  const dist = proximity;
-  const rating = c.place.rating != null ? c.place.rating / 5 : 0;
-  const reviewsRaw = c.place.ratingCount ?? 0;
-  const reviews = reviewsRaw > 0
-    ? Math.min(1, Math.log10(reviewsRaw + 1) / 3)
-    : 0;
-  const open = c.place.openNow === false ? 0 : 1;
-
-  if (c.everyday) {
-    return (
-      dist * 0.55 +
-      pos * 0.10 +
-      rating * 0.20 +
-      reviews * 0.10 +
-      open * 0.05
-    );
-  }
-  return (
-    dist * 0.35 +
-    pos * 0.10 +
-    rating * 0.30 +
-    reviews * 0.15 +
-    open * 0.05 +
-    // Small bonus for venues with strong rating + many reviews —
-    // the user explicitly wants well-validated far gyms to surface.
-    (rating >= 0.9 && reviewsRaw >= 200 ? 0.05 : 0)
-  );
-}
+// `scoreCandidate` + its weighting profiles live in ../_shared/venuePick.ts.
 
 // --------------------------------------------------- Google multi-query fan-out
 //
@@ -910,13 +824,7 @@ function scrubReasoning(s: string | undefined): string | undefined {
   return out;
 }
 
-/** Heuristic: does the intent describe a routine, walk-to-it venue? */
-function isEverydayIntent(intent: string, queries: string[]): boolean {
-  const haystack = [intent, ...queries].join(' ').toLowerCase();
-  return /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|café|coffee|bar|pub|bistro|grocery|pharmacy|bakery|eat|drink|takeout|takeaway)\b/.test(
-    haystack,
-  );
-}
+// `isEverydayIntent` lives in ../_shared/venuePick.ts (shared with the planner).
 
 // ------------------------------------------------------- Google high-level API
 

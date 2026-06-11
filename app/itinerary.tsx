@@ -1656,15 +1656,21 @@ export default function ItineraryScreen() {
       Haptics.selectionAsync().catch(() => undefined);
     }
 
-    // Track which anchor is in view: a located stop focuses its own pin; any
-    // placeless block (the at-home morning, cooking after the walk, the evening
-    // wind-down, the "Back home" arrival) focuses the home pin — so the map
-    // follows you back home exactly when the cards do.
+    // Track which anchor is in view by following where the user actually IS:
+    // a located stop focuses its own pin; a placeless block INHERITS the last
+    // place you arrived at (so deep work or a phone call at the cafe keeps the
+    // map on the cafe instead of yanking it home). Only a home arrival (the
+    // synthetic "Back home") sends focus back to the home pin — and the default
+    // stays home, which covers the at-home morning before the first stop and
+    // the wind-down after you're back. This is the fix for "placeless blocks
+    // reroute the map home" — the route line was always right; the camera wasn't.
     let stopId: string | null = home ? HOME_ID : null;
     for (const item of flatItems) {
       const off = itemOffsetsRef.current[item.id];
       if (off == null || off > probe) continue;
-      stopId = item.place?.coords ? item.id : home ? HOME_ID : stopId;
+      if (item.place?.coords) stopId = item.id;
+      else if (item.arrival && home) stopId = HOME_ID;
+      // else: placeless, non-arrival block → stay wherever you currently are.
     }
     if (stopId !== activeStopId) setActiveStopId(stopId);
   };

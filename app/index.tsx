@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Image,
   Pressable,
   ScrollView,
@@ -8,11 +9,12 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import * as Haptics from 'expo-haptics';
+import * as Notifications from 'expo-notifications';
 import { useDayStore } from '@/store/useDayStore';
 import {
   useSavedItineraries,
@@ -44,7 +46,8 @@ import { ErrandRow } from '@/components/ErrandRow';
 import { WeatherCard } from '@/components/WeatherCard';
 import { PlanPeek } from '@/components/PlanPeek';
 import { parseErrandRemote, type ErrandDraft } from '@/lib/ai/parseErrand';
-import { formatTime, formatDuration, todayISO } from '@/utils/time';
+import { isDailyReviewResponse } from '@/lib/notifications';
+import { formatTime, formatDuration, todayISO, tomorrowISO } from '@/utils/time';
 import {
   DAYTIME_PALETTES,
   getDayPart,
@@ -115,27 +118,36 @@ export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
 
-  // The part of the day drives the gradient + greeting. Re-evaluate on a slow
-  // tick so the colour field flows from, say, sunset into night if the screen
-  // is left open across a boundary — but only re-render when it actually moves.
-  const [dayPart, setDayPart] = useState(() => getDayPart());
+  // A slow "now" tick (once a minute) keeps every time-derived part of the home
+  // screen live while the app stays open: the date rolls over at midnight, and
+  // the greeting + gradient flow from one part of the day into the next.
+  const [now, setNow] = useState(() => new Date());
   useEffect(() => {
-    const id = setInterval(() => {
-      setDayPart((prev) => {
-        const next = getDayPart();
-        return next === prev ? prev : next;
-      });
-    }, 60 * 1000);
+    const id = setInterval(() => setNow(new Date()), 60 * 1000);
     return () => clearInterval(id);
   }, []);
 
-  // Pull fresh weather for the home widget. The store is stale-while-revalidate
-  // (20-min TTL) and resolves location without prompting, so this is cheap to
-  // fire on every mount.
-  useEffect(() => {
+  // Keep the weather widget fresh "as you use the app". Each call is cheap: the
+  // store is stale-while-revalidate (20-min TTL) and resolves location without
+  // prompting, so it no-ops until the cache actually expires. We re-check on the
+  // minute tick (covers leaving the app open), when the screen regains focus,
+  // and when the app returns to the foreground (JS timers are throttled while
+  // backgrounded, so the tick alone can't be trusted after a resume).
+  const refreshWeather = useCallback(() => {
     void useWeatherStore.getState().refresh();
   }, []);
+  useEffect(() => {
+    refreshWeather();
+  }, [now, refreshWeather]);
+  useFocusEffect(refreshWeather);
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refreshWeather();
+    });
+    return () => sub.remove();
+  }, [refreshWeather]);
 
+  const dayPart = getDayPart(now);
   const palette = DAYTIME_PALETTES[dayPart];
   const greeting = getGreeting(dayPart);
   const label = getDayPartLabel(dayPart);
@@ -144,7 +156,6 @@ export default function HomeScreen() {
   const firstName = fullName?.trim().split(/\s+/)[0] ?? '';
   const homeHeading = firstName ? `Hey, ${firstName}` : 'Hey there';
 
-  const date = useDayStore((s) => s.date);
   const plans = useDayStore((s) => s.plans);
   const isScheduling = useDayStore((s) => s.isScheduling);
   const isComposing = useDayStore((s) => s.isComposing);
@@ -248,13 +259,38 @@ export default function HomeScreen() {
   const moreCount = Math.max(0, plans.length - 1);
 
   const [setupOpen, setSetupOpen] = useState(false);
+  // When the planner is opened from the daily reminder we seed it to tomorrow;
+  // every other entry point (the card, the "+" composer) leaves this undefined
+  // so the sheet defaults to today.
+  const [setupInitialDate, setSetupInitialDate] = useState<string | undefined>(
+    undefined,
+  );
   const setDayPlan = usePlanSetupStore((s) => s.setDayPlan);
-  const openSetup = () => setSetupOpen(true);
+  const openSetup = () => {
+    setSetupInitialDate(undefined);
+    setSetupOpen(true);
+  };
+  const closeSetup = () => {
+    setSetupOpen(false);
+    setSetupInitialDate(undefined);
+  };
   const onSetupConfirm = (selection: DayPlanSelection) => {
     setDayPlan(selection);
-    setSetupOpen(false);
+    closeSetup();
     router.push('/itinerary');
   };
+
+  // A tap on the evening "plan tomorrow" reminder routes here: open the planner
+  // seeded to tomorrow, then clear the response so it doesn't reopen on the next
+  // render. The hook surfaces the launching tap too, so this also covers a cold
+  // start from the notification.
+  const lastNotificationResponse = Notifications.useLastNotificationResponse();
+  useEffect(() => {
+    if (!isDailyReviewResponse(lastNotificationResponse)) return;
+    setSetupInitialDate(tomorrowISO());
+    setSetupOpen(true);
+    void Notifications.clearLastNotificationResponseAsync();
+  }, [lastNotificationResponse]);
 
   // Build the single adaptive card: planning → up-next → recent trip → prompt.
   let cardOnPress: (() => void) | undefined;
@@ -441,7 +477,7 @@ export default function HomeScreen() {
               {greeting}
             </Text>
             <Text variant="body" style={{ color: ON_SOFT }}>
-              {formatLongDate(date)}
+              {formatLongDate(today)}
             </Text>
           </View>
 
@@ -596,7 +632,8 @@ export default function HomeScreen() {
 
       <PlanSetupSheet
         open={setupOpen}
-        onClose={() => setSetupOpen(false)}
+        initialDate={setupInitialDate}
+        onClose={closeSetup}
         onConfirm={onSetupConfirm}
       />
 

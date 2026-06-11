@@ -43,6 +43,16 @@ export function todayISO(): string {
   return `${y}-${m}-${day}`;
 }
 
+/** Local "YYYY-MM-DD" for tomorrow. */
+export function tomorrowISO(): string {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  const y = d.getFullYear();
+  const m = (d.getMonth() + 1).toString().padStart(2, '0');
+  const day = d.getDate().toString().padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 export function currentHHMM(): string {
   const d = new Date();
   return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes()

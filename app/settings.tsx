@@ -1,12 +1,18 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Alert,
+  Linking,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   View,
   useColorScheme,
 } from 'react-native';
+import DateTimePicker, {
+  type DateTimePickerEvent,
+} from '@react-native-community/datetimepicker';
 import { useRouter } from 'expo-router';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BottomSheetScrollView } from '@gorhom/bottom-sheet';
@@ -21,7 +27,22 @@ import { HomePicker, type AnchorSlot } from '@/components/HomePicker';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { useHomeStore } from '@/store/useHomeStore';
+import { useNotificationStore } from '@/store/useNotificationStore';
 import { formatTime } from '@/utils/time';
+
+/** Seed a time picker from a stored "HH:MM" (falls back to 9 PM if unparseable). */
+function hhmmToDate(hhmm: string): Date {
+  const [h, m] = hhmm.split(':').map(Number);
+  const d = new Date();
+  d.setHours(Number.isFinite(h) ? h : 21, Number.isFinite(m) ? m : 0, 0, 0);
+  return d;
+}
+
+function dateToHHMM(d: Date): string {
+  return `${String(d.getHours()).padStart(2, '0')}:${String(
+    d.getMinutes(),
+  ).padStart(2, '0')}`;
+}
 
 interface RowProps {
   icon: keyof typeof Ionicons.glyphMap;
@@ -122,8 +143,51 @@ export default function SettingsScreen() {
   const home = useHomeStore((s) => s.home);
   const work = useHomeStore((s) => s.work);
 
+  const dailyReviewEnabled = useNotificationStore((s) => s.dailyReviewEnabled);
+  const dailyReviewTime = useNotificationStore((s) => s.dailyReviewTime);
+  const setDailyReviewEnabled = useNotificationStore(
+    (s) => s.setDailyReviewEnabled,
+  );
+  const setDailyReviewTime = useNotificationStore((s) => s.setDailyReviewTime);
+
   // Which anchor the location-picker sheet is editing (null = closed).
   const [anchorSlot, setAnchorSlot] = useState<AnchorSlot | null>(null);
+  // Android shows the time picker as a one-shot dialog; iOS renders it inline.
+  const [androidTimeOpen, setAndroidTimeOpen] = useState(false);
+  const reviewDate = useMemo(() => hhmmToDate(dailyReviewTime), [dailyReviewTime]);
+
+  const onToggleDailyReview = (next: boolean) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    void setDailyReviewEnabled(next).then((ok) => {
+      if (next && ok) {
+        Haptics.notificationAsync(
+          Haptics.NotificationFeedbackType.Success,
+        ).catch(() => undefined);
+      } else if (next && !ok) {
+        // Permission was refused (or previously denied) — the toggle stays off;
+        // point the user at system settings where they can grant it.
+        Alert.alert(
+          'Turn on notifications',
+          'Diem needs notification permission to send your evening planning reminder. You can enable it in Settings.',
+          [
+            { text: 'Not now', style: 'cancel' },
+            {
+              text: 'Open Settings',
+              onPress: () => void Linking.openSettings(),
+            },
+          ],
+        );
+      }
+    });
+  };
+
+  const onReviewTimeChange = (_: DateTimePickerEvent, picked?: Date) => {
+    if (Platform.OS !== 'ios') setAndroidTimeOpen(false);
+    if (picked) {
+      Haptics.selectionAsync().catch(() => undefined);
+      void setDailyReviewTime(dateToHHMM(picked));
+    }
+  };
 
   const dietarySummary = dietary.length
     ? dietary.join(', ')
@@ -305,6 +369,61 @@ export default function SettingsScreen() {
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
+              Notifications
+            </Text>
+          </View>
+          <Row
+            first
+            icon="moon-outline"
+            iconBg={t.colors.accentSoft}
+            iconColor={t.colors.accentText}
+            title="Plan tomorrow"
+            subtitle="An evening nudge to review today and set up tomorrow"
+            trailing={
+              <Switch
+                value={dailyReviewEnabled}
+                onValueChange={onToggleDailyReview}
+                trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
+              />
+            }
+          />
+          {dailyReviewEnabled ? (
+            <Row
+              icon="time-outline"
+              iconBg={t.colors.fill1}
+              title="Remind me at"
+              subtitle="When the nudge arrives each day"
+              trailing={
+                Platform.OS === 'ios' ? (
+                  <DateTimePicker
+                    value={reviewDate}
+                    mode="time"
+                    display="compact"
+                    minuteInterval={5}
+                    onChange={onReviewTimeChange}
+                    themeVariant={t.isDark ? 'dark' : 'light'}
+                  />
+                ) : (
+                  <Pressable
+                    onPress={() => {
+                      Haptics.selectionAsync().catch(() => undefined);
+                      setAndroidTimeOpen(true);
+                    }}
+                    style={[styles.timePill, { backgroundColor: t.colors.fill1 }]}
+                  >
+                    <Text variant="body" weight="bold" tone="accent">
+                      {formatTime(dailyReviewTime)}
+                    </Text>
+                  </Pressable>
+                )
+              }
+            />
+          ) : null}
+        </Card>
+
+        <Card padded style={{ padding: 0 }}>
+          <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+            <Text variant="caption" tone="secondary" uppercase weight="semibold">
               Appearance
             </Text>
           </View>
@@ -383,6 +502,16 @@ export default function SettingsScreen() {
         </Card>
       </ScrollView>
 
+      {androidTimeOpen && Platform.OS !== 'ios' ? (
+        <DateTimePicker
+          value={reviewDate}
+          mode="time"
+          display="default"
+          minuteInterval={5}
+          onChange={onReviewTimeChange}
+        />
+      ) : null}
+
       <Sheet
         open={anchorSlot !== null}
         onClose={() => setAnchorSlot(null)}
@@ -428,6 +557,11 @@ const styles = StyleSheet.create({
   pill: {
     paddingHorizontal: 10,
     paddingVertical: 4,
+    borderRadius: 999,
+  },
+  timePill: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
     borderRadius: 999,
   },
   dietaryValue: {

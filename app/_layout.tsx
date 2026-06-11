@@ -9,6 +9,7 @@ import {
 } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as SplashScreen from 'expo-splash-screen';
+import * as Notifications from 'expo-notifications';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -17,6 +18,8 @@ import { useTheme } from '@/theme/useTheme';
 import { Text } from '@/components/Text';
 import { WaveLoader } from '@/components/WaveLoader';
 import { useAuthStore } from '@/store/useAuthStore';
+import { useNotificationStore } from '@/store/useNotificationStore';
+import { configureNotifications, isDailyReviewResponse } from '@/lib/notifications';
 
 // Hold the native splash until React has painted our themed splash overlay, so
 // the home screen can't flash through before the first auth redirect lands.
@@ -77,6 +80,34 @@ function useAuthGate(): boolean {
   return ready && target === null;
 }
 
+/**
+ * Wires up local notifications at the app root: configure the channel/handler
+ * once, re-assert the saved daily-review schedule after prefs rehydrate, and
+ * route a tap on the reminder to the home screen — where it opens the planner
+ * seeded to tomorrow (see app/index.tsx).
+ */
+function useNotificationsBootstrap(): void {
+  const router = useRouter();
+  const notifHydrated = useNotificationStore((s) => s.hydrated);
+
+  useEffect(() => {
+    void configureNotifications();
+  }, []);
+
+  useEffect(() => {
+    if (notifHydrated) void useNotificationStore.getState().reconcile();
+  }, [notifHydrated]);
+
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener(
+      (response) => {
+        if (isDailyReviewResponse(response)) router.navigate('/');
+      },
+    );
+    return () => sub.remove();
+  }, [router]);
+}
+
 function Splash() {
   const t = useTheme();
   return (
@@ -105,6 +136,8 @@ export default function RootLayout() {
   useEffect(() => {
     void SplashScreen.hideAsync();
   }, []);
+
+  useNotificationsBootstrap();
 
   const settled = useAuthGate();
 

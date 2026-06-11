@@ -42,6 +42,7 @@
           "locationWhenInUsePermission": "DayFlow uses your location to suggest nearby gyms, grocery stores, cafés, and other places when you ask."
         }
       ],
+      "expo-notifications",
       "@react-native-community/datetimepicker"
     ],
     "experiments": {
