@@ -15,6 +15,7 @@ import { Itinerary } from '@/types/itinerary';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import type { SchedulerContext } from '@/lib/ai/scheduler';
 import { sanitizeItinerary } from '@/lib/ai/itinerary';
+import { devNow } from '@/store/useDevClockStore';
 
 /**
  * Instant kill-switch. Set `EXPO_PUBLIC_DISABLE_ROUTING=1` in the .env (then
@@ -94,7 +95,7 @@ export async function recomputeItinerary(
     } catch {
       // no tz available — backend falls back to time-agnostic routing
     }
-    body.now = new Date().toISOString();
+    body.now = devNow().toISOString();
     const { data, error } = await supabase.functions.invoke('recompute-itinerary', {
       body,
     });

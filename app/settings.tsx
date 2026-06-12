@@ -29,6 +29,7 @@ import { useProfileStore } from '@/store/useProfileStore';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
 import { formatTime } from '@/utils/time';
+import { useDevClockStore } from '@/store/useDevClockStore';
 
 /** Seed a time picker from a stored "HH:MM" (falls back to 9 PM if unparseable). */
 function hhmmToDate(hhmm: string): Date {
@@ -137,6 +138,11 @@ export default function SettingsScreen() {
   const fullName = useProfileStore((s) => s.fullName);
   const wakeTime = useProfileStore((s) => s.wakeTime);
   const bedTime = useProfileStore((s) => s.bedTime);
+  const wakeUpDurationMin = useProfileStore((s) => s.wakeUpDurationMin);
+  const breakfastStart = useProfileStore((s) => s.breakfastStart);
+  const lunchStart = useProfileStore((s) => s.lunchStart);
+  const dinnerStart = useProfileStore((s) => s.dinnerStart);
+  const windDownTime = useProfileStore((s) => s.windDownTime);
   const hasCar = useProfileStore((s) => s.hasCar);
   const dietary = useProfileStore((s) => s.dietary);
   const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
@@ -189,11 +195,102 @@ export default function SettingsScreen() {
     }
   };
 
+  // DEV-only fake clock ("time machine"). Lets us rehearse a plan as if it were
+  // an arbitrary instant — e.g. 9 AM on a weekday — so shops read as open and
+  // the planner starts in the morning instead of late at night.
+  const devClockEnabled = useDevClockStore((s) => s.enabled);
+  const devAnchorRealMs = useDevClockStore((s) => s.anchorRealMs);
+  const devAnchorFakeMs = useDevClockStore((s) => s.anchorFakeMs);
+  const setDevFakeNow = useDevClockStore((s) => s.setFakeNow);
+  const setDevClockEnabled = useDevClockStore((s) => s.setEnabled);
+  const resetDevClock = useDevClockStore((s) => s.reset);
+  // Android picks date + time in two sequential dialogs; iOS shows one inline.
+  const [androidDevStage, setAndroidDevStage] = useState<'idle' | 'date' | 'time'>(
+    'idle',
+  );
+  const [androidDevDraft, setAndroidDevDraft] = useState<Date | null>(null);
+
+  // The instant the picker seeds from and the label shows: the live simulated
+  // "now" when the clock is on, else real now.
+  const devClockValue = useMemo(() => {
+    if (devClockEnabled && devAnchorRealMs != null && devAnchorFakeMs != null) {
+      return new Date(devAnchorFakeMs + (Date.now() - devAnchorRealMs));
+    }
+    return new Date();
+  }, [devClockEnabled, devAnchorRealMs, devAnchorFakeMs]);
+
+  const onToggleDevClock = (next: boolean) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    if (next) {
+      // First time on with nothing pinned: default to 9 AM today so a tap is
+      // immediately useful ("plan my morning"). Re-enabling keeps the last pin.
+      if (devAnchorFakeMs == null) {
+        const seed = new Date();
+        seed.setHours(9, 0, 0, 0);
+        setDevFakeNow(seed);
+      } else {
+        setDevClockEnabled(true);
+      }
+    } else {
+      setDevClockEnabled(false);
+    }
+  };
+
+  const onDevTimeChange = (_: DateTimePickerEvent, picked?: Date) => {
+    if (picked) {
+      Haptics.selectionAsync().catch(() => undefined);
+      setDevFakeNow(picked);
+    }
+  };
+
+  // Android two-step: pick the date, then the time, then pin the combined value.
+  const onAndroidDevChange = (_: DateTimePickerEvent, picked?: Date) => {
+    if (!picked) {
+      setAndroidDevStage('idle');
+      setAndroidDevDraft(null);
+      return;
+    }
+    if (androidDevStage === 'date') {
+      setAndroidDevDraft(picked);
+      setAndroidDevStage('time');
+      return;
+    }
+    if (androidDevStage === 'time') {
+      const base = androidDevDraft ?? new Date();
+      const combined = new Date(
+        base.getFullYear(),
+        base.getMonth(),
+        base.getDate(),
+        picked.getHours(),
+        picked.getMinutes(),
+        0,
+        0,
+      );
+      Haptics.selectionAsync().catch(() => undefined);
+      setDevFakeNow(combined);
+      setAndroidDevStage('idle');
+      setAndroidDevDraft(null);
+    }
+  };
+
+  const devClockLabel = devClockValue.toLocaleString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+
   const dietarySummary = dietary.length
     ? dietary.join(', ')
     : dietaryNotes
       ? dietaryNotes
       : 'No restrictions';
+
+  const mealSummary =
+    breakfastStart && lunchStart && dinnerStart
+      ? `${formatTime(breakfastStart)} · ${formatTime(lunchStart)} · ${formatTime(dinnerStart)}`
+      : 'Set your meal windows';
 
   const accountName =
     fullName ??
@@ -208,9 +305,22 @@ export default function SettingsScreen() {
 
   // Jump straight to the matching onboarding step to edit a single preference;
   // onboarding runs in "edit" mode and returns here on Save/Cancel.
-  const editPref = (key: 'rhythm' | 'car' | 'diet') => {
+  const editPref = (
+    key: 'morning' | 'meals' | 'winddown' | 'car' | 'diet',
+  ) => {
     Haptics.selectionAsync().catch(() => undefined);
     router.push({ pathname: '/onboarding', params: { edit: key } });
+  };
+
+  // DEV-only: replay the entire onboarding wizard (all steps, not the single-
+  // preference edit mode) to test the first-run flow without signing out. We
+  // only flip the in-memory `needsOnboarding` gate, which makes the auth gate
+  // route to /onboarding; the saved profile is left untouched, so finishing the
+  // wizard (or just relaunching the app) returns everything to normal.
+  const replayOnboarding = () => {
+    Haptics.selectionAsync().catch(() => undefined);
+    useAuthStore.setState({ needsOnboarding: true });
+    router.replace('/onboarding');
   };
 
   const confirmSignOut = () => {
@@ -307,9 +417,9 @@ export default function SettingsScreen() {
             icon="sunny-outline"
             iconBg={t.colors.warningSoft}
             iconColor={t.colors.warning}
-            title="Wake up"
-            subtitle="Seeds your default day start"
-            onPress={() => editPref('rhythm')}
+            title="Morning routine"
+            subtitle={`${wakeUpDurationMin} min to get going`}
+            onPress={() => editPref('morning')}
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {wakeTime ? formatTime(wakeTime) : 'Not set'}
@@ -317,11 +427,31 @@ export default function SettingsScreen() {
             }
           />
           <Row
+            icon="fast-food-outline"
+            iconBg={t.colors.infoSoft}
+            iconColor={t.colors.info}
+            title="Meal times"
+            subtitle={mealSummary}
+            onPress={() => editPref('meals')}
+          />
+          <Row
+            icon="cloudy-night-outline"
+            iconBg={t.colors.fill1}
+            title="Wind down"
+            subtitle="Calm-only activities after this"
+            onPress={() => editPref('winddown')}
+            trailing={
+              <Text variant="body" weight="semibold" tone="secondary">
+                {windDownTime ? formatTime(windDownTime) : 'Not set'}
+              </Text>
+            }
+          />
+          <Row
             icon="moon-outline"
             iconBg={t.colors.fill1}
             title="Bed time"
-            subtitle="When you want to wind down"
-            onPress={() => editPref('rhythm')}
+            subtitle="Lights out — the end of your day"
+            onPress={() => editPref('winddown')}
             trailing={
               <Text variant="body" weight="semibold" tone="secondary">
                 {bedTime ? formatTime(bedTime) : 'Not set'}
@@ -487,6 +617,104 @@ export default function SettingsScreen() {
           />
         </Card>
 
+        {__DEV__ ? (
+          <Card padded style={{ padding: 0 }}>
+            <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+              <Text
+                variant="caption"
+                tone="secondary"
+                uppercase
+                weight="semibold"
+              >
+                Developer
+              </Text>
+            </View>
+            <Row
+              first
+              icon="time-outline"
+              iconBg={t.colors.infoSoft}
+              iconColor={t.colors.info}
+              title="Fake clock"
+              subtitle={
+                devClockEnabled
+                  ? `Simulating ${devClockLabel}`
+                  : 'Test plans at any time of day'
+              }
+              trailing={
+                <Switch
+                  value={devClockEnabled}
+                  onValueChange={onToggleDevClock}
+                  trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
+                />
+              }
+            />
+            {devClockEnabled ? (
+              <Row
+                icon="calendar-outline"
+                iconBg={t.colors.fill1}
+                title="Set date & time"
+                subtitle="Plan as if it were this moment"
+                trailing={
+                  Platform.OS === 'ios' ? (
+                    <DateTimePicker
+                      value={devClockValue}
+                      mode="datetime"
+                      display="compact"
+                      onChange={onDevTimeChange}
+                      themeVariant={t.isDark ? 'dark' : 'light'}
+                    />
+                  ) : (
+                    <Pressable
+                      onPress={() => {
+                        Haptics.selectionAsync().catch(() => undefined);
+                        setAndroidDevDraft(devClockValue);
+                        setAndroidDevStage('date');
+                      }}
+                      style={[styles.timePill, { backgroundColor: t.colors.fill1 }]}
+                    >
+                      <Text variant="body" weight="bold" tone="accent">
+                        {devClockLabel}
+                      </Text>
+                    </Pressable>
+                  )
+                }
+              />
+            ) : null}
+            {devClockEnabled ? (
+              <Row
+                icon="refresh-outline"
+                iconBg={t.colors.dangerSoft}
+                iconColor={t.colors.danger}
+                title="Reset to real time"
+                subtitle="Back to the actual clock"
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  resetDevClock();
+                }}
+              />
+            ) : null}
+            <Row
+              icon="play-circle-outline"
+              iconBg={t.colors.accentSoft}
+              iconColor={t.colors.accentText}
+              title="Replay onboarding"
+              subtitle="Walk the full first-run setup again"
+              onPress={replayOnboarding}
+            />
+            <Row
+              icon="search-outline"
+              iconBg={t.colors.infoSoft}
+              iconColor={t.colors.info}
+              title="Discovery sandbox"
+              subtitle="Test place search, blurbs & latency"
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                router.push('/discover-sandbox');
+              }}
+            />
+          </Card>
+        ) : null}
+
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
@@ -509,6 +737,23 @@ export default function SettingsScreen() {
           display="default"
           minuteInterval={5}
           onChange={onReviewTimeChange}
+        />
+      ) : null}
+
+      {__DEV__ && Platform.OS !== 'ios' && androidDevStage === 'date' ? (
+        <DateTimePicker
+          value={androidDevDraft ?? devClockValue}
+          mode="date"
+          display="default"
+          onChange={onAndroidDevChange}
+        />
+      ) : null}
+      {__DEV__ && Platform.OS !== 'ios' && androidDevStage === 'time' ? (
+        <DateTimePicker
+          value={androidDevDraft ?? devClockValue}
+          mode="time"
+          display="default"
+          onChange={onAndroidDevChange}
         />
       ) : null}
 

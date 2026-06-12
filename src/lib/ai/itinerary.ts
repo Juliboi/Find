@@ -79,6 +79,30 @@ function buildContextPayload(
   if (ctx.userName && ctx.userName.trim()) out.userName = ctx.userName.trim();
   if (ctx.wakeTime) out.wakeTime = ctx.wakeTime;
   if (ctx.bedTime) out.bedTime = ctx.bedTime;
+  if (typeof ctx.wakeUpDurationMin === 'number' && ctx.wakeUpDurationMin > 0) {
+    out.wakeUpDurationMin = ctx.wakeUpDurationMin;
+  }
+  // Comfortable meal windows, grouped so the planner can schedule each meal
+  // inside its range. Each window omits ends it doesn't have.
+  const meals: Record<string, { start?: string; end?: string }> = {};
+  const addMeal = (
+    name: 'breakfast' | 'lunch' | 'dinner',
+    start?: string | null,
+    end?: string | null,
+  ) => {
+    const window: { start?: string; end?: string } = {};
+    if (start) window.start = start;
+    if (end) window.end = end;
+    if (window.start || window.end) meals[name] = window;
+  };
+  addMeal('breakfast', ctx.breakfastStart, ctx.breakfastEnd);
+  addMeal('lunch', ctx.lunchStart, ctx.lunchEnd);
+  addMeal('dinner', ctx.dinnerStart, ctx.dinnerEnd);
+  if (Object.keys(meals).length > 0) out.meals = meals;
+  if (ctx.windDownTime) out.windDownTime = ctx.windDownTime;
+  if (typeof ctx.allowScreenWindDown === 'boolean') {
+    out.allowScreenWindDown = ctx.allowScreenWindDown;
+  }
   // Always describe car availability so the planner knows whether it may emit
   // any "drive" legs. `owns` gates the car entirely; `useToday` is the per-day
   // switch (off ⇒ plan as if car-free for, e.g., a night out).

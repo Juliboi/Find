@@ -29,6 +29,19 @@ export interface SchedulerContext {
   wakeTime?: string | null;
   /** "HH:MM" the user usually winds down — anchors the day's end. */
   bedTime?: string | null;
+  /** Minutes the user takes to fully wake up before focused/productive time. */
+  wakeUpDurationMin?: number | null;
+  /** "HH:MM" comfortable meal windows the planner schedules meals within. */
+  breakfastStart?: string | null;
+  breakfastEnd?: string | null;
+  lunchStart?: string | null;
+  lunchEnd?: string | null;
+  dinnerStart?: string | null;
+  dinnerEnd?: string | null;
+  /** "HH:MM" after which only calm, sleep-friendly activities are scheduled. */
+  windDownTime?: string | null;
+  /** Whether screen-heavy wind-down activities are OK near bedtime. */
+  allowScreenWindDown?: boolean | null;
   /** Whether the user owns a car at all (availability, not "always drive"). */
   hasCar?: boolean | null;
   /** Whether the car is in play for THIS day (per-day toggle). */

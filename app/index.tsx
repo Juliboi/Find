@@ -3,12 +3,19 @@ import {
   ActivityIndicator,
   AppState,
   Image,
+  Keyboard,
   Pressable,
   ScrollView,
   StyleSheet,
   View,
   useWindowDimensions,
 } from 'react-native';
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -34,6 +41,7 @@ import {
   type ErrandInput,
 } from '@/store/useErrandsStore';
 import { useProfileStore } from '@/store/useProfileStore';
+import { useHomeStore } from '@/store/useHomeStore';
 import { useWeatherStore } from '@/store/useWeatherStore';
 import { usePlanJobsStore } from '@/store/usePlanJobsStore';
 import { useTheme } from '@/theme/useTheme';
@@ -48,6 +56,7 @@ import { ErrandRow } from '@/components/ErrandRow';
 import { WeatherCard } from '@/components/WeatherCard';
 import { PlanPeek } from '@/components/PlanPeek';
 import { parseErrandRemote, type ErrandDraft } from '@/lib/ai/parseErrand';
+import { detectDiscovery, type DiscoveryIntent } from '@/lib/discover';
 import { isDailyReviewResponse } from '@/lib/notifications';
 import { formatTime, formatDuration, todayISO, tomorrowISO } from '@/utils/time';
 import {
@@ -62,6 +71,16 @@ import {
 const ON = '#FFFFFF';
 const ON_SOFT = 'rgba(255, 255, 255, 0.82)';
 const ON_DIM = 'rgba(255, 255, 255, 0.64)';
+
+const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
+// Focusing the errand composer dims the page behind it to near-black so the
+// field reads as a spotlit, focused compose surface. We darken toward the app's
+// black canvas (rather than the active theme bg) so it reads as "almost black"
+// in both light and dark mode, stopping just shy of full opacity so a whisper of
+// the page survives underneath.
+const DIM_COLOR = '#0B0B0F';
+const DIM_OPACITY = 1;
+const DIM_TIMING = { duration: 260, easing: Easing.out(Easing.cubic) } as const;
 
 // The "Anytime" group shows at most this many rows before a "Show all" expander.
 const ANYTIME_CAP = 5;
@@ -203,27 +222,68 @@ export default function HomeScreen() {
   const [showAllAnytime, setShowAllAnytime] = useState(false);
   const [showCompleted, setShowCompleted] = useState(false);
 
+  // Drives the full-screen scrim that fades in while the errand composer holds
+  // focus. Kept on the UI thread via reanimated so the dim tracks the keyboard's
+  // rise frame-for-frame.
+  const [composerFocused, setComposerFocused] = useState(false);
+  const dim = useSharedValue(0);
+  useEffect(() => {
+    dim.value = withTiming(composerFocused ? 1 : 0, DIM_TIMING);
+  }, [composerFocused, dim]);
+  const dimStyle = useAnimatedStyle(() => ({
+    opacity: dim.value * DIM_OPACITY,
+  }));
+
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerParsing, setDrawerParsing] = useState(false);
   const [drawerMode, setDrawerMode] = useState<'create' | 'edit'>('create');
   const [drawerSeed, setDrawerSeed] = useState<ErrandDraft>(EMPTY_DRAFT);
   const [drawerRawText, setDrawerRawText] = useState('');
   const [drawerSeedKey, setDrawerSeedKey] = useState('seed-0');
+  const [drawerInitialStep, setDrawerInitialStep] = useState<'form' | 'discover'>('form');
+  const [drawerDiscovery, setDrawerDiscovery] = useState<DiscoveryIntent | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
   // Monotonic token so a slow parse that resolves after the user has moved on
   // (started another errand, opened one to edit) is ignored.
   const parseSeq = useRef(0);
+
+  // Home anchors discovery searches that aren't "nearby" and have no named area
+  // ("find a pharmacy"). Kept as stable primitives so the drawer's fetch effect
+  // doesn't refire on unrelated re-renders.
+  const home = useHomeStore((s) => s.home);
+  const fallbackCenter = useMemo(
+    () => (home ? { latitude: home.latitude, longitude: home.longitude } : null),
+    [home],
+  );
 
   const onComposerSubmit = (text: string) => {
     const seq = (parseSeq.current += 1);
     setDrawerMode('create');
     setEditId(null);
     setDrawerRawText(text);
+    Haptics.selectionAsync().catch(() => undefined);
+
+    // The orchestrator decides the route from the single line the user typed:
+    // a place search ("find a pharmacy near Karlín", "coffee nearby") opens
+    // straight into the discover step; anything else is parsed into the form as
+    // before. No area field or "near me" toggle — it's all read from the text.
+    const discovery = detectDiscovery(text);
+    if (discovery) {
+      setDrawerDiscovery(discovery);
+      setDrawerInitialStep('discover');
+      setDrawerSeed({ ...EMPTY_DRAFT, title: discovery.query });
+      setDrawerParsing(false);
+      setDrawerSeedKey(`discover-${seq}`);
+      setDrawerOpen(true);
+      return;
+    }
+
+    setDrawerDiscovery(null);
+    setDrawerInitialStep('form');
     setDrawerSeed({ ...EMPTY_DRAFT, title: text });
     setDrawerParsing(true);
     setDrawerSeedKey(`create-${seq}`);
     setDrawerOpen(true);
-    Haptics.selectionAsync().catch(() => undefined);
     parseErrandRemote(text, { date: todayISO() })
       .then((draft) => {
         if (seq !== parseSeq.current) return;
@@ -245,6 +305,8 @@ export default function HomeScreen() {
     setEditId(errand.id);
     setDrawerRawText(errand.rawText);
     setDrawerSeed(errandToDraft(errand));
+    setDrawerDiscovery(null);
+    setDrawerInitialStep('form');
     setDrawerParsing(false);
     setDrawerSeedKey(`edit-${errand.id}-${errand.updatedAt}`);
     setDrawerOpen(true);
@@ -650,9 +712,20 @@ export default function HomeScreen() {
         </ScrollView>
       </View>
 
+      <AnimatedPressable
+        pointerEvents={composerFocused ? 'auto' : 'none'}
+        onPress={() => Keyboard.dismiss()}
+        accessibilityElementsHidden={!composerFocused}
+        importantForAccessibility={
+          composerFocused ? 'auto' : 'no-hide-descendants'
+        }
+        style={[styles.dim, { backgroundColor: DIM_COLOR }, dimStyle]}
+      />
+
       <ChatComposerBar
         onPlus={openSetup}
         onSubmit={onComposerSubmit}
+        onFocusChange={setComposerFocused}
         placeholder="Add an errand…"
       />
 
@@ -671,6 +744,9 @@ export default function HomeScreen() {
         parsing={drawerParsing}
         seedKey={drawerSeedKey}
         mode={drawerMode}
+        initialStep={drawerInitialStep}
+        discovery={drawerDiscovery}
+        fallbackCenter={fallbackCenter}
         onSave={onSaveErrand}
         onDelete={drawerMode === 'edit' ? onDeleteErrand : undefined}
       />
@@ -742,6 +818,13 @@ function ErrandSection({
 const styles = StyleSheet.create({
   container: { flex: 1 },
   safe: { flex: 1 },
+  // Full-screen scrim that fades the home content toward near-black while the
+  // errand composer is focused. Sits above the page but below the composer bar
+  // (which is rendered after it), so the field stays lit while everything else
+  // recedes. A tap anywhere on it dismisses the keyboard.
+  dim: {
+    ...StyleSheet.absoluteFillObject,
+  },
   header: {
     flexDirection: 'row',
     alignItems: 'center',

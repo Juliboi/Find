@@ -340,6 +340,15 @@ export default function ItineraryScreen() {
   const userName = useProfileStore((s) => s.fullName);
   const profileWakeTime = useProfileStore((s) => s.wakeTime);
   const profileBedTime = useProfileStore((s) => s.bedTime);
+  const wakeUpDurationMin = useProfileStore((s) => s.wakeUpDurationMin);
+  const breakfastStart = useProfileStore((s) => s.breakfastStart);
+  const breakfastEnd = useProfileStore((s) => s.breakfastEnd);
+  const lunchStart = useProfileStore((s) => s.lunchStart);
+  const lunchEnd = useProfileStore((s) => s.lunchEnd);
+  const dinnerStart = useProfileStore((s) => s.dinnerStart);
+  const dinnerEnd = useProfileStore((s) => s.dinnerEnd);
+  const windDownTime = useProfileStore((s) => s.windDownTime);
+  const allowScreenWindDown = useProfileStore((s) => s.allowScreenWindDown);
   const hasCar = useProfileStore((s) => s.hasCar);
   const dietary = useProfileStore((s) => s.dietary);
   const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
@@ -625,6 +634,15 @@ export default function ItineraryScreen() {
       userName,
       wakeTime: profileWakeTime,
       bedTime: profileBedTime,
+      wakeUpDurationMin,
+      breakfastStart,
+      breakfastEnd,
+      lunchStart,
+      lunchEnd,
+      dinnerStart,
+      dinnerEnd,
+      windDownTime,
+      allowScreenWindDown,
       hasCar,
       useCarToday,
       dietary,
@@ -637,6 +655,15 @@ export default function ItineraryScreen() {
       userName,
       profileWakeTime,
       profileBedTime,
+      wakeUpDurationMin,
+      breakfastStart,
+      breakfastEnd,
+      lunchStart,
+      lunchEnd,
+      dinnerStart,
+      dinnerEnd,
+      windDownTime,
+      allowScreenWindDown,
       hasCar,
       useCarToday,
       dietary,

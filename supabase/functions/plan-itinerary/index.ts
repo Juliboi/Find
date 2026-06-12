@@ -230,6 +230,17 @@ interface CarContext {
   useToday: boolean;
 }
 
+interface MealWindow {
+  start?: string;
+  end?: string;
+}
+
+interface MealWindows {
+  breakfast?: MealWindow;
+  lunch?: MealWindow;
+  dinner?: MealWindow;
+}
+
 interface Context {
   home?: HomePin;
   userName?: string;
@@ -237,6 +248,14 @@ interface Context {
   wakeTime?: string;
   /** "HH:MM" the user usually winds down. */
   bedTime?: string;
+  /** Minutes the user takes to fully wake up before focused/productive time. */
+  wakeUpDurationMin?: number;
+  /** Comfortable meal windows the planner schedules meals within. */
+  meals?: MealWindows;
+  /** "HH:MM" after which only calm, sleep-friendly activities are scheduled. */
+  windDownTime?: string;
+  /** Whether screen-heavy wind-down activities are OK near bedtime. */
+  allowScreenWindDown?: boolean;
   car?: CarContext;
   /** Canonical dietary tags (vegetarian, gluten-free, …). */
   dietary?: string[];
@@ -363,6 +382,34 @@ function normalizeContext(input: any): Context {
   if (isHHMM(input.wakeTime)) ctx.wakeTime = input.wakeTime;
   if (isHHMM(input.bedTime)) ctx.bedTime = input.bedTime;
 
+  const rampMin = Number(input.wakeUpDurationMin);
+  if (Number.isFinite(rampMin) && rampMin > 0 && rampMin <= 600) {
+    ctx.wakeUpDurationMin = Math.round(rampMin);
+  }
+
+  if (input.meals && typeof input.meals === 'object') {
+    const parseWindow = (w: any): MealWindow | undefined => {
+      if (!w || typeof w !== 'object') return undefined;
+      const out: MealWindow = {};
+      if (isHHMM(w.start)) out.start = w.start;
+      if (isHHMM(w.end)) out.end = w.end;
+      return out.start || out.end ? out : undefined;
+    };
+    const meals: MealWindows = {};
+    const breakfast = parseWindow(input.meals.breakfast);
+    const lunch = parseWindow(input.meals.lunch);
+    const dinner = parseWindow(input.meals.dinner);
+    if (breakfast) meals.breakfast = breakfast;
+    if (lunch) meals.lunch = lunch;
+    if (dinner) meals.dinner = dinner;
+    if (Object.keys(meals).length > 0) ctx.meals = meals;
+  }
+
+  if (isHHMM(input.windDownTime)) ctx.windDownTime = input.windDownTime;
+  if (typeof input.allowScreenWindDown === 'boolean') {
+    ctx.allowScreenWindDown = input.allowScreenWindDown;
+  }
+
   if (input.car && typeof input.car === 'object') {
     const owns = input.car.owns === true;
     ctx.car = { owns, useToday: owns && input.car.useToday !== false };
@@ -394,6 +441,10 @@ function buildPlannerPrompt(args: {
   userName?: string;
   wakeTime?: string;
   bedTime?: string;
+  wakeUpDurationMin?: number;
+  meals?: MealWindows;
+  windDownTime?: string;
+  allowScreenWindDown?: boolean;
   car?: CarContext;
   dietary?: string[];
   dietaryNotes?: string;
@@ -444,6 +495,47 @@ function buildPlannerPrompt(args: {
         ? `- Dietary notes/allergies: ${args.dietaryNotes}.`
         : '';
 
+  // ----- Morning ramp-up, meal windows, wind-down (sleep-hygiene) lines -----
+  // Morning ramp only matters when planning a fresh day from the top; on a
+  // day already in progress the user is long past waking.
+  const morningLine =
+    !inProgress && args.wakeTime && args.wakeUpDurationMin
+      ? `- Morning ramp-up: the user needs about ${args.wakeUpDurationMin} min after waking to fully get going. Keep the first stretch gentle (coffee, shower, easy prep) and avoid demanding or high-focus activities before about ${addMinutesHHMM(
+          args.wakeTime,
+          args.wakeUpDurationMin,
+        )}.`
+      : '';
+
+  const fmtWindow = (w?: MealWindow): string | null => {
+    if (!w) return null;
+    if (w.start && w.end) return `${w.start}–${w.end}`;
+    if (w.start) return `from ${w.start}`;
+    if (w.end) return `by ${w.end}`;
+    return null;
+  };
+  const mealParts: string[] = [];
+  if (args.meals) {
+    const b = fmtWindow(args.meals.breakfast);
+    const l = fmtWindow(args.meals.lunch);
+    const d = fmtWindow(args.meals.dinner);
+    if (b) mealParts.push(`breakfast ${b}`);
+    if (l) mealParts.push(`lunch ${l}`);
+    if (d) mealParts.push(`dinner ${d}`);
+  }
+  const mealsLine = mealParts.length
+    ? `- Preferred meal windows: ${mealParts.join('; ')}. Schedule each meal so it starts inside its window.`
+    : '';
+
+  const screenClause =
+    args.allowScreenWindDown === false
+      ? ' The user prefers NO screen-heavy wind-down — avoid TV/movies, video games, and phone-centric activities close to bed to protect sleep quality.'
+      : args.allowScreenWindDown === true
+        ? ' Screen-based wind-down (a movie, light gaming, a show) is OK for this user, but keep it low-stimulation as bedtime nears.'
+        : '';
+  const windDownLine = args.windDownTime
+    ? `- Wind-down begins around ${args.windDownTime}: after that, do NOT schedule high-energy or stimulating activities (intense workouts, parties, big errands, anything that spikes adrenaline). Only calm, sleep-friendly activities are allowed then — reading, light stretching, journaling, a warm shower/bath, gentle music.${screenClause}`
+    : '';
+
   // ----- Transport / car context line (the per-day, "only if needed" logic) -----
   const car = args.car;
   const carLine = !car || !car.owns
@@ -473,6 +565,9 @@ function buildPlannerPrompt(args: {
     nowLine,
     nameLine,
     rhythmLine,
+    morningLine,
+    mealsLine,
+    windDownLine,
     carLine,
     dietLine,
   ]
@@ -497,6 +592,29 @@ function buildPlannerPrompt(args: {
       ? '\n12. DIETARY — honour the user\'s dietary profile for EVERY food or drink venue YOU choose: pick places that genuinely serve suitable options (e.g. for vegan, somewhere with real vegan dishes, not just a token side salad), and never centre a meal on a listed allergen. This does NOT override a venue the USER named themselves — keep those verbatim even if the fit is imperfect.'
       : '';
 
+  const hasMeals = !!(
+    args.meals &&
+    (args.meals.breakfast || args.meals.lunch || args.meals.dinner)
+  );
+  const routineRule =
+    args.windDownTime || hasMeals || (!inProgress && args.wakeUpDurationMin)
+      ? `\n13. DAILY RHYTHM & SLEEP HYGIENE — shape the day around the user's routine above.${
+          hasMeals
+            ? ' Schedule each meal ("kind": "meal") to START within its stated window, using "window" flexibility with windowStart/windowEnd set to that range so it can flex inside it but not drift outside.'
+            : ''
+        }${
+          !inProgress && args.wakeUpDurationMin
+            ? " Ease into the morning — keep the wake-up ramp gentle and don't schedule demanding focus work until the user is fully up."
+            : ''
+        }${
+          args.windDownTime
+            ? ` After ${args.windDownTime}, schedule ONLY calm, sleep-friendly activities — never place a high-energy block in the wind-down window — and still close the day with the single fixed sleep/lights-out anchor near ${
+                args.bedTime ?? 'bedtime'
+              }.`
+            : ''
+        } This governs only activities YOU add: if the USER explicitly asks for something (a late workout, a movie, a night out), keep it even if it bends the routine.`
+      : '';
+
   return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
 
 CONTEXT
@@ -517,7 +635,7 @@ ${venueRule}
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
 9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
-10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.${transportRule}${dietaryRule}
+10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.${transportRule}${dietaryRule}${routineRule}
 
 Output ONLY a single JSON object, no prose, no markdown fences. Match this schema. OMIT optional fields you don't have rather than inventing. Use null for unknown ratings; do not make up transit line numbers.
 
@@ -1388,6 +1506,10 @@ Deno.serve(async (req: Request) => {
     userName: context.userName,
     wakeTime: context.wakeTime,
     bedTime: context.bedTime,
+    wakeUpDurationMin: context.wakeUpDurationMin,
+    meals: context.meals,
+    windDownTime: context.windDownTime,
+    allowScreenWindDown: context.allowScreenWindDown,
     car: context.car,
     dietary: context.dietary,
     dietaryNotes: context.dietaryNotes,

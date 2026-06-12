@@ -35,6 +35,11 @@ interface Props {
    * errand/reminder. When omitted, "send" just dismisses the keyboard.
    */
   onSubmit?: (text: string) => void;
+  /**
+   * Fired when the field gains/loses focus, so the host can react — e.g. dim the
+   * screen behind the composer to spotlight it while the keyboard is up.
+   */
+  onFocusChange?: (focused: boolean) => void;
   placeholder?: string;
   /** Hide the bar entirely (useful for modal sub-screens). */
   hidden?: boolean;
@@ -62,6 +67,7 @@ const TIMING = { duration: 240, easing: Easing.out(Easing.cubic) };
 export function ChatComposerBar({
   onPlus,
   onSubmit,
+  onFocusChange,
   placeholder = 'Ask anything',
   hidden,
   style,
@@ -210,10 +216,12 @@ export function ChatComposerBar({
               onFocus={() => {
                 setFocused(true);
                 animateTo(1);
+                onFocusChange?.(true);
               }}
               onBlur={() => {
                 setFocused(false);
                 animateTo(0);
+                onFocusChange?.(false);
               }}
               onSubmitEditing={submit}
               blurOnSubmit={false}

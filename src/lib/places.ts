@@ -214,6 +214,13 @@ export async function findPlaces(
    * existing route rather than by distance from `center`.
    */
   route?: RouteContext,
+  /**
+   * Search tuning. `radiusM` (default 5 km, clamped 200 m–10 km) sets how wide
+   * to look around the center; `limit` (default 6) caps how many places come
+   * back. Discovery passes a tighter radius for "near me" lookups and a wider
+   * one when searching around a named area.
+   */
+  opts?: { radiusM?: number; limit?: number },
 ): Promise<FindPlacesResult> {
   const queries = (Array.isArray(input) ? input : [input])
     .map((q) => q.trim())
@@ -231,12 +238,19 @@ export async function findPlaces(
   if (!coords) {
     return { places: [], category: null, provider: 'none', reason: 'no_location' };
   }
+  const radiusM = Math.min(10000, Math.max(200, Math.round(opts?.radiusM ?? 5000)));
+  const limit = Math.min(20, Math.max(1, Math.round(opts?.limit ?? 6)));
   // Route context, when present, changes which alternatives win — fold a
   // coarse (~100m) version of both anchors into the cache key so a
-  // route-aware lookup never serves a plain "near the old pin" result.
+  // route-aware lookup never serves a plain "near the old pin" result. Radius
+  // and limit are part of the key too, so a tight "near me" lookup and a wide
+  // area search don't collide in the cache.
   const routeKey = routeCacheKey(route);
   const key = cacheKey(
-    queries.join('|') + (intent ? `:${intent}` : '') + routeKey,
+    queries.join('|') +
+      (intent ? `:${intent}` : '') +
+      routeKey +
+      `|r=${radiusM}|n=${limit}`,
     coords,
   );
   const cached = readCache(key);
@@ -249,12 +263,8 @@ export async function findPlaces(
         intent: intent ?? queries[0],
         latitude: coords.latitude,
         longitude: coords.longitude,
-        // 5 km is roughly what Google Maps uses by default when you
-        // search for a venue type in a city: wide enough to include
-        // popular places a few neighborhoods over, narrow enough to
-        // stay locally meaningful.
-        radiusM: 5000,
-        limit: 6,
+        radiusM,
+        limit,
         ...(route?.prev ? { prev: route.prev } : {}),
         ...(route?.next ? { next: route.next } : {}),
       },

@@ -194,6 +194,14 @@ export default function RootLayout() {
             />
             <Stack.Screen name="itinerary" />
             <Stack.Screen name="day-plans" />
+            <Stack.Screen
+              name="discover-sandbox"
+              options={{
+                presentation: 'modal',
+                animation: 'slide_from_bottom',
+                contentStyle: { backgroundColor: colors.background },
+              }}
+            />
           </Stack>
           {!settled ? <Splash /> : null}
           <InAppNotification />

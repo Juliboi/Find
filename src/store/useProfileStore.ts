@@ -16,6 +16,19 @@ interface ProfileState {
   wakeTime: string | null;
   /** "HH:MM" 24h — when the user wants to be done for the day. */
   bedTime: string | null;
+  /** Minutes the user takes to fully wake up before focused/productive time. */
+  wakeUpDurationMin: number;
+  /** "HH:MM" comfortable meal windows (null until onboarding sets them). */
+  breakfastStart: string | null;
+  breakfastEnd: string | null;
+  lunchStart: string | null;
+  lunchEnd: string | null;
+  dinnerStart: string | null;
+  dinnerEnd: string | null;
+  /** "HH:MM" after which the planner sticks to calm, sleep-friendly activities. */
+  windDownTime: string | null;
+  /** Whether screen-heavy wind-down activities are acceptable near bedtime. */
+  allowScreenWindDown: boolean;
   /** Whether the user owns/has access to a car (availability, not "always"). */
   hasCar: boolean;
   /** Canonical dietary tags chosen during onboarding. */
@@ -33,6 +46,15 @@ const EMPTY = {
   fullName: null,
   wakeTime: null,
   bedTime: null,
+  wakeUpDurationMin: 30,
+  breakfastStart: null,
+  breakfastEnd: null,
+  lunchStart: null,
+  lunchEnd: null,
+  dinnerStart: null,
+  dinnerEnd: null,
+  windDownTime: null,
+  allowScreenWindDown: false,
   hasCar: false,
   dietary: [] as string[],
   dietaryNotes: null,
@@ -53,6 +75,15 @@ export const useProfileStore = create<ProfileState>()(
         fullName: s.fullName,
         wakeTime: s.wakeTime,
         bedTime: s.bedTime,
+        wakeUpDurationMin: s.wakeUpDurationMin,
+        breakfastStart: s.breakfastStart,
+        breakfastEnd: s.breakfastEnd,
+        lunchStart: s.lunchStart,
+        lunchEnd: s.lunchEnd,
+        dinnerStart: s.dinnerStart,
+        dinnerEnd: s.dinnerEnd,
+        windDownTime: s.windDownTime,
+        allowScreenWindDown: s.allowScreenWindDown,
         hasCar: s.hasCar,
         dietary: s.dietary,
         dietaryNotes: s.dietaryNotes,

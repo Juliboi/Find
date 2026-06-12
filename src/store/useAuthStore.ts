@@ -54,6 +54,18 @@ function applyProfileToStores(row: ProfileRow) {
     fullName: row.full_name,
     wakeTime: wake,
     bedTime: bed,
+    wakeUpDurationMin:
+      typeof row.wake_up_duration_min === 'number'
+        ? row.wake_up_duration_min
+        : 30,
+    breakfastStart: normalizeTime(row.breakfast_start),
+    breakfastEnd: normalizeTime(row.breakfast_end),
+    lunchStart: normalizeTime(row.lunch_start),
+    lunchEnd: normalizeTime(row.lunch_end),
+    dinnerStart: normalizeTime(row.dinner_start),
+    dinnerEnd: normalizeTime(row.dinner_end),
+    windDownTime: normalizeTime(row.wind_down_time),
+    allowScreenWindDown: row.allow_screen_wind_down === true,
     hasCar: row.has_car,
     dietary: row.dietary ?? [],
     dietaryNotes: row.dietary_notes ?? null,
@@ -260,6 +272,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       home_longitude: input.homeLongitude,
       wake_time: input.wakeTime,
       bed_time: input.bedTime,
+      wake_up_duration_min: input.wakeUpDurationMin,
+      breakfast_start: input.breakfastStart,
+      breakfast_end: input.breakfastEnd,
+      lunch_start: input.lunchStart,
+      lunch_end: input.lunchEnd,
+      dinner_start: input.dinnerStart,
+      dinner_end: input.dinnerEnd,
+      wind_down_time: input.windDownTime,
+      allow_screen_wind_down: input.allowScreenWindDown,
       has_car: input.hasCar,
       dietary: input.dietary,
       dietary_notes: input.dietaryNotes,
@@ -270,7 +291,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       .upsert(row, { onConflict: 'id' })
       .select()
       .single();
-    if (error) throw error;
+    // Supabase returns a PostgrestError (a plain object, not an `Error`), which
+    // makes callers' `err instanceof Error` checks fall through to a generic
+    // message. Re-wrap it so the real cause (e.g. a missing column) surfaces.
+    if (error) {
+      throw new Error(
+        [error.message, error.details, error.hint].filter(Boolean).join(' — '),
+      );
+    }
     const saved = data as ProfileRow;
     applyProfileToStores(saved);
     set({ profile: saved, profileLoaded: true, needsOnboarding: false });

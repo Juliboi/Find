@@ -12,6 +12,19 @@ export interface ProfileRow {
   home_longitude: number | null;
   wake_time: string | null;
   bed_time: string | null;
+  /** Minutes the user needs to fully wake up before focused/productive time. */
+  wake_up_duration_min: number | null;
+  /** Comfortable meal windows ("HH:MM:SS" from PostgREST; nullable). */
+  breakfast_start: string | null;
+  breakfast_end: string | null;
+  lunch_start: string | null;
+  lunch_end: string | null;
+  dinner_start: string | null;
+  dinner_end: string | null;
+  /** After this time the planner sticks to calm, sleep-friendly activities. */
+  wind_down_time: string | null;
+  /** Whether screen-heavy wind-down activities are acceptable near bedtime. */
+  allow_screen_wind_down: boolean | null;
   has_car: boolean;
   /** Canonical dietary tags (e.g. "vegetarian", "gluten-free"). */
   dietary: string[] | null;
@@ -32,6 +45,19 @@ export interface OnboardingInput {
   wakeTime: string;
   /** "HH:MM" 24h. */
   bedTime: string;
+  /** Minutes the user takes to fully wake up (morning ramp-up). */
+  wakeUpDurationMin: number;
+  /** "HH:MM" comfortable meal windows. */
+  breakfastStart: string;
+  breakfastEnd: string;
+  lunchStart: string;
+  lunchEnd: string;
+  dinnerStart: string;
+  dinnerEnd: string;
+  /** "HH:MM" after which only calm, sleep-friendly activities are scheduled. */
+  windDownTime: string;
+  /** Whether screen-heavy wind-down activities are acceptable near bedtime. */
+  allowScreenWindDown: boolean;
   hasCar: boolean;
   /** Canonical dietary tags chosen from the onboarding chip set. */
   dietary: string[];
