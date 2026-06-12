@@ -323,8 +323,12 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
   }
 
   const radiusM = params.radiusM ?? defaultRadiusM(params);
+  // Discovery never filters by "open now": the user is choosing a place for a
+  // possibly-later time, so closed-right-now venues must still appear (their
+  // open/closed status is shown on each card, not used to hide them).
   const res = await findPlaces(queries, baseQuery, resolved.center, undefined, {
     radiusM,
+    includeClosed: true,
   });
 
   return {

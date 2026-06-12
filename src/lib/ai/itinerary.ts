@@ -32,6 +32,27 @@ export interface ItineraryResult {
   debug?: ItineraryDebug;
 }
 
+/**
+ * An already-located stop handed to the planner to compose verbatim — a placed
+ * errand, or an auto-place errand the client resolved before planning (Phase 6).
+ * The planner places it exactly (no discovery) and enrichment uses its coords +
+ * metadata directly instead of a Google Places lookup.
+ */
+export interface PlanFixedStop {
+  title: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  startTime?: string;
+  endTime?: string;
+  durationMin?: number;
+  notes?: string;
+  photoUrl?: string;
+  rating?: number;
+  ratingCount?: number;
+  openingHours?: VenueOpeningHours;
+}
+
 interface PlanItineraryOptions {
   context?: SchedulerContext;
   date?: string;
@@ -48,6 +69,18 @@ interface PlanItineraryOptions {
    * the request to the planner's cheaper + faster grounded model.
    */
   fast?: boolean;
+  /**
+   * Already-located stops (placed / resolved errands) the planner must compose
+   * verbatim rather than discover. Sent structurally so it never re-searches or
+   * swaps the user's chosen venues.
+   */
+  fixedStops?: PlanFixedStop[];
+  /**
+   * Compose mode (Phase 6): build the day ONLY from `fixedStops` with no venue
+   * discovery, letting the planner skip Google Search grounding and run the
+   * cheapest model. The client sets this only when the day needs no discovery.
+   */
+  compose?: boolean;
 }
 
 function buildContextPayload(
@@ -417,6 +450,8 @@ export async function planItinerary(
     if (options.date) body.date = options.date;
     if (options.now) body.now = options.now;
     if (options.fast) body.fast = true;
+    if (options.fixedStops && options.fixedStops.length) body.fixedStops = options.fixedStops;
+    if (options.compose) body.compose = true;
     const ctx = buildContextPayload(options.context);
     if (ctx) body.context = ctx;
     if (debug) debug.request = body;

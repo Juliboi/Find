@@ -570,6 +570,11 @@ interface ScoreContext {
    * to the old pin".
    */
   detourM?: number | null;
+  /**
+   * Discovery browsing: when true, "open now" stops being a ranking signal —
+   * a venue closed right now is fine because the user is choosing for later.
+   */
+  includeClosed?: boolean;
 }
 
 function scoreCandidate(c: ScoreContext): number {
@@ -596,7 +601,7 @@ function scoreCandidate(c: ScoreContext): number {
   const reviews = reviewsRaw > 0
     ? Math.min(1, Math.log10(reviewsRaw + 1) / 3)
     : 0;
-  const open = c.place.openNow === false ? 0 : 1;
+  const open = c.includeClosed || c.place.openNow !== false ? 1 : 0;
 
   if (c.everyday) {
     return (
@@ -637,6 +642,7 @@ async function searchGoogleFanOut(
   everyday: boolean,
   route: { prev?: Coords; next?: Coords } | undefined,
   candidatePoolSize = 20,
+  includeClosed = false,
 ): Promise<{ candidates: ScoredCandidate[]; perQueryCounts: Record<string, number> }> {
   const settled = await Promise.allSettled(
     queries.map((q) => searchGoogleOnce(q, biasCenter, distRef, radiusM, apiKey)),
@@ -688,6 +694,7 @@ async function searchGoogleFanOut(
         radiusM,
         everyday,
         detourM: c.detourM,
+        includeClosed,
       }) + corroboration;
     return c;
   });
@@ -725,6 +732,7 @@ async function analyzeWithLLM(
   apiKey: string,
   everyday: boolean,
   routeAware: boolean,
+  includeClosed = false,
 ): Promise<LLMPickResult> {
   // Compact representation. We only include what the model needs to
   // form a judgement — full coordinates and photo URLs would just
@@ -762,8 +770,9 @@ Your job:
        (a) it satisfies the proximity rule below,
        (b) it is on-intent (e.g. not a bar when intent is "lunch"),
        (c) rating is null OR ≥4.0.
-     STEP B — Apply the openNow rule (rule 3 below) to drop closed
-     venues unless keeping them prevents under-supply.
+     STEP B — ${includeClosed
+       ? 'KEEP closed venues too. The user is browsing for a possibly-later time, so "open right now" is NOT a filter here — never drop a venue just because it is currently closed.'
+       : 'Apply the openNow rule (rule 3 below) to drop closed venues unless keeping them prevents under-supply.'}
      STEP C — From the remaining QUALIFIED set, output up to
      ${limit} picks. If 5 qualify, output 5. If 7 qualify, output
      ${limit}. If 2 qualify, output 2.
@@ -792,10 +801,16 @@ Your job:
    type, or price (don't claim "free Wi-Fi", "free chargers", or "open
    24 hours" unless the data shows it or the place is genuinely well
    known for it).
-3. Drop venues with openNow === false UNLESS removing them would
+3. ${includeClosed
+  ? `Do NOT drop a venue for being closed right now (openNow === false).
+   The user is choosing a place for a later time, so a venue that
+   happens to be closed now is a perfectly valid pick. Its open/closed
+   status is shown on the card — do NOT mention it in the reasoning
+   sentence.`
+  : `Drop venues with openNow === false UNLESS removing them would
    leave fewer than 3 picks AND the venue is exceptional (4.7+ rating
    with 200+ reviews). Open/closed status is shown to the user
-   visually — do NOT mention it in the reasoning sentence.
+   visually — do NOT mention it in the reasoning sentence.`}
 4. Never invent facts you can't see in the candidate metadata.
 
 PROXIMITY RULE — the intent type determines how strict to be:
@@ -956,6 +971,8 @@ async function searchGoogle(
   apiKey: string,
   openaiKey: string | undefined,
   route?: { prev?: Coords; next?: Coords },
+  /** Discovery browsing: don't drop venues that are closed right now. */
+  includeClosed = false,
 ): Promise<{
   provider: 'google';
   places: UnifiedPlace[];
@@ -1009,6 +1026,8 @@ async function searchGoogle(
     apiKey,
     everyday,
     routeAware ? { prev, next } : undefined,
+    20,
+    includeClosed,
   );
 
   if (candidates.length === 0) {
@@ -1042,6 +1061,7 @@ async function searchGoogle(
     openaiKey,
     everyday,
     routeAware,
+    includeClosed,
   );
   if (llm.picks.length === 0) {
     return {
@@ -1121,21 +1141,21 @@ async function searchGoogle(
     (c) =>
       proximityOf(c.id, c.distanceM) <= proxLimit &&
       (c.rating === null || c.rating >= 4.0) &&
-      c.openNow !== false,
+      (includeClosed || c.openNow !== false),
   );
   // Well-validated far pool — only used for non-everyday intents WITHOUT
   // route context. When we have a corridor, surfacing a far-detour venue
   // contradicts the whole point (anti-zig-zag), so we skip it.
   const wellValidatedFarPool = everyday || routeAware
     ? []
-    : candidates.filter(
-        (c) =>
-          c.distanceM > proxLimit &&
-          c.distanceM <= 7500 &&
-          (c.rating ?? 0) >= 4.5 &&
-          (c.ratingCount ?? 0) >= 200 &&
-          c.openNow !== false,
-      );
+      : candidates.filter(
+          (c) =>
+            c.distanceM > proxLimit &&
+            c.distanceM <= 7500 &&
+            (c.rating ?? 0) >= 4.5 &&
+            (c.ratingCount ?? 0) >= 200 &&
+            (includeClosed || c.openNow !== false),
+        );
 
   // Drop AI picks that backtrack too far when on-route/close alternatives
   // exist. For route-aware swaps this applies to BOTH intent types — a
@@ -1494,6 +1514,12 @@ Deno.serve(async (req: Request) => {
     prev?: { latitude?: number; longitude?: number } | null;
     /** Next located stop (place-swap browser) — anchors the corridor. */
     next?: { latitude?: number; longitude?: number } | null;
+    /**
+     * Discovery browsing: keep venues that are CLOSED right now. The user is
+     * choosing a place for a possibly-later time, so "open now" must not hide
+     * options — open/closed status is shown on each card, never used to filter.
+     */
+    includeClosed?: boolean;
   };
   try {
     payload = await req.json();
@@ -1549,6 +1575,10 @@ Deno.serve(async (req: Request) => {
     Math.max(200, Number(payload.radiusM) || 5000),
   );
   const limit = Math.min(20, Math.max(1, Number(payload.limit) || 6));
+  // Discovery browsing opts out of the "open now" filter entirely (see field
+  // doc above). Place-swap / compose callers leave it false to keep the
+  // existing behaviour of preferring venues that are currently open.
+  const includeClosed = payload.includeClosed === true;
 
   // Optional route context from the place-swap browser. Both stops are
   // validated independently — a single bad coord just disables that side
@@ -1582,7 +1612,8 @@ Deno.serve(async (req: Request) => {
   const cacheKey = serverCacheKey(
     queries.join('|') +
       (intent && intent !== queries[0] ? `::${intent}` : '') +
-      routeKeyPart,
+      routeKeyPart +
+      (includeClosed ? '|inc' : ''),
     lat,
     lon,
     radiusM,
@@ -1639,6 +1670,7 @@ Deno.serve(async (req: Request) => {
         prevCoords || nextCoords
           ? { prev: prevCoords, next: nextCoords }
           : undefined,
+        includeClosed,
       );
     } else if (fsqKey && category) {
       result = await searchFoursquare(

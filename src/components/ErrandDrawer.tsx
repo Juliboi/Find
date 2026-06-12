@@ -192,6 +192,7 @@ export function ErrandDrawer({
             nearby={discovery?.nearby ?? false}
             fallbackCenter={fallbackCenter ?? null}
             anchorDate={draft.date ?? null}
+            anchorTime={draft.startTime ?? null}
             onPick={(place) => {
               setOverride({
                 draft: mergePlaceIntoDraft(draft, place, discoverQuery),

@@ -15,7 +15,16 @@
 //      some random nearby building.
 //
 // Request body:
-//   { request: string, date?: "YYYY-MM-DD", context?: { home?: { latitude, longitude, label } } }
+//   { request: string, date?: "YYYY-MM-DD", now?: "HH:MM", fast?: boolean,
+//     context?: { home?: { latitude, longitude, label }, ... },
+//     fixedStops?: FixedStop[],   // already-located errands to compose verbatim
+//     compose?: boolean }         // Phase 6: build ONLY from fixedStops, no
+//                                 // discovery → no grounding, cheapest model.
+//
+// Compose mode (compose:true + fixedStops): the model only orders/times/
+// describes the pre-located stops and fills gaps — it never invents venues, so
+// we skip Google Search grounding (schema mode, cheapest model) and skip the
+// per-venue Places lookup for those stops. This is the cost/reliability win.
 //
 // Response body: an Itinerary object (see src/types/itinerary.ts).
 //
@@ -62,6 +71,18 @@ const CONFIGURED_GEMINI_MODEL = Deno.env.get('GEMINI_MODEL') ?? DEFAULT_GEMINI_M
 const DEFAULT_FAST_GEMINI_MODEL = 'gemini-3.1-flash-lite';
 const CONFIGURED_FAST_GEMINI_MODEL =
   Deno.env.get('GEMINI_FAST_MODEL') ?? DEFAULT_FAST_GEMINI_MODEL;
+
+// Compose mode (Phase 6) — the day is built from PRE-PLANNED, already-located
+// stops (resolved errands), so the planner only ORDERS / TIMES / DESCRIBES them
+// and fills the gaps; it never discovers venues. With no discovery there's no
+// need for Google Search grounding, so compose always runs in schema mode —
+// where even the cheapest lite model emits reliable JSON (grounding is what made
+// lite models drift empty). This is the cost/reliability win: cheapest + fastest
+// model, no grounding, no per-venue Places lookups. Override with
+//   supabase secrets set GEMINI_COMPOSE_MODEL=gemini-2.5-flash
+const DEFAULT_COMPOSE_GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const CONFIGURED_COMPOSE_GEMINI_MODEL =
+  Deno.env.get('GEMINI_COMPOSE_MODEL') ?? DEFAULT_COMPOSE_GEMINI_MODEL;
 
 // Planning has two mutually-exclusive modes (Gemini forbids combining the
 // google_search tool with a JSON responseSchema):
@@ -263,6 +284,31 @@ interface Context {
   dietaryNotes?: string;
 }
 
+/**
+ * A stop the user has ALREADY located (a placed errand, or an auto-place errand
+ * the client resolved before planning). The planner places these verbatim and
+ * never discovers them, and enrichment uses their trusted coords/metadata
+ * directly instead of a Google Places lookup. See Phase 6 (compose mode).
+ */
+interface FixedStop {
+  /** What the user is doing here, e.g. "Pick up prescription". */
+  title: string;
+  /** The venue name/label, copied verbatim into the plan. */
+  name: string;
+  latitude: number;
+  longitude: number;
+  startTime?: string;
+  endTime?: string;
+  durationMin?: number;
+  notes?: string;
+  /** Pre-resolved venue metadata (from when the errand's place was picked) so
+   * enrichment can skip Google entirely. */
+  photoUrl?: string;
+  rating?: number;
+  ratingCount?: number;
+  openingHours?: VenueOpeningHours;
+}
+
 // ----------------------------------------------------------- HTTP helpers
 
 function corsHeaders(): Record<string, string> {
@@ -431,6 +477,50 @@ function normalizeContext(input: any): Context {
   return ctx;
 }
 
+/**
+ * Shapes the request's `fixedStops` into validated {@link FixedStop}s. A stop is
+ * dropped unless it carries finite coordinates and a name/title — a "fixed" stop
+ * is by definition already located. Caps the list so a runaway client can't
+ * balloon the prompt.
+ */
+function normalizeFixedStops(input: any): FixedStop[] {
+  if (!Array.isArray(input)) return [];
+  const out: FixedStop[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const lat = Number(raw.latitude);
+    const lon = Number(raw.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const title =
+      typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim().slice(0, 120) : '';
+    const name =
+      typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 160) : title;
+    if (!title && !name) continue;
+    const stop: FixedStop = {
+      title: title || name,
+      name,
+      latitude: lat,
+      longitude: lon,
+    };
+    if (isHHMM(raw.startTime)) stop.startTime = raw.startTime;
+    if (isHHMM(raw.endTime)) stop.endTime = raw.endTime;
+    const dur = Number(raw.durationMin);
+    if (Number.isFinite(dur) && dur > 0 && dur <= 1440) stop.durationMin = Math.round(dur);
+    if (typeof raw.notes === 'string' && raw.notes.trim()) stop.notes = raw.notes.trim().slice(0, 300);
+    if (typeof raw.photoUrl === 'string' && raw.photoUrl.trim()) stop.photoUrl = raw.photoUrl.trim();
+    const rating = Number(raw.rating);
+    if (Number.isFinite(rating) && rating >= 0 && rating <= 5) stop.rating = rating;
+    const rc = Number(raw.ratingCount);
+    if (Number.isFinite(rc) && rc >= 0) stop.ratingCount = Math.round(rc);
+    if (raw.openingHours && typeof raw.openingHours === 'object') {
+      stop.openingHours = raw.openingHours as VenueOpeningHours;
+    }
+    out.push(stop);
+    if (out.length >= 25) break;
+  }
+  return out;
+}
+
 // ----------------------------------------------------------- Gemini prompt
 
 function buildPlannerPrompt(args: {
@@ -438,6 +528,10 @@ function buildPlannerPrompt(args: {
   home: HomePin | null;
   date: string;
   grounded: boolean;
+  /** Already-located stops (placed/resolved errands) to compose verbatim. */
+  fixedStops?: FixedStop[];
+  /** Compose mode: the day is built ONLY from fixedStops — no venue discovery. */
+  compose?: boolean;
   userName?: string;
   wakeTime?: string;
   bedTime?: string;
@@ -555,9 +649,30 @@ function buildPlannerPrompt(args: {
   // they might be closed (the app shows a "consider changing" notice instead).
   const hoursRule =
     ` OPENING HOURS (the day is ${args.date}): for any venue YOU choose yourself (the user did NOT name it), pick one that is OPEN for the ENTIRE planned time block at its scheduled start/end time — factor in how long the activity needs. Never self-select a venue that is closed or about to close at that time; choose an alternative that is open for the whole visit instead. EXCEPTION: if the user NAMED the venue or gave its address, keep it EXACTLY as written even if it might be closed — do NOT substitute it.`;
-  const venueRule = args.grounded
+  const venueRule = args.compose
+    ? '4. DO NOT invent, search for, or name any NEW business or venue beyond the PRE-PLANNED STOPS listed above. Those are the ONLY located venues in the day — place each one EXACTLY as given (copy its name verbatim into place.name, the same name into place.userQuery, and the EXACT given latitude/longitude into place.coords). For every OTHER activity (meals, getting ready, downtime, exercise, reading, chores), keep it AT HOME (omit the place field entirely) or model it as a "gap"/"break" — never attach a made-up venue to it.' + userQueryRule + hoursRule
+    : args.grounded
     ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
     : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
+
+  // PRE-PLANNED STOPS — already-located errands the user picked. The model must
+  // place these verbatim (never re-discover or move them) and build the day's
+  // order + travel around them. In compose mode these are the ONLY venues.
+  const fixed = args.fixedStops ?? [];
+  const fmtFixedStop = (s: FixedStop): string => {
+    const when = s.startTime
+      ? s.endTime
+        ? ` (${s.startTime}–${s.endTime})`
+        : ` (at ${s.startTime})`
+      : s.durationMin
+        ? ` (~${s.durationMin} min)`
+        : '';
+    const note = s.notes ? ` — ${s.notes}` : '';
+    return `- "${s.title}" → ${s.name} [${s.latitude.toFixed(5)}, ${s.longitude.toFixed(5)}]${when}${note}`;
+  };
+  const fixedStopsBlock = fixed.length
+    ? `\n\nPRE-PLANNED STOPS — already chosen and located by the user. You MUST include each as an item placed EXACTLY here: copy the venue name verbatim into place.name, set place.userQuery to that same name, and set place.coords to the EXACT latitude/longitude given. Do NOT search for, rename, move, swap, or replace them — they are fixed. Schedule each at its given time (or sensibly when none is given), reserve its duration, and order/route the rest of the day around them:\n${fixed.map(fmtFixedStop).join('\n')}`
+    : '';
 
   const contextLines = [
     homeBlock,
@@ -623,7 +738,7 @@ ${contextLines}
 USER REQUEST (their own words, between triple quotes):
 """
 ${args.userText}
-"""
+"""${fixedStopsBlock}
 
 REQUIREMENTS
 1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
@@ -1214,6 +1329,34 @@ function openStatusFromBool(b: boolean | null): string | null {
 }
 
 /**
+ * Does this resolved slot correspond to a PRE-PLANNED stop? We instruct the
+ * model to copy a fixed stop's exact coords + name, so we match on coordinates
+ * first (≤75 m, the same slack used for the home check) and fall back to a fuzzy
+ * name match. A hit means we trust the client's pre-resolved place and skip the
+ * Google lookup entirely.
+ */
+function matchFixedStop(
+  slot: { name: string; userQuery: string; coords: Coords | null },
+  fixedStops: FixedStop[],
+): FixedStop | null {
+  if (fixedStops.length === 0) return null;
+  if (slot.coords) {
+    for (const fs of fixedStops) {
+      if (haversineMeters(slot.coords, { latitude: fs.latitude, longitude: fs.longitude }) <= 75) {
+        return fs;
+      }
+    }
+  }
+  const label = slot.userQuery || slot.name;
+  if (label) {
+    for (const fs of fixedStops) {
+      if (nameSimilar(label, fs.name)) return fs;
+    }
+  }
+  return null;
+}
+
+/**
  * Walks the parsed itinerary and merges Google Places fields into every
  * unique venue the model returned. Skips:
  *   - items with no place block (at-home / break items the model wisely omits)
@@ -1226,6 +1369,7 @@ async function enrichItinerary(
   home: HomePin | null,
   apiKey: string,
   dateISO: string,
+  fixedStops: FixedStop[] = [],
 ): Promise<void> {
   if (!parsed || !Array.isArray(parsed.sections)) return;
 
@@ -1313,6 +1457,44 @@ async function enrichItinerary(
   await Promise.all(
     Array.from(slotsByKey.values()).map(async (slots) => {
       const { name, address, userQuery, locationType, coords } = slots[0];
+
+      // PRE-PLANNED stop? The client already resolved this place (a located /
+      // auto-resolved errand), so trust its coords + metadata and skip Google
+      // entirely — the compose-mode cost win, and it guarantees the user's
+      // chosen venue is never swapped.
+      const fx = matchFixedStop({ name, userQuery, coords }, fixedStops);
+      if (fx) {
+        for (const { item, startTime, endTime, durationMinutes } of slots) {
+          const hint = item.place && typeof item.place === 'object' ? item.place : {};
+          const endForItem = visitEndHHMM(startTime, endTime, durationMinutes);
+          const scheduledStatus = fx.openingHours
+            ? openStatusForVisit(fx.openingHours, dateISO, startTime, endForItem)
+            : null;
+          item.place = {
+            ...hint,
+            name: fx.name,
+            address: typeof hint.address === 'string' && hint.address ? hint.address : null,
+            rating:
+              typeof fx.rating === 'number'
+                ? fx.rating
+                : typeof hint.rating === 'number'
+                  ? hint.rating
+                  : null,
+            ratingCount: typeof fx.ratingCount === 'number' ? fx.ratingCount : undefined,
+            openStatus: scheduledStatus ?? undefined,
+            openingHours: fx.openingHours ?? undefined,
+            userNamed: true,
+            photoUrl: fx.photoUrl ?? (typeof hint.photoUrl === 'string' ? hint.photoUrl : null),
+            coords: { latitude: fx.latitude, longitude: fx.longitude },
+          };
+        }
+        console.log(
+          `[enrich] FIXED uq=${JSON.stringify(userQuery)} name=${JSON.stringify(name)} → ` +
+            `${fx.name} @${fx.latitude.toFixed(4)},${fx.longitude.toFixed(4)} (no lookup)`,
+        );
+        return;
+      }
+
       const center = coords ?? homeC;
       if (!center) return; // no anchor to bias the search to
       let record = await lookupGooglePlace({
@@ -1476,7 +1658,15 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  let payload: { request?: string; date?: string; now?: string; context?: any; fast?: boolean };
+  let payload: {
+    request?: string;
+    date?: string;
+    now?: string;
+    context?: any;
+    fast?: boolean;
+    fixedStops?: any;
+    compose?: boolean;
+  };
   try {
     payload = await req.json();
   } catch {
@@ -1493,16 +1683,31 @@ Deno.serve(async (req: Request) => {
   const context = normalizeContext(payload.context);
   // Re-plans of an existing day ask for the cheaper/faster grounded model.
   const fast = payload.fast === true;
-  const primaryModel = fast ? CONFIGURED_FAST_GEMINI_MODEL : CONFIGURED_GEMINI_MODEL;
+
+  // Phase 6 — the client's already-located stops (placed / auto-resolved
+  // errands). Compose mode kicks in when the client asks for it AND there are
+  // fixed stops to build from: it forces schema mode (no Google Search
+  // grounding) on the cheapest model, since with no venue discovery there's
+  // nothing to ground. Anything else stays on the current grounded path.
+  const fixedStops = normalizeFixedStops(payload.fixedStops);
+  const compose = payload.compose === true && fixedStops.length > 0;
+  const grounded = compose ? false : GROUNDING_ENABLED;
+  const primaryModel = compose
+    ? CONFIGURED_COMPOSE_GEMINI_MODEL
+    : fast
+      ? CONFIGURED_FAST_GEMINI_MODEL
+      : CONFIGURED_GEMINI_MODEL;
 
   // 1) Single Gemini call that produces the whole itinerary (grounded with
-  //    live search, or schema-constrained — see GROUNDING_ENABLED).
+  //    live search, or schema-constrained — see GROUNDING_ENABLED / compose).
   const prompt = buildPlannerPrompt({
     userText: request,
     home: context.home ?? null,
     date,
     now,
-    grounded: GROUNDING_ENABLED,
+    grounded,
+    fixedStops,
+    compose,
     userName: context.userName,
     wakeTime: context.wakeTime,
     bedTime: context.bedTime,
@@ -1518,12 +1723,14 @@ Deno.serve(async (req: Request) => {
     prompt,
     apiKey: geminiKey,
     model: primaryModel,
-    grounded: GROUNDING_ENABLED,
+    grounded,
   });
   // Self-heal a primary that fails or returns junk — a bad GEMINI_MODEL
-  // override, or the cheaper fast-replan model emitting an empty GROUNDED
-  // response. Retry once on the known-reliable default rather than failing the
-  // whole request (which would drop the client to its offline sample).
+  // override, the cheaper fast-replan model emitting an empty GROUNDED
+  // response, or a compose-model hiccup. Retry once on the known-reliable
+  // default (keeping the same grounded flag, so compose stays schema mode)
+  // rather than failing the whole request (which would drop the client to its
+  // offline sample).
   if (!gem.ok && primaryModel !== DEFAULT_GEMINI_MODEL) {
     console.warn(
       `plan-itinerary: model "${primaryModel}" failed (${gem.detail}); retrying with "${DEFAULT_GEMINI_MODEL}".`,
@@ -1532,7 +1739,7 @@ Deno.serve(async (req: Request) => {
       prompt,
       apiKey: geminiKey,
       model: DEFAULT_GEMINI_MODEL,
-      grounded: GROUNDING_ENABLED,
+      grounded,
     });
   }
   if (!gem.ok) {
@@ -1551,7 +1758,7 @@ Deno.serve(async (req: Request) => {
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
   if (googleKey) {
     try {
-      await enrichItinerary(parsed, context.home ?? null, googleKey, date);
+      await enrichItinerary(parsed, context.home ?? null, googleKey, date, fixedStops);
     } catch {
       // ignore — the unenriched plan is still useful
     }

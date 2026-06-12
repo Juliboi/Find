@@ -51,9 +51,12 @@ import { ErrandDrawer } from '@/components/ErrandDrawer';
 import { PlanComposer } from '@/components/PlanComposer';
 import type { ErrandDraft } from '@/lib/ai/parseErrand';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
-import { planItinerary, type ItineraryDebug } from '@/lib/ai/itinerary';
+import { planItinerary, type ItineraryDebug, type PlanFixedStop } from '@/lib/ai/itinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
 import { requestAdjustOps } from '@/lib/ai/adjustItinerary';
+import { collectDayAnchors } from '@/lib/dayAnchors';
+import { resolveAutoPlaceVenues } from '@/lib/resolveAutoPlace';
+import type { NearbyPlace } from '@/lib/places';
 import {
   applyOp,
   applyRoutedLegs,
@@ -213,6 +216,13 @@ const GAP_MIN_MINUTES = 20;
 
 // Default length for a gap the user adds by hand (between two plans, etc.).
 const DEFAULT_GAP_MINUTES = 30;
+
+// Compose mode (Phase 6) triggers only for short, discovery-free prose — a
+// richly described day stays on the grounded path. These bound "short" and
+// catch venue cues that mean the user DOES want the planner to discover places.
+const COMPOSE_PROSE_MAX_CHARS = 80;
+const COMPOSE_DISCOVERY_CUE_RE =
+  /\b(find|somewhere|recommend|suggest|nice|good|best|bar|pub|club|restaurant|bistro|caf[eé]|coffee|brunch|lunch|dinner|breakfast|museum|gallery|cinema|movie|theat(?:re|er)|park|shop|store|mall|market|gym|spa|drinks?|eat|explore)\b/i;
 
 const HOME_NAME_RE = /^(home|my home|house|residence)$/i;
 
@@ -1195,8 +1205,84 @@ export default function ItineraryScreen() {
       const chosenErrands = errands.filter(
         (e) => selectedErrandIds.has(e.id) && !e.done,
       );
-      const errandsBlock = chosenErrands.length
-        ? `\n\nAlso work these errands into the day:\n${chosenErrands
+
+      // Phase 6a — pre-resolve "Diem picks the spot" (autoPlace) errands to a
+      // concrete, route-aware venue BEFORE planning, so the model composes a
+      // real place instead of guessing one via grounded search. Best-effort:
+      // anything left unresolved falls back to the prose hint below.
+      const autoErrands = chosenErrands.filter((e) => e.autoPlace);
+      let resolvedPlaces = new Map<string, NearbyPlace>();
+      if (autoErrands.length) {
+        const startCoord = planStartLocation
+          ? { latitude: planStartLocation.latitude, longitude: planStartLocation.longitude }
+          : home
+            ? { latitude: home.latitude, longitude: home.longitude }
+            : null;
+        const endCoord = planEndLocation
+          ? { latitude: planEndLocation.latitude, longitude: planEndLocation.longitude }
+          : home
+            ? { latitude: home.latitude, longitude: home.longitude }
+            : null;
+        const anchors = collectDayAnchors({ errands, date: effectiveDate, home }).map(
+          (a) => a.coords,
+        );
+        if (startCoord) anchors.push(startCoord);
+        if (endCoord) anchors.push(endCoord);
+        resolvedPlaces = await resolveAutoPlaceVenues({
+          items: autoErrands.map((e) => ({ id: e.id, query: e.placeQuery?.trim() || e.title })),
+          anchors,
+          start: startCoord,
+          end: endCoord,
+        });
+        if (planSeqRef.current !== seq) return; // reset / re-planned while resolving
+      }
+
+      // Phase 6 — split the chosen errands into PLACED stops (located, or an
+      // auto-place we just resolved) and UNPLACED ones (calls/tasks, or an
+      // auto-place we couldn't resolve). Placed stops go to the planner as
+      // structured `fixedStops` it composes verbatim (never re-searched);
+      // unplaced ones stay as the prose hints below.
+      const fixedStops: PlanFixedStop[] = [];
+      const unplacedErrands: typeof chosenErrands = [];
+      for (const e of chosenErrands) {
+        const picked = e.autoPlace ? resolvedPlaces.get(e.id) : null;
+        if (picked) {
+          fixedStops.push({
+            title: e.title,
+            name: picked.name,
+            latitude: picked.latitude,
+            longitude: picked.longitude,
+            startTime: e.startTime,
+            endTime: e.endTime,
+            durationMin: e.durationMin,
+            notes: e.notes,
+            photoUrl: picked.photoUrl ?? undefined,
+            rating: picked.rating ?? undefined,
+            ratingCount: picked.ratingCount ?? undefined,
+            openingHours: picked.openingHours ?? undefined,
+          });
+        } else if (!e.autoPlace && e.address && e.latitude != null && e.longitude != null) {
+          fixedStops.push({
+            title: e.title,
+            name: e.address,
+            latitude: e.latitude,
+            longitude: e.longitude,
+            startTime: e.startTime,
+            endTime: e.endTime,
+            durationMin: e.durationMin,
+            notes: e.notes,
+            photoUrl: e.photoUrl,
+            rating: e.rating,
+            ratingCount: e.ratingCount,
+            openingHours: e.openingHours,
+          });
+        } else {
+          unplacedErrands.push(e);
+        }
+      }
+
+      const errandsBlock = unplacedErrands.length
+        ? `\n\nAlso work these errands into the day:\n${unplacedErrands
             .map((e) => {
               const bits: string[] = [];
               if (e.startTime) {
@@ -1207,8 +1293,7 @@ export default function ItineraryScreen() {
                 bits.push(`~${formatDuration(e.durationMin)}`);
               }
               if (e.autoPlace) {
-                // No pinned venue — tell the planner to choose the best spot
-                // (closest / least detour / open) for the errand's category.
+                // Auto-place we couldn't resolve — let the planner choose.
                 const q =
                   e.placeQuery && e.placeQuery.toLowerCase() !== e.title.toLowerCase()
                     ? e.placeQuery
@@ -1226,6 +1311,21 @@ export default function ItineraryScreen() {
             })
             .join('\n')}`
         : '';
+
+      // Compose mode: when the day is driven purely by located stops — we have
+      // fixed stops, every auto-place errand resolved, and the user's free-text
+      // is a short, discovery-free line (not a richly described day) — let the
+      // planner COMPOSE without grounding (the cost/reliability win). A real
+      // prose description, or any venue cue ("find", "café", "drinks", …), keeps
+      // the safe grounded path.
+      const allAutoResolved = autoErrands.every((e) => resolvedPlaces.has(e.id));
+      const composeDay =
+        fixedStops.length > 0 &&
+        unplacedErrands.every((e) => !e.autoPlace) &&
+        allAutoResolved &&
+        text.length <= COMPOSE_PROSE_MAX_CHARS &&
+        !COMPOSE_DISCOVERY_CUE_RE.test(text);
+
       // When planning TODAY, the day is already underway: send the planner the
       // current time so it plans the rest of the day from now (not the morning),
       // and never let the stated start time sit in the past.
@@ -1239,6 +1339,8 @@ export default function ItineraryScreen() {
         context,
         date: effectiveDate,
         now: nowArg,
+        fixedStops,
+        compose: composeDay,
         debug: true,
       });
       if (planSeqRef.current !== seq) return; // user reset / planned again

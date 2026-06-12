@@ -9,6 +9,9 @@
 // It uses Google Places API (New):
 //   - places:autocomplete  → forgiving predictions (handles partials /
 //                            misspellings) mixing venues + addresses.
+//   - places:searchText    → fallback when autocomplete returns nothing for a
+//                            full, slightly-wrong string ("pirktova" → the
+//                            "Pikrtova" street; "kolkovna pankrac" → the venue).
 //   - places/{placeId}     → resolves a chosen prediction to coordinates.
 //
 // Two modes, picked by the request body:
@@ -191,6 +194,71 @@ async function autocomplete(
     .filter((p) => p.primary);
 }
 
+// ----------------------------------------------------- text search fallback
+//
+// Autocomplete is tuned for INCREMENTAL typing and is strict about spelling: a
+// full, AI-extracted string like "pirktova" (a typo for the street "Pikrtova")
+// or "kolkovna pankrac" (venue + area) returns ZERO place predictions — Google
+// hands back "query predictions" instead, which aren't pinnable. Text Search
+// (the same API `find-places` uses) is far more forgiving for whole queries and
+// returns BOTH venues and addresses, so we fall back to it whenever
+// autocomplete comes up empty. This is what makes "at <slightly-wrong place>"
+// actually resolve to a real pin.
+
+async function textSearch(
+  input: string,
+  apiKey: string,
+  center: { latitude: number; longitude: number } | null,
+): Promise<Prediction[]> {
+  const body: Record<string, unknown> = {
+    textQuery: input,
+    languageCode: 'en',
+    maxResultCount: 6,
+    ...(center
+      ? {
+          locationBias: {
+            circle: {
+              center: { latitude: center.latitude, longitude: center.longitude },
+              radius: 50000,
+            },
+          },
+        }
+      : {}),
+  };
+
+  const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': apiKey,
+      'X-Goog-FieldMask':
+        'places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Google Text Search ${res.status}: ${detail.slice(0, 240)}`);
+  }
+  const data = await res.json();
+  const places: any[] = Array.isArray(data?.places) ? data.places : [];
+
+  return places
+    .filter((p) => p && typeof p.id === 'string')
+    .map<Prediction>((p) => {
+      const name = typeof p?.displayName?.text === 'string' ? p.displayName.text : '';
+      const addr =
+        (typeof p?.shortFormattedAddress === 'string' ? p.shortFormattedAddress : '') ||
+        (typeof p?.formattedAddress === 'string' ? p.formattedAddress : '');
+      // Prefer the venue name as the headline; for a plain address the name IS
+      // the address, so don't repeat it on the secondary line.
+      const primary = name || addr;
+      const secondary = name ? addr : '';
+      return { placeId: p.id, primary, secondary };
+    })
+    .filter((p) => p.primary);
+}
+
 // ------------------------------------------------------------------- details
 
 interface PlaceDetails {
@@ -324,7 +392,16 @@ Deno.serve(async (req: Request) => {
         ? { latitude: lat, longitude: lon }
         : null;
 
-    const predictions = await autocomplete(input, apiKey, center, sessionToken);
+    let predictions = await autocomplete(input, apiKey, center, sessionToken);
+    // Autocomplete drew a blank (typo'd street, "venue + area", etc.) — retry
+    // with the forgiving Text Search so the place still resolves to a real pin.
+    if (predictions.length === 0 && input.length >= 3) {
+      try {
+        predictions = await textSearch(input, apiKey, center);
+      } catch {
+        // Keep the empty autocomplete result; client falls back to Nominatim.
+      }
+    }
     return jsonResponse({ provider: 'google', predictions });
   } catch (e) {
     return jsonResponse(

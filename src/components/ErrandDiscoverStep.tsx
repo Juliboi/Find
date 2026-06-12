@@ -44,6 +44,10 @@ interface Props {
   /** The errand's date (from the orchestrator) — scopes which day's stops we
    * measure closeness to. Null falls back to today. */
   anchorDate: string | null;
+  /** The errand's start time (from the orchestrator). When set together with
+   * anchorDate, each card shows open/closed AT that planned time instead of
+   * "right now" — "open now" is irrelevant when planning for later. */
+  anchorTime: string | null;
   /** Picked a candidate → hand back to the drawer to seed the confirm form. */
   onPick: (place: NearbyPlace) => void;
   /** Skip the suggestions and fill the form by hand. */
@@ -65,6 +69,7 @@ export function ErrandDiscoverStep({
   nearby,
   fallbackCenter,
   anchorDate,
+  anchorTime,
   onPick,
   onManual,
   onAutoPlan,
@@ -170,6 +175,8 @@ export function ErrandDiscoverStep({
               place={p}
               index={i}
               dayStops={dayStops}
+              anchorDate={anchorDate}
+              anchorTime={anchorTime}
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
                 onPick(p);
@@ -218,11 +225,15 @@ function DiscoverCard({
   place,
   index,
   dayStops,
+  anchorDate,
+  anchorTime,
   onPress,
 }: {
   place: NearbyPlace;
   index: number;
   dayStops: DayAnchor[];
+  anchorDate: string | null;
+  anchorTime: string | null;
   onPress: () => void;
 }) {
   const t = useTheme();
@@ -246,15 +257,20 @@ function DiscoverCard({
     [dayStops, place.latitude, place.longitude],
   );
 
-  // Google-Maps-style live hours from the structured weekly schedule, evaluated
-  // against the current clock. We pass a 60-min look-ahead as the visit "end" so
-  // a venue closing within the hour reads "Closing soon" instead of a bare
-  // "Open". Falls back to the provider's coarse open-now flag when a place has
-  // no structured periods (Foursquare/OSM).
-  const now = currentHHMM();
+  // Google-Maps-style hours from the structured weekly schedule, evaluated for
+  // the PLANNED visit rather than blindly "right now":
+  //   • an explicit time → check open/closed AT that date+time (a 60-min
+  //     look-ahead surfaces "Closing soon");
+  //   • today / no date, no time → fall back to the live clock (acting now);
+  //   • a FUTURE day with no time → show NO judgment — "open now" is irrelevant
+  //     for a day we aren't on yet, and shouldn't hide or flag anything.
+  const today = todayISO();
+  const evalDate = anchorDate ?? today;
+  const isFutureDay = evalDate > today;
+  const evalStart = anchorTime ?? (isFutureDay ? null : currentHHMM());
   const hours =
-    place.openingHours && place.openingHours.periods?.length
-      ? getOpeningHoursStatus(place.openingHours, todayISO(), now, addMinutes(now, 60))
+    evalStart && place.openingHours && place.openingHours.periods?.length
+      ? getOpeningHoursStatus(place.openingHours, evalDate, evalStart, addMinutes(evalStart, 60))
       : null;
   let hoursLabel: string | null = hours?.statusLabel ?? null;
   let hoursColor = ON_DIM;
@@ -267,7 +283,9 @@ function DiscoverCard({
           : hours.status === 'closed'
             ? t.colors.danger
             : ON_DIM;
-  } else if (place.openNow != null) {
+  } else if (!anchorTime && !isFutureDay && place.openNow != null) {
+    // Coarse provider flag (Foursquare/OSM, no structured periods). It only
+    // describes "right now", so we surface it only when evaluating the live clock.
     hoursLabel = place.openNow ? 'Open now' : 'Closed';
     hoursColor = place.openNow ? t.colors.success : t.colors.danger;
   }

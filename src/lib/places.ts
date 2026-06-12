@@ -225,9 +225,11 @@ export async function findPlaces(
    * Search tuning. `radiusM` (default 5 km, clamped 200 m–10 km) sets how wide
    * to look around the center; `limit` (default 6) caps how many places come
    * back. Discovery passes a tighter radius for "near me" lookups and a wider
-   * one when searching around a named area.
+   * one when searching around a named area. `includeClosed` (discovery only)
+   * keeps venues that are closed right now — the user is choosing a place for a
+   * possibly-later time, so "open now" must not hide options.
    */
-  opts?: { radiusM?: number; limit?: number },
+  opts?: { radiusM?: number; limit?: number; includeClosed?: boolean },
 ): Promise<FindPlacesResult> {
   const queries = (Array.isArray(input) ? input : [input])
     .map((q) => q.trim())
@@ -247,6 +249,7 @@ export async function findPlaces(
   }
   const radiusM = Math.min(10000, Math.max(200, Math.round(opts?.radiusM ?? 5000)));
   const limit = Math.min(20, Math.max(1, Math.round(opts?.limit ?? 6)));
+  const includeClosed = opts?.includeClosed === true;
   // Route context, when present, changes which alternatives win — fold a
   // coarse (~100m) version of both anchors into the cache key so a
   // route-aware lookup never serves a plain "near the old pin" result. Radius
@@ -257,7 +260,8 @@ export async function findPlaces(
     queries.join('|') +
       (intent ? `:${intent}` : '') +
       routeKey +
-      `|r=${radiusM}|n=${limit}`,
+      `|r=${radiusM}|n=${limit}` +
+      (includeClosed ? '|inc' : ''),
     coords,
   );
   const cached = readCache(key);
@@ -274,6 +278,7 @@ export async function findPlaces(
         limit,
         ...(route?.prev ? { prev: route.prev } : {}),
         ...(route?.next ? { next: route.next } : {}),
+        ...(includeClosed ? { includeClosed: true } : {}),
       },
     });
     if (error) {
