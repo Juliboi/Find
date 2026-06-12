@@ -61,6 +61,18 @@ export interface Errand {
   ratingCount?: number;
   priceLevel?: number;
   openingHours?: VenueOpeningHours;
+  /**
+   * "Let AI plan it": the user deliberately did NOT pin a venue. When this
+   * errand is folded into a plan the day-planner finds the best spot for
+   * `placeQuery` (closest / least detour / open at the time). Mutually exclusive
+   * with a resolved `address` + coords — a real picked place clears it.
+   */
+  autoPlace?: boolean;
+  /**
+   * The place CATEGORY to auto-find ("grocery store", "gas station"), carried
+   * from the discovery query. Only meaningful alongside `autoPlace`.
+   */
+  placeQuery?: string;
   /** Optional extra note the parser pulled out. */
   notes?: string;
   /** The raw text the user typed, kept so we can re-parse / show provenance. */
@@ -94,6 +106,8 @@ export type ErrandInput = Pick<
   | 'ratingCount'
   | 'priceLevel'
   | 'openingHours'
+  | 'autoPlace'
+  | 'placeQuery'
   | 'notes'
   | 'rawText'
 >;
@@ -158,6 +172,9 @@ function cleanHours(
 
 function normalizeInput(input: ErrandInput): ErrandInput {
   const address = clean(input.address);
+  // Auto-place ("Let AI plan it") only applies when the user did NOT pin a real
+  // place — a resolved address always wins and clears the flag.
+  const autoPlace = !address && input.autoPlace === true;
   // All place metadata is meaningless without an address — drop it wholesale
   // when there's no place, so a cleared address can't leave a stale photo/pin.
   return {
@@ -175,6 +192,8 @@ function normalizeInput(input: ErrandInput): ErrandInput {
     ratingCount: address ? numOrUndef(input.ratingCount) : undefined,
     priceLevel: address ? numOrUndef(input.priceLevel) : undefined,
     openingHours: address ? cleanHours(input.openingHours) : undefined,
+    autoPlace: autoPlace ? true : undefined,
+    placeQuery: autoPlace ? clean(input.placeQuery) ?? clean(input.title) : undefined,
     notes: clean(input.notes),
     rawText: clean(input.rawText) ?? clean(input.title) ?? '',
   };
@@ -231,10 +250,12 @@ export const useErrandsStore = create<ErrandsState>()(
             if ('date' in patch) next.date = clean(patch.date);
             if ('notes' in patch) next.notes = clean(patch.notes);
             if ('rawText' in patch) next.rawText = clean(patch.rawText) ?? e.rawText;
-            // Address + place metadata move together: a new/blank address
-            // resets coords, photo, rating, and hours.
-            if ('address' in patch) {
+            // Address, auto-place, and place metadata move together. A real
+            // picked address resets coords/photo/rating/hours AND clears
+            // auto-place; an explicit auto-place (no address) clears the pin.
+            if ('address' in patch || 'autoPlace' in patch || 'placeQuery' in patch) {
               const addr = clean(patch.address);
+              const auto = !addr && patch.autoPlace === true;
               next.address = addr;
               next.latitude = addr ? numOrUndef(patch.latitude) : undefined;
               next.longitude = addr ? numOrUndef(patch.longitude) : undefined;
@@ -244,6 +265,10 @@ export const useErrandsStore = create<ErrandsState>()(
               next.ratingCount = addr ? numOrUndef(patch.ratingCount) : undefined;
               next.priceLevel = addr ? numOrUndef(patch.priceLevel) : undefined;
               next.openingHours = addr ? cleanHours(patch.openingHours) : undefined;
+              next.autoPlace = auto ? true : undefined;
+              next.placeQuery = auto
+                ? clean(patch.placeQuery) ?? next.placeQuery ?? clean(next.title)
+                : undefined;
             }
             return next;
           }),

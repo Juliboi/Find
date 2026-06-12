@@ -10,6 +10,8 @@
  */
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { todayISO } from '@/utils/time';
+import { detectDiscovery, type DiscoveryIntent } from '@/lib/discover';
+import { logTokenUsage, shapeUsage, type LlmTokenUsage } from '@/lib/usage';
 import type { VenueOpeningHours } from '@/types/itinerary';
 
 /** The fields the parser fills. `null` means "the user didn't say". */
@@ -38,6 +40,13 @@ export interface ErrandDraft {
   ratingCount?: number | null;
   priceLevel?: number | null;
   openingHours?: VenueOpeningHours | null;
+  /**
+   * "Let AI plan it": set when the user defers the venue choice to the planner
+   * (from the discover footer, or the form's "Where" toggle). The AI parser
+   * never sets these — they're carried through the drawer only.
+   */
+  autoPlace?: boolean | null;
+  placeQuery?: string | null;
   notes: string | null;
 }
 
@@ -46,14 +55,40 @@ interface ParseOptions {
   date?: string;
 }
 
+/**
+ * The orchestrator's verdict for one composer line: the slot-filled draft plus
+ * the routing decision. `intent: 'discover'` means "open the place-suggestion
+ * step seeded with `discovery`"; `'plan'` means "go straight to the form".
+ */
+export interface ParsedErrand {
+  draft: ErrandDraft;
+  intent: 'plan' | 'discover';
+  discovery: DiscoveryIntent | null;
+  /**
+   * Token spend the `parse-errand` function reported for this call (model +
+   * counts). Null on the offline local parse, or when the server didn't
+   * report usage (older deploy).
+   */
+  usage?: LlmTokenUsage | null;
+}
+
+const EMPTY: ErrandDraft = {
+  title: '',
+  date: null,
+  startTime: null,
+  endTime: null,
+  address: null,
+  notes: null,
+};
+
 export async function parseErrandRemote(
   text: string,
   options: ParseOptions = {},
-): Promise<ErrandDraft> {
+): Promise<ParsedErrand> {
   const clean = text.trim();
   const today = options.date ?? todayISO();
   if (!clean) {
-    return { title: '', date: null, startTime: null, endTime: null, address: null, notes: null };
+    return { draft: { ...EMPTY }, intent: 'plan', discovery: null };
   }
 
   if (isSupabaseConfigured && supabase) {
@@ -63,35 +98,98 @@ export async function parseErrandRemote(
       });
       if (!error && data && typeof data === 'object' && !('error' in (data as object))) {
         const shaped = shapeRemote(data as Record<string, unknown>, clean);
-        if (shaped) return shaped;
+        if (shaped) {
+          logTokenUsage('parse-errand', shaped.usage ?? null);
+          return shaped;
+        }
       }
     } catch (e) {
       console.warn('[parse-errand] request failed, using local parse', e);
     }
   }
 
-  return localParseErrand(clean, today);
+  return localParse(clean, today);
 }
 
-/** Validate the function's JSON into a strict ErrandDraft (defensive). */
-function shapeRemote(data: Record<string, unknown>, rawText: string): ErrandDraft | null {
+/** Validate the function's JSON into a strict {@link ParsedErrand} (defensive). */
+function shapeRemote(data: Record<string, unknown>, rawText: string): ParsedErrand | null {
   const title =
-    typeof data.title === 'string' && data.title.trim()
-      ? data.title.trim()
-      : rawText;
+    typeof data.title === 'string' && data.title.trim() ? data.title.trim() : rawText;
   const startTime = isHHMM(data.startTime) ? (data.startTime as string) : null;
-  return {
+  const draft: ErrandDraft = {
     title,
     date: isISODate(data.date) ? (data.date as string) : null,
     startTime,
     endTime: startTime && isHHMM(data.endTime) ? (data.endTime as string) : null,
     address:
-      typeof data.address === 'string' && data.address.trim()
-        ? data.address.trim()
-        : null,
+      typeof data.address === 'string' && data.address.trim() ? data.address.trim() : null,
     notes:
       typeof data.notes === 'string' && data.notes.trim() ? data.notes.trim() : null,
   };
+
+  // Read the orchestration fields. An old deploy won't return `intent`; in that
+  // case we fall back to the on-device heuristic so discovery phrasings still
+  // route correctly before the function is redeployed.
+  let intent: 'plan' | 'discover' | null =
+    data.intent === 'discover' ? 'discover' : data.intent === 'plan' ? 'plan' : null;
+  let discovery: DiscoveryIntent | null = null;
+
+  if (intent === 'discover') {
+    discovery = shapeDiscovery(data.discovery);
+    if (!discovery) intent = 'plan';
+  }
+  if (intent === null) {
+    const detected = detectDiscovery(rawText);
+    if (detected) {
+      intent = 'discover';
+      discovery = detected;
+    } else {
+      intent = 'plan';
+    }
+  }
+
+  // The discovered venue is chosen later — don't keep a half-guessed address.
+  if (intent === 'discover') draft.address = null;
+
+  return { draft, intent, discovery, usage: shapeUsage(data.usage) };
+}
+
+/** Validate the model's discovery object; null if there's no usable category. */
+function shapeDiscovery(raw: unknown): DiscoveryIntent | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const d = raw as Record<string, unknown>;
+  const query = typeof d.query === 'string' && d.query.trim() ? d.query.trim() : '';
+  if (!query) return null;
+  return {
+    query,
+    area: typeof d.area === 'string' && d.area.trim() ? d.area.trim() : null,
+    nearby: d.nearby === true,
+  };
+}
+
+/**
+ * Offline path: the local regex parser for the slots, plus the on-device
+ * discovery heuristic for the routing decision. Used when Supabase is
+ * unconfigured or the function call fails.
+ */
+function localParse(text: string, today: string): ParsedErrand {
+  const base = localParseErrand(text, today);
+  const detected = detectDiscovery(text);
+  if (detected) {
+    return {
+      // Keep any time the local parser found, but title from the category and
+      // drop the address (the place is picked in the discover step).
+      draft: { ...base, title: capitalize(detected.query), address: null },
+      intent: 'discover',
+      discovery: detected,
+    };
+  }
+  return { draft: base, intent: 'plan', discovery: null };
+}
+
+function capitalize(s: string): string {
+  const trimmed = (s ?? '').trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : trimmed;
 }
 
 // --------------------------------------------------------- local heuristic

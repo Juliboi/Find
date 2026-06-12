@@ -1206,7 +1206,21 @@ export default function ItineraryScreen() {
                 // of a gap to reserve for it.
                 bits.push(`~${formatDuration(e.durationMin)}`);
               }
-              if (e.address) bits.push(`at ${e.address}`);
+              if (e.autoPlace) {
+                // No pinned venue — tell the planner to choose the best spot
+                // (closest / least detour / open) for the errand's category.
+                const q =
+                  e.placeQuery && e.placeQuery.toLowerCase() !== e.title.toLowerCase()
+                    ? e.placeQuery
+                    : null;
+                bits.push(
+                  q
+                    ? `find a ${q} on the way`
+                    : 'find the best place for this on the way',
+                );
+              } else if (e.address) {
+                bits.push(`at ${e.address}`);
+              }
               if (e.notes) bits.push(e.notes);
               return `- ${e.title}${bits.length ? ` (${bits.join(', ')})` : ''}`;
             })

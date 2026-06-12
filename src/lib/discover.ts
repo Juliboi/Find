@@ -12,7 +12,7 @@
  *
  *   - "nearby" / "near me"  → the user's current GPS location
  *   - "near <area>"         → geocode that area to a center
- *   - otherwise             → the user's home (fallback to GPS)
+ *   - otherwise             → the user's current GPS location (fallback to home)
  *
  * Per-candidate distances to the rest of the user's day are computed later,
  * client-side, by the drawer — this module only fetches the candidates.
@@ -26,6 +26,7 @@ import {
   type PlacesProvider,
 } from '@/lib/places';
 import { autocompletePlaces, resolvePlace } from '@/lib/geocoding';
+import type { LlmTokenUsage } from '@/lib/usage';
 
 /** Where the candidate search was centered, and how we got there. */
 export type DiscoverCenterSource = 'gps' | 'area' | 'home' | 'none';
@@ -64,6 +65,8 @@ export interface DiscoverResult {
   provider: PlacesProvider;
   reason?: 'no_supabase' | 'no_location' | 'no_results' | 'error';
   detail?: string;
+  /** Token spend the venue re-rank reported for this call; null when none ran. */
+  usage?: LlmTokenUsage | null;
   /** Raw provider payload (provider, server debug, etc.) for the dev sandbox. */
   debug?: unknown;
 }
@@ -260,10 +263,13 @@ async function resolveCenter(input: {
     return { center: null, label: null, source: 'none', areaInQuery: areaName };
   }
 
-  // General search ("find a pharmacy"): prefer home, fall back to GPS.
-  if (fallbackCenter) return { center: fallbackCenter, label: 'Home', source: 'home' };
+  // General search ("find a pharmacy", "recommend a restaurant"): default to
+  // the user's CURRENT location. People who type a bare "find a …" almost always
+  // mean "near me right now", and that naturally covers the at-home case too.
+  // Home is the fallback only when GPS is unavailable / permission is denied.
   const gps = await getCurrentCoords();
   if (gps) return { center: gps, label: 'Current location', source: 'gps' };
+  if (fallbackCenter) return { center: fallbackCenter, label: 'Home', source: 'home' };
   return { center: null, label: null, source: 'none' };
 }
 
@@ -331,6 +337,7 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
     provider: res.provider,
     reason: res.reason,
     detail: res.detail,
+    usage: res.usage ?? null,
     debug: res.debug,
   };
 }

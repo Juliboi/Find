@@ -56,7 +56,7 @@ import { ErrandRow } from '@/components/ErrandRow';
 import { WeatherCard } from '@/components/WeatherCard';
 import { PlanPeek } from '@/components/PlanPeek';
 import { parseErrandRemote, type ErrandDraft } from '@/lib/ai/parseErrand';
-import { detectDiscovery, type DiscoveryIntent } from '@/lib/discover';
+import { type DiscoveryIntent } from '@/lib/discover';
 import { isDailyReviewResponse } from '@/lib/notifications';
 import { formatTime, formatDuration, todayISO, tomorrowISO } from '@/utils/time';
 import {
@@ -110,6 +110,8 @@ function errandToDraft(e: Errand): ErrandDraft {
     ratingCount: e.ratingCount ?? null,
     priceLevel: e.priceLevel ?? null,
     openingHours: e.openingHours ?? null,
+    autoPlace: e.autoPlace ?? null,
+    placeQuery: e.placeQuery ?? null,
     notes: e.notes ?? null,
   };
 }
@@ -261,35 +263,33 @@ export default function HomeScreen() {
     setDrawerMode('create');
     setEditId(null);
     setDrawerRawText(text);
-    Haptics.selectionAsync().catch(() => undefined);
-
-    // The orchestrator decides the route from the single line the user typed:
-    // a place search ("find a pharmacy near Karlín", "coffee nearby") opens
-    // straight into the discover step; anything else is parsed into the form as
-    // before. No area field or "near me" toggle — it's all read from the text.
-    const discovery = detectDiscovery(text);
-    if (discovery) {
-      setDrawerDiscovery(discovery);
-      setDrawerInitialStep('discover');
-      setDrawerSeed({ ...EMPTY_DRAFT, title: discovery.query });
-      setDrawerParsing(false);
-      setDrawerSeedKey(`discover-${seq}`);
-      setDrawerOpen(true);
-      return;
-    }
-
+    // Open immediately in the reading state; the orchestrator (one cheap call)
+    // both classifies the intent and fills the slots, then we route. A place
+    // search ("find a pharmacy near Karlín", or a 12:00 coffee whose café isn't
+    // chosen yet) lands on the discover step; everything else on the form. The
+    // field stays a single line — no area field, no "near me" toggle.
     setDrawerDiscovery(null);
     setDrawerInitialStep('form');
     setDrawerSeed({ ...EMPTY_DRAFT, title: text });
     setDrawerParsing(true);
-    setDrawerSeedKey(`create-${seq}`);
+    setDrawerSeedKey(`parse-${seq}`);
     setDrawerOpen(true);
+    Haptics.selectionAsync().catch(() => undefined);
     parseErrandRemote(text, { date: todayISO() })
-      .then((draft) => {
+      .then((res) => {
         if (seq !== parseSeq.current) return;
-        setDrawerSeed(draft);
-        setDrawerParsing(false);
-        setDrawerSeedKey(`create-${seq}-done`);
+        if (res.intent === 'discover' && res.discovery) {
+          setDrawerDiscovery(res.discovery);
+          setDrawerSeed(res.draft);
+          setDrawerInitialStep('discover');
+          setDrawerParsing(false);
+          setDrawerSeedKey(`discover-${seq}`);
+        } else {
+          setDrawerSeed(res.draft);
+          setDrawerInitialStep('form');
+          setDrawerParsing(false);
+          setDrawerSeedKey(`create-${seq}-done`);
+        }
       })
       .catch(() => {
         if (seq !== parseSeq.current) return;
@@ -726,7 +726,7 @@ export default function HomeScreen() {
         onPlus={openSetup}
         onSubmit={onComposerSubmit}
         onFocusChange={setComposerFocused}
-        placeholder="Add an errand…"
+        placeholder="Add a plan or find a place…"
       />
 
       <PlanSetupSheet

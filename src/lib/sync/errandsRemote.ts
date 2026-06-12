@@ -35,6 +35,8 @@ interface ErrandRow {
   rating_count: number | null;
   price_level: number | null;
   opening_hours: VenueOpeningHours | null;
+  auto_place: boolean | null;
+  place_query: string | null;
   notes: string | null;
   raw_text: string;
   planned_date: string | null;
@@ -60,6 +62,8 @@ function rowToErrand(r: ErrandRow): Errand {
     ratingCount: r.rating_count ?? undefined,
     priceLevel: r.price_level ?? undefined,
     openingHours: r.opening_hours ?? undefined,
+    autoPlace: r.auto_place ?? undefined,
+    placeQuery: r.place_query ?? undefined,
     notes: r.notes ?? undefined,
     rawText: r.raw_text ?? '',
     plannedDate: r.planned_date ?? undefined,
@@ -87,6 +91,8 @@ function errandToRow(e: Errand, userId: string): ErrandRow {
     rating_count: e.ratingCount ?? null,
     price_level: e.priceLevel ?? null,
     opening_hours: e.openingHours ?? null,
+    auto_place: e.autoPlace ?? null,
+    place_query: e.placeQuery ?? null,
     notes: e.notes ?? null,
     raw_text: e.rawText ?? '',
     planned_date: e.plannedDate ?? null,

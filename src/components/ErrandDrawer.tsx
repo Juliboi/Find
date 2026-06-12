@@ -52,13 +52,16 @@ interface Props {
   onDelete?: () => void;
 }
 
-/** Turns a picked discovery candidate into a confirm-form seed draft. */
-function placeToDraft(title: string, p: NearbyPlace): ErrandDraft {
+/**
+ * Folds a picked discovery candidate into the parsed base draft. The base
+ * carries the orchestrator's plan fields (title like "Coffee with Natalie",
+ * date, time, notes); we overlay the chosen venue's location + metadata so the
+ * confirm form opens fully prefilled and the place reads as a confirmed pin.
+ */
+function mergePlaceIntoDraft(base: ErrandDraft, p: NearbyPlace, fallbackTitle: string): ErrandDraft {
   return {
-    title,
-    date: null,
-    startTime: null,
-    endTime: null,
+    ...base,
+    title: base.title?.trim() ? base.title : fallbackTitle,
     address: p.name,
     latitude: p.latitude,
     longitude: p.longitude,
@@ -68,7 +71,32 @@ function placeToDraft(title: string, p: NearbyPlace): ErrandDraft {
     ratingCount: p.ratingCount ?? null,
     priceLevel: p.priceLevel ?? null,
     openingHours: p.openingHours ?? null,
-    notes: null,
+    autoPlace: null,
+    placeQuery: null,
+  };
+}
+
+/**
+ * Builds the confirm-form seed for "Let Diem find it": keep the parsed plan
+ * fields (title, date, time, notes) but pin NO venue — flag it auto-place and
+ * carry the search category so the planner can pick the best spot when the
+ * errand is folded into a day.
+ */
+function autoPlaceDraft(base: ErrandDraft, query: string, fallbackTitle: string): ErrandDraft {
+  return {
+    ...base,
+    title: base.title?.trim() ? base.title : fallbackTitle,
+    address: null,
+    latitude: null,
+    longitude: null,
+    placeId: null,
+    photoUrl: null,
+    rating: null,
+    ratingCount: null,
+    priceLevel: null,
+    openingHours: null,
+    autoPlace: true,
+    placeQuery: query?.trim() ? query.trim() : fallbackTitle,
   };
 }
 
@@ -163,17 +191,25 @@ export function ErrandDrawer({
             area={discovery?.area ?? null}
             nearby={discovery?.nearby ?? false}
             fallbackCenter={fallbackCenter ?? null}
+            anchorDate={draft.date ?? null}
             onPick={(place) => {
               setOverride({
-                draft: placeToDraft(discoverQuery, place),
+                draft: mergePlaceIntoDraft(draft, place, discoverQuery),
                 seedKey: `picked-${place.id}-${Date.now()}`,
               });
               setStep('form');
             }}
             onManual={() => {
               setOverride({
-                draft: { ...draft, title: discoverQuery },
+                draft: { ...draft, title: draft.title?.trim() ? draft.title : discoverQuery },
                 seedKey: `manual-${Date.now()}`,
+              });
+              setStep('form');
+            }}
+            onAutoPlan={() => {
+              setOverride({
+                draft: autoPlaceDraft(draft, discoverQuery, discoverQuery),
+                seedKey: `auto-${Date.now()}`,
               });
               setStep('form');
             }}

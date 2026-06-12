@@ -1,26 +1,31 @@
 // Supabase Edge Function: parse-errand
 //
-// Turns ONE free-form reminder the user typed ("call mom", "dentist at 18:00 at
-// Pirktova Gemini A") into a structured errand the app can prefill into the
-// confirm drawer:
+// The planning ORCHESTRATOR. From ONE free-form line the user typed it does two
+// jobs in a single cheap call: (1) CLASSIFY the intent, and (2) fill the errand
+// slots. So the home composer stays a single text field — no "area" field, no
+// "near me" toggle — and the model decides where the line should go:
 //
-//   { title, date, startTime, endTime, address, notes }
+//   { intent, title, date, startTime, endTime, address, notes, discovery }
 //
-// Every slot except `title` is optional — the model returns null when the user
-// didn't say, and the client renders those as "Any day" / "Anytime" /
-// "Anywhere".
+//   - intent "plan":     a fixed activity/reminder → go straight to the form.
+//   - intent "discover": a place to find/choose by category → open the venue
+//                        suggestion step. `discovery = { query, area, nearby }`.
 //
-// This is a tiny slot-filling task, so we run the CHEAPEST + FASTEST Gemini
-// model and force structured output via a responseSchema. Schema mode
-// GUARANTEES parseable JSON from any model — including the flash-lite tier —
-// so there's no risk of the lite model drifting into prose (the failure mode
-// that forces grounded planning onto Flash). ~1s, fractions of a cent.
+// A line can be BOTH a timed plan and a discovery ("Natalie Karlín coffee at
+// 12:00") — that's "discover": we pick the café, then it becomes the 12:00
+// errand. Every slot except title/intent is optional (null when unsaid).
+//
+// This is a tiny slot-filling + classification task, so we run the CHEAPEST +
+// FASTEST Gemini tier and force structured output via a responseSchema. Schema
+// mode GUARANTEES parseable JSON from any model — including flash-lite — so
+// there's no risk of the lite model drifting into prose. ~1s, fractions of a
+// cent.
 //
 // Request body:
 //   { text: string, date?: "YYYY-MM-DD" }   // date = the user's "today", to
 //                                            // resolve "tomorrow"/"friday".
 //
-// Response body: the errand draft (see ERRAND_SCHEMA).
+// Response body: the orchestrated errand (see ERRAND_SCHEMA / shapeResult).
 //
 // Required env vars:
 //   GEMINI_API_KEY        — Google AI Studio key (same one plan-itinerary uses).
@@ -28,6 +33,8 @@
 
 // deno-lint-ignore-file no-explicit-any
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
+
+import { geminiUsage, logTokenUsage, type TokenUsage } from '../_shared/tokenLog.ts';
 
 // The cheapest + fastest Gemini tier. Because we constrain the output with a
 // responseSchema (not Google Search grounding), flash-lite reliably emits the
@@ -42,18 +49,41 @@ const CONFIGURED_ERRAND_MODEL =
 const FALLBACK_ERRAND_MODEL = 'gemini-2.5-flash';
 
 // Gemini structured-output schema. A subset of OpenAPI — the shape Gemini's
-// `responseSchema` accepts. Mirrors the ErrandDraft the client expects.
+// `responseSchema` accepts. Mirrors the ErrandDraft the client expects, plus the
+// orchestration fields (`intent` + `discovery`) so this one cheap call both
+// classifies the request AND fills the slots.
 const ERRAND_SCHEMA: Record<string, unknown> = {
   type: 'object',
-  required: ['title'],
-  propertyOrdering: ['title', 'date', 'startTime', 'endTime', 'address', 'notes'],
+  required: ['intent', 'title'],
+  propertyOrdering: [
+    'intent',
+    'title',
+    'date',
+    'startTime',
+    'endTime',
+    'address',
+    'notes',
+    'discovery',
+  ],
   properties: {
+    intent: { type: 'string', format: 'enum', enum: ['plan', 'discover'] },
     title: { type: 'string' },
     date: { type: 'string', nullable: true },
     startTime: { type: 'string', nullable: true },
     endTime: { type: 'string', nullable: true },
     address: { type: 'string', nullable: true },
     notes: { type: 'string', nullable: true },
+    // Present (and required) only when intent="discover": the venue search shape.
+    discovery: {
+      type: 'object',
+      nullable: true,
+      propertyOrdering: ['query', 'area', 'nearby'],
+      properties: {
+        query: { type: 'string', nullable: true },
+        area: { type: 'string', nullable: true },
+        nearby: { type: 'boolean', nullable: true },
+      },
+    },
   },
 };
 
@@ -121,24 +151,52 @@ function extractJsonObject(text: string): any | null {
 
 function buildPrompt(text: string, today: string): string {
   const weekday = weekdayOf(today);
-  return `You extract a single structured "errand" (a reminder/task) from one short line the user typed. Output ONLY a JSON object matching the schema. Set a field to null when the user did NOT clearly state it — never guess a date, time, or place that isn't implied.
+  return `You are the planning ORCHESTRATOR. From ONE short line the user typed, do two things: (1) classify the INTENT, and (2) extract structured fields. Output ONLY a JSON object matching the schema. Set a field to null when the user did NOT clearly state it — never invent a date, time, or place.
 
 TODAY is ${today}${weekday ? ` (${weekday})` : ''}.
 
-Fields:
-- title: a short, clean imperative task, Capitalized, WITHOUT the time/date/place baked in. ("call mom" → "Call mom"; "visit dentist at 6pm" → "Visit dentist").
-- date: "YYYY-MM-DD" only if the user named a day. Resolve relative words against TODAY ("today", "tomorrow", "this friday", "next mon", "June 12", "12/6"). Otherwise null.
-- startTime: "HH:MM" 24h if the user gave a time ("18:00", "6pm", "at 6", "noon", "half past 7"). Otherwise null.
-- endTime: "HH:MM" 24h. If there is a startTime but no explicit end, estimate a realistic end from how long the task usually takes (a phone call ~15 min, coffee ~45 min, a dentist/doctor/haircut visit ~60 min, a meeting ~60 min, errands ~30 min). If there is NO startTime, set endTime null too.
-- address: the place or address EXACTLY as the user wrote it, so it can be geocoded later ("Pirktova Gemini A", "mom's place", "Tesco Letňany"). Distinguish a place from a time: "at 18:00" is a time, "at Pirktova" is a place. Null if no place was given.
-- notes: any leftover detail worth keeping (e.g. "bring documents"), else null.
+INTENT — choose exactly one:
+- "discover": the user wants to FIND or CHOOSE a place by CATEGORY, so we should show venue suggestions to pick from. Signals:
+    • an explicit search ("find", "where", "recommend", "suggest", "any");
+    • proximity ("near me", "nearby", "closest", "around here");
+    • a place CATEGORY combined with a NEIGHBOURHOOD/area ("coffee in Karlín", "pharmacy near Karlín", "good ramen in Žižkov");
+    • a place CATEGORY the user must still pick a specific venue for — EVEN with a person and/or a time ("coffee with Admir in Karlín at 10", "Natalie Karlín coffee at 12:00").
+  A quality adjective on a category is STILL a category, NOT a venue name ("good ramen", "nice coffee", "cheap sushi" → query "ramen"/"coffee"/"sushi"). The user has NOT named one specific venue.
+- "plan": a fixed activity, reminder, or task. Signals:
+    • a specific NAMED venue or street address you could already point to on a map ("Kolkovna at Pankrác", "sport centrum Cimice", "Pirktova 12");
+    • a person-centric/social plan with NO place category to choose ("lunch with Nikol", "drinks with the team");
+    • a COMMUNICATION or possession/TASK verb acting on a person or place — "call", "phone", "ring", "text", "email", "message", "book", "buy", "get", "pick up", "pay", "return" — these are reminders to DO something, NOT a place to go choose. They are "plan" EVEN when they name a category ("call the pharmacy", "buy milk", "email the dentist", "pick up a prescription");
+    • any timed commitment with no category to search.
+
+Rule of thumb: a COMMUNICATION/TASK verb ("call/text/email/buy/book/pick up …") → ALWAYS "plan". Otherwise: if you could already point to ONE place on a map, or there's no place at all → "plan"; if the user would still need to pick among options of a category → "discover". A line can be a timed plan AND a discovery at once (e.g. a 12:00 coffee whose café isn't chosen yet) — that is "discover" (we pick the place, then it becomes the timed errand).
+
+Fields (fill for BOTH intents):
+- title: short, clean, Capitalized activity, WITHOUT the time/date/place baked in, but KEEP the person/context. ("Natalie Karlín coffee at 12:00" → "Coffee with Natalie"; "call the pharmacy" → "Call the pharmacy"; "buy milk" → "Buy milk"; "find a pharmacy" → "Pharmacy").
+- date: "YYYY-MM-DD" only if the user named a day. Resolve relative words against TODAY ("today","tomorrow","this friday","next mon","June 12","12/6"). Else null.
+- startTime: "HH:MM" 24h if the user gave a time ("18:00","6pm","at 6","noon","half past 7"). Else null.
+- endTime: "HH:MM" 24h. If there is a startTime but no explicit end, estimate a realistic end by activity (phone call ~15 min, coffee ~45 min, dentist/doctor/haircut/meeting ~60 min, errands ~30 min). If there is NO startTime, endTime is null.
+- address: for "plan", the named place/address EXACTLY as the user wrote it so it can be geocoded ("Pirktova Gemini A","Kolkovna Pankrác"). For a communication/task "plan" with no real venue ("call the pharmacy","buy milk"), address is null. For "discover", ALWAYS null (the venue is chosen later). Distinguish place from time: "at 18:00" is a time, "at Pirktova" is a place.
+- notes: any leftover detail worth keeping ("bring documents"), else null.
+- discovery: REQUIRED object when intent="discover", null when intent="plan":
+    - query: the place CATEGORY to search, cleaned — NO verbs, NO area, NO "near me", NO quality adjective ("pharmacy","coffee","ramen","coworking or cafe","tennis court").
+    - area: the neighbourhood/area to search around if the user named one ("Karlín","Žižkov","Vinohrady"); else null.
+    - nearby: true ONLY for proximity to the user ("near me","nearby","closest","around here"); else false.
 
 Examples:
-"call mom" → {"title":"Call mom","date":null,"startTime":null,"endTime":null,"address":null,"notes":null}
-"visit dentist at pirktova gemini a" → {"title":"Visit dentist","date":null,"startTime":null,"endTime":null,"address":"pirktova gemini a","notes":null}
-"visit dentist at 18:00" → {"title":"Visit dentist","date":null,"startTime":"18:00","endTime":"19:00","address":null,"notes":null}
-"visit dentist at 18:00 at pirktova gemini a" → {"title":"Visit dentist","date":null,"startTime":"18:00","endTime":"19:00","address":"pirktova gemini a","notes":null}
-"dentist tomorrow 9am bring xray" → {"title":"Dentist","date":"<tomorrow's date>","startTime":"09:00","endTime":"10:00","address":null,"notes":"bring xray"}
+"call the pharmacy" → {"intent":"plan","title":"Call the pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":null}
+"buy milk" → {"intent":"plan","title":"Buy milk","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":null}
+"call mom" → {"intent":"plan","title":"Call mom","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":null}
+"lunch with nikol" → {"intent":"plan","title":"Lunch with Nikol","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":null}
+"padel with maty at sport centrum cimice" → {"intent":"plan","title":"Padel with Maty","date":null,"startTime":null,"endTime":null,"address":"sport centrum cimice","notes":null,"discovery":null}
+"meet admir at pirktova 12:00" → {"intent":"plan","title":"Meet Admir","date":null,"startTime":"12:00","endTime":"13:00","address":"pirktova","notes":null,"discovery":null}
+"find a pharmacy" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":false}}
+"pharmacy near me" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":true}}
+"find a pharmacy near karlin" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":"Karlín","nearby":false}}
+"good ramen in zizkov" → {"intent":"discover","title":"Ramen","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"ramen","area":"Žižkov","nearby":false}}
+"coffee with admir in karlin tomorrow at 10" → {"intent":"discover","title":"Coffee with Admir","date":"<tomorrow's date>","startTime":"10:00","endTime":"10:45","address":null,"notes":null,"discovery":{"query":"coffee","area":"Karlín","nearby":false}}
+"natalie karlin coffee at 12:00" → {"intent":"discover","title":"Coffee with Natalie","date":null,"startTime":"12:00","endTime":"12:45","address":null,"notes":null,"discovery":{"query":"coffee","area":"Karlín","nearby":false}}
+"closest tennis court tomorrow" → {"intent":"discover","title":"Tennis","date":"<tomorrow's date>","startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"tennis court","area":null,"nearby":true}}
+"any karlin coworking or cafe" → {"intent":"discover","title":"Coworking or cafe","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"coworking or cafe","area":"Karlín","nearby":false}}
 
 USER LINE (between triple quotes):
 """
@@ -152,7 +210,10 @@ async function callGemini(args: {
   prompt: string;
   apiKey: string;
   model: string;
-}): Promise<{ ok: true; parsed: any } | { ok: false; status: number; detail: string }> {
+}): Promise<
+  | { ok: true; parsed: any; usage: TokenUsage }
+  | { ok: false; status: number; detail: string }
+> {
   const body = {
     contents: [{ role: 'user', parts: [{ text: args.prompt }] }],
     generationConfig: {
@@ -186,7 +247,7 @@ async function callGemini(args: {
   if (!parsed) {
     return { ok: false, status: 502, detail: `Unparseable JSON: ${rawText.slice(0, 300)}` };
   }
-  return { ok: true, parsed };
+  return { ok: true, parsed, usage: geminiUsage(data?.usageMetadata) };
 }
 
 /** Clamp + validate the model's object into the wire shape the client expects. */
@@ -219,6 +280,43 @@ function shapeDraft(parsed: any, rawText: string): {
       typeof parsed?.notes === 'string' && parsed.notes.trim()
         ? parsed.notes.trim().slice(0, 300)
         : null,
+  };
+}
+
+/**
+ * Adds the orchestration fields on top of the base draft: the classified
+ * `intent` and, for discovery, the validated `{ query, area, nearby }` search
+ * shape. Defensive — a "discover" with no usable category degrades to "plan",
+ * and a discovered place must be chosen later so its address is dropped.
+ */
+function shapeResult(parsed: any, rawText: string) {
+  const draft = shapeDraft(parsed, rawText);
+  let intent: 'plan' | 'discover' = parsed?.intent === 'discover' ? 'discover' : 'plan';
+  let discovery: { query: string; area: string | null; nearby: boolean } | null = null;
+
+  if (intent === 'discover') {
+    const d = parsed?.discovery ?? {};
+    const query =
+      typeof d?.query === 'string' && d.query.trim() ? d.query.trim().slice(0, 120) : '';
+    if (query) {
+      discovery = {
+        query,
+        area: typeof d?.area === 'string' && d.area.trim() ? d.area.trim().slice(0, 120) : null,
+        nearby: d?.nearby === true,
+      };
+    } else {
+      // "discover" without a category is useless — treat it as an ordinary plan.
+      intent = 'plan';
+    }
+  }
+
+  return {
+    ...draft,
+    // The discovered venue is chosen in the next step, so never carry a guessed
+    // address into a discovery result.
+    address: intent === 'discover' ? null : draft.address,
+    intent,
+    discovery,
   };
 }
 
@@ -258,16 +356,27 @@ Deno.serve(async (req: Request) => {
 
   const prompt = buildPrompt(text, today);
 
+  let modelUsed = CONFIGURED_ERRAND_MODEL;
   let gem = await callGemini({ prompt, apiKey: geminiKey, model: CONFIGURED_ERRAND_MODEL });
   if (!gem.ok && CONFIGURED_ERRAND_MODEL !== FALLBACK_ERRAND_MODEL) {
     console.warn(
       `parse-errand: model "${CONFIGURED_ERRAND_MODEL}" failed (${gem.detail}); retrying with "${FALLBACK_ERRAND_MODEL}".`,
     );
+    modelUsed = FALLBACK_ERRAND_MODEL;
     gem = await callGemini({ prompt, apiKey: geminiKey, model: FALLBACK_ERRAND_MODEL });
   }
   if (!gem.ok) {
     return jsonResponse({ error: 'Parse failed', detail: gem.detail }, gem.status);
   }
 
-  return jsonResponse(shapeDraft(gem.parsed, text));
+  // Every errand line runs through this one call — log its token spend so the
+  // errand system's cost is tallyable straight from the function logs.
+  logTokenUsage({ fn: 'parse-errand', step: 'orchestrate', model: modelUsed, usage: gem.usage });
+
+  // Also return the usage on the wire (model + token counts) so the client can
+  // read this call's spend directly, not just from the function logs.
+  return jsonResponse({
+    ...shapeResult(gem.parsed, text),
+    usage: { model: modelUsed, ...gem.usage },
+  });
 });

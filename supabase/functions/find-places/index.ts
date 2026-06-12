@@ -33,6 +33,11 @@
 // @ts-nocheck Deno runtime - types resolved by Supabase tooling at deploy time.
 
 import { extractOpeningHours, type VenueOpeningHours } from '../_shared/hours.ts';
+import { logTokenUsage, openaiUsage, type TokenUsage } from '../_shared/tokenLog.ts';
+
+// The model behind the discovery re-rank / blurb pass. Named once so the request
+// body and the token-usage log can't drift apart.
+const RERANK_MODEL = 'gpt-4o-mini';
 
 interface UnifiedPlace {
   id: string;
@@ -708,6 +713,8 @@ async function searchGoogleFanOut(
 interface LLMPickResult {
   picks: Array<{ id: string; reasoning?: string }>;
   failureReason?: string;
+  /** Token spend for this re-rank call; absent when the request never reached the model. */
+  usage?: TokenUsage;
 }
 
 async function analyzeWithLLM(
@@ -766,12 +773,25 @@ Your job:
      • Stopping at 3 picks "because that feels enough" when 5 or 6
        candidates actually qualified. Inclusivity is the default.
 
-2. For each pick, write ONE concise sentence that explains why it
-   fits — mention distinctive signals (cuisine/type, rating + review
-   count, price level, vibe). Plain language, no marketing fluff. If
-   you reference distance, paraphrase ("a short walk", "a bit out of
-   the way") rather than quoting numbers; the user sees the exact
-   distance in the UI already.
+2. For each pick, write ONE concise, SPECIFIC sentence on what makes
+   THIS place distinct — what it is known for or best for. Draw on:
+   the cuisine/specialty inferable from its name + types ("ramen
+   specialist", "third-wave espresso bar", "24/7 chain pharmacy"); the
+   atmosphere or who it suits ("quiet and laptop-friendly", "lively
+   after-work spot", "quick grab-and-go", "good for a group"); or the
+   venue's character via its price tier in WORDS when it adds meaning
+   (a budget counter vs an upscale sit-down room). Make the picks read
+   DIFFERENTLY from one another — the blurbs exist to help the user
+   choose BETWEEN options, so contrast them.
+   CRITICAL — do NOT restate anything already shown on the card: the
+   numeric rating, the review count, the price $ symbols, the open/
+   closed status, or the distance number. Repeating those is the single
+   biggest thing to avoid — they add zero information. If location is
+   relevant, paraphrase ("a short walk", "a bit out of the way").
+   Never invent specifics you cannot reasonably infer from the name,
+   type, or price (don't claim "free Wi-Fi", "free chargers", or "open
+   24 hours" unless the data shows it or the place is genuinely well
+   known for it).
 3. Drop venues with openNow === false UNLESS removing them would
    leave fewer than 3 picks AND the venue is exceptional (4.7+ rating
    with 200+ reviews). Open/closed status is shown to the user
@@ -856,7 +876,7 @@ Output ONLY JSON:
       // ~$0.003 for the full-size 4o. Quality difference is marginal
       // once the candidate pool is already pre-ranked by composite
       // score and the proximity rule is enforced server-side.
-      model: 'gpt-4o-mini',
+      model: RERANK_MODEL,
       // Temperature 0.3 gives the most consistent count + variety
       // tradeoff in our probes (0.0 is over-deterministic and
       // sometimes returns 2 picks; higher temps drift into picking
@@ -874,6 +894,11 @@ Output ONLY JSON:
     return { picks: [], failureReason: `OpenAI ${res.status}: ${text.slice(0, 200)}` };
   }
   const completion = await res.json();
+  // The discovery flow's second token cost (after parse-errand). Log it so the
+  // errand system's full spend is visible from the function logs, and return it
+  // so the caller can surface it on the wire.
+  const usage = openaiUsage(completion?.usage);
+  logTokenUsage({ fn: 'find-places', step: 'rerank', model: RERANK_MODEL, usage });
   const content: string = completion?.choices?.[0]?.message?.content ?? '{}';
   try {
     const parsed = JSON.parse(content);
@@ -885,9 +910,10 @@ Output ONLY JSON:
           reasoning: typeof p?.reasoning === 'string' ? p.reasoning : undefined,
         }))
         .filter((p: any) => p.id),
+      usage,
     };
   } catch {
-    return { picks: [], failureReason: 'invalid JSON' };
+    return { picks: [], failureReason: 'invalid JSON', usage };
   }
 }
 
@@ -933,6 +959,8 @@ async function searchGoogle(
 ): Promise<{
   provider: 'google';
   places: UnifiedPlace[];
+  /** Token spend for the re-rank pass; absent when the model wasn't called. */
+  usage?: TokenUsage;
   debug: {
     perQueryCounts: Record<string, number>;
     candidatePoolSize: number;
@@ -1019,6 +1047,8 @@ async function searchGoogle(
     return {
       provider: 'google',
       places: candidates.slice(0, limit).map(stripScoringFields),
+      // Tokens were still spent reaching the model even though it gave no picks.
+      usage: llm.usage,
       debug: {
         perQueryCounts,
         candidatePoolSize: candidates.length,
@@ -1139,6 +1169,7 @@ async function searchGoogle(
     return {
       provider: 'google',
       places: candidates.slice(0, limit).map(stripScoringFields),
+      usage: llm.usage,
       debug: {
         perQueryCounts,
         candidatePoolSize: candidates.length,
@@ -1151,6 +1182,7 @@ async function searchGoogle(
   return {
     provider: 'google',
     places: picked,
+    usage: llm.usage,
     debug: {
       perQueryCounts,
       candidatePoolSize: candidates.length,
@@ -1591,6 +1623,7 @@ Deno.serve(async (req: Request) => {
     let result: {
       provider: string;
       places: UnifiedPlace[];
+      usage?: TokenUsage;
       debug?: Record<string, unknown>;
     };
     if (googleKey) {
@@ -1640,9 +1673,17 @@ Deno.serve(async (req: Request) => {
       category: category?.category ?? null,
       places: result.places,
       debug: result.debug,
+      // Token spend for THIS call (model + counts), or null when no LLM ran
+      // (Foursquare/OSM/no key). Cached as null on purpose — a later cache HIT
+      // serves this body without spending any tokens, so it must not re-report
+      // the original call's usage.
+      usage: null,
     };
     if (result.places.length > 0) writeServerCache(cacheKey, body);
-    return jsonResponse(body, 200, {
+    const liveUsage = result.usage
+      ? { model: RERANK_MODEL, ...result.usage }
+      : null;
+    return jsonResponse({ ...body, usage: liveUsage }, 200, {
       'X-Cache': 'miss',
       'Cache-Control': 'public, max-age=300',
     });

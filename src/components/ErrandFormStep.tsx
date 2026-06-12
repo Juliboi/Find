@@ -114,6 +114,10 @@ export function ErrandFormStep({
   // timed one always resolves to a concrete duration so it has an end).
   const [durationMin, setDurationMin] = useState<number | null>(DEFAULT_DURATION);
   const [addr, setAddr] = useState<AddressValue | null>(null);
+  // "Let Diem find it": defer the venue to the day-planner. Mutually exclusive
+  // with a pinned `addr` — toggling one clears the other.
+  const [autoPlace, setAutoPlace] = useState(false);
+  const [placeQuery, setPlaceQuery] = useState<string | undefined>(undefined);
   const [notes, setNotes] = useState('');
   const [androidPicker, setAndroidPicker] = useState(false);
   // The horizontal day list + a map of each day chip's x-offset, so a (re)seed
@@ -145,6 +149,8 @@ export function ErrandFormStep({
           }
         : null,
     );
+    setAutoPlace(!!draft.autoPlace);
+    setPlaceQuery(draft.placeQuery ?? undefined);
     setNotes(draft.notes ?? '');
     const hasTime = !!draft.startTime;
     setTimed(hasTime);
@@ -228,15 +234,17 @@ export function ErrandFormStep({
       // Persist the length estimate in BOTH modes (timed → mirrors the window;
       // anytime → the standalone "how long" the planner uses). null = no estimate.
       durationMin: durationMin ?? undefined,
-      address: addr?.label,
-      latitude: addr?.latitude ?? undefined,
-      longitude: addr?.longitude ?? undefined,
-      placeId: addr?.placeId ?? undefined,
-      photoUrl: addr?.photoUrl ?? undefined,
-      rating: addr?.rating ?? undefined,
-      ratingCount: addr?.ratingCount ?? undefined,
-      priceLevel: addr?.priceLevel ?? undefined,
-      openingHours: addr?.openingHours ?? undefined,
+      address: autoPlace ? undefined : addr?.label,
+      latitude: autoPlace ? undefined : addr?.latitude ?? undefined,
+      longitude: autoPlace ? undefined : addr?.longitude ?? undefined,
+      placeId: autoPlace ? undefined : addr?.placeId ?? undefined,
+      photoUrl: autoPlace ? undefined : addr?.photoUrl ?? undefined,
+      rating: autoPlace ? undefined : addr?.rating ?? undefined,
+      ratingCount: autoPlace ? undefined : addr?.ratingCount ?? undefined,
+      priceLevel: autoPlace ? undefined : addr?.priceLevel ?? undefined,
+      openingHours: autoPlace ? undefined : addr?.openingHours ?? undefined,
+      autoPlace: autoPlace || undefined,
+      placeQuery: autoPlace ? placeQuery?.trim() || title.trim() || undefined : undefined,
       notes: notes.trim() || undefined,
       rawText,
     });
@@ -414,20 +422,71 @@ export function ErrandFormStep({
             fresh parse it auto-searches the AI's guess so the user can
             confirm/correct it; an already-pinned errand just rests. */}
         <Field icon="location-outline" label="Where" index={4}>
-          <ErrandAddressField
-            value={addr}
-            center={center}
-            seedKey={seedKey}
-            seedQuery={
-              mode === 'create' && draft.latitude == null
-                ? draft.address
-                : null
-            }
-            dateISO={date}
-            startTime={timed ? startTime : undefined}
-            endTime={timed ? endTime : undefined}
-            onChange={setAddr}
-          />
+          {autoPlace ? (
+            <View
+              style={[
+                styles.autoPlaceCard,
+                { backgroundColor: t.colors.accentSoft, borderColor: t.colors.separator },
+              ]}
+            >
+              <View style={styles.autoPlaceHead}>
+                <Ionicons name="sparkles" size={15} color={t.colors.accent} />
+                <Text variant="body" weight="semibold" tone="accent">
+                  Diem will pick the spot
+                </Text>
+              </View>
+              <Text variant="caption" tone="secondary">
+                {placeQuery
+                  ? `When this lands in a day, Diem finds the closest, on-route ${placeQuery.toLowerCase()} that's open.`
+                  : "When this lands in a day, Diem finds the closest, on-route option that's open."}
+              </Text>
+              <Pressable
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  setAutoPlace(false);
+                }}
+                hitSlop={8}
+                style={styles.autoPlaceSwitch}
+              >
+                <Ionicons name="location-outline" size={13} color={t.colors.accent} />
+                <Text variant="bodySm" weight="semibold" tone="accent">
+                  Pick a specific place instead
+                </Text>
+              </Pressable>
+            </View>
+          ) : (
+            <>
+              <ErrandAddressField
+                value={addr}
+                center={center}
+                seedKey={seedKey}
+                seedQuery={
+                  mode === 'create' && draft.latitude == null
+                    ? draft.address
+                    : null
+                }
+                dateISO={date}
+                startTime={timed ? startTime : undefined}
+                endTime={timed ? endTime : undefined}
+                onChange={setAddr}
+              />
+              <Pressable
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  setAddr(null);
+                  setPlaceQuery((q) => q ?? (title.trim() || undefined));
+                  setAutoPlace(true);
+                }}
+                hitSlop={8}
+                style={styles.autoPlaceSwitch}
+              >
+                <Ionicons name="sparkles-outline" size={13} color={t.colors.accent} />
+                <Text variant="bodySm" weight="semibold" tone="accent">
+                  Let Diem find it for me
+                </Text>
+              </Pressable>
+            </>
+          )}
         </Field>
 
         {/* Notes — also handed to the planner when this errand is folded
@@ -648,6 +707,25 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
+  },
+  autoPlaceCard: {
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 6,
+  },
+  autoPlaceHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  autoPlaceSwitch: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingTop: 6,
+    alignSelf: 'flex-start',
   },
   input: {
     minHeight: 46,

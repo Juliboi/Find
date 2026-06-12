@@ -1,5 +1,6 @@
 import * as Location from 'expo-location';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
+import { logTokenUsage, shapeUsage, type LlmTokenUsage } from '@/lib/usage';
 import type { VenueOpeningHours } from '@/types/itinerary';
 
 export interface Coords {
@@ -125,6 +126,12 @@ export interface FindPlacesResult {
    * "lookup failed" dead-end.
    */
   detail?: string;
+  /**
+   * Token spend the `find-places` re-rank reported for this call (model +
+   * counts). Null when no model ran — no OpenAI key, the Foursquare/OSM
+   * providers, or a cache hit (which spends nothing).
+   */
+  usage?: LlmTokenUsage | null;
   /** Raw error / response payload for the sandbox's debug section. */
   debug?: unknown;
 }
@@ -308,6 +315,7 @@ export async function findPlaces(
       };
     }
     const places = Array.isArray(data.places) ? (data.places as NearbyPlace[]) : [];
+    const usage = shapeUsage((data as any).usage);
     const result: FindPlacesResult = {
       places,
       category: typeof data.category === 'string' ? data.category : null,
@@ -320,9 +328,13 @@ export async function findPlaces(
           ? 'osm'
           : 'none',
       reason: places.length === 0 ? 'no_results' : undefined,
+      usage,
       debug: data,
     };
-    if (places.length > 0) writeCache(key, result);
+    logTokenUsage('find-places', usage);
+    // Cache without usage: a later cache hit serves stored places but spends no
+    // tokens, so it must report null rather than re-attributing this call's spend.
+    if (places.length > 0) writeCache(key, { ...result, usage: null });
     return result;
   } catch (e: any) {
     return {

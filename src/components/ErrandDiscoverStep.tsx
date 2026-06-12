@@ -1,7 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Image, Pressable, StyleSheet, View } from 'react-native';
 import { BottomSheetScrollView } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
+import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import Animated from 'react-native-reanimated';
@@ -11,6 +12,25 @@ import { Button } from './Button';
 import { ENTER, EXIT } from './errandDrawerAnim';
 import { discoverPlaces, type DiscoverResult } from '@/lib/discover';
 import { formatDistance, type Coords, type NearbyPlace } from '@/lib/places';
+import { collectDayAnchors, nearestAnchor, type DayAnchor } from '@/lib/dayAnchors';
+import { travelIconName } from '@/lib/travel';
+import { useErrandsStore } from '@/store/useErrandsStore';
+import { getOpeningHoursStatus } from '@/lib/itinerary/hours';
+import { addMinutes, currentHHMM, todayISO } from '@/utils/time';
+
+// Discovery candidates render as dark "liquid glass" cards (matching the home
+// screen's frosted surfaces) so pure-white text stays crisp no matter what the
+// sheet background is. Text tones below are white at descending opacity.
+const ON = '#FFFFFF';
+const ON_SOFT = 'rgba(255, 255, 255, 0.82)';
+const ON_DIM = 'rgba(255, 255, 255, 0.56)';
+const ON_FAINT = 'rgba(255, 255, 255, 0.40)';
+// The glass itself: a dark tint over a blur, a hairline light edge, and a
+// brighter inset for the AI blurb so it reads as a panel-within-a-panel.
+const GLASS_TINT = 'rgba(18, 18, 24, 0.55)';
+const GLASS_BORDER = 'rgba(255, 255, 255, 0.14)';
+const GLASS_INSET = 'rgba(255, 255, 255, 0.09)';
+const ACCENT_ON_GLASS = '#5AC8FA';
 
 interface Props {
   /** The normalized "what" the orchestrator pulled from the typed line. */
@@ -21,10 +41,15 @@ interface Props {
   nearby: boolean;
   /** Where to search when not nearby and no area resolves (usually home). */
   fallbackCenter: Coords | null;
+  /** The errand's date (from the orchestrator) — scopes which day's stops we
+   * measure closeness to. Null falls back to today. */
+  anchorDate: string | null;
   /** Picked a candidate → hand back to the drawer to seed the confirm form. */
   onPick: (place: NearbyPlace) => void;
   /** Skip the suggestions and fill the form by hand. */
   onManual: () => void;
+  /** Defer the venue choice to the day-planner ("Let Diem pick the spot"). */
+  onAutoPlan: () => void;
 }
 
 /**
@@ -39,8 +64,10 @@ export function ErrandDiscoverStep({
   area,
   nearby,
   fallbackCenter,
+  anchorDate,
   onPick,
   onManual,
+  onAutoPlan,
 }: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
@@ -48,6 +75,15 @@ export function ErrandDiscoverStep({
   const [result, setResult] = useState<DiscoverResult | null>(null);
   const [version, setVersion] = useState(0);
   const reqRef = useRef(0);
+
+  // The day's other located errands — the "stops" each candidate's closeness is
+  // measured against ("≈12 min from Dentist"), so picking a place is informed by
+  // how it fits the day rather than an opaque proximity rank.
+  const errands = useErrandsStore((s) => s.items);
+  const dayStops = useMemo(
+    () => collectDayAnchors({ errands, date: anchorDate ?? todayISO() }),
+    [errands, anchorDate],
+  );
 
   // Refetch whenever the search shape changes (a new discovery submit) or the
   // user hits retry. Guarded so a stale in-flight call can't overwrite a newer
@@ -133,6 +169,7 @@ export function ErrandDiscoverStep({
               key={p.id}
               place={p}
               index={i}
+              dayStops={dayStops}
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
                 onPick(p);
@@ -151,6 +188,17 @@ export function ErrandDiscoverStep({
         ]}
       >
         <Button
+          title="Let Diem pick the spot"
+          variant="tonal"
+          leftIcon={<Ionicons name="sparkles" size={16} color={t.colors.accent} />}
+          onPress={() => {
+            Haptics.selectionAsync().catch(() => undefined);
+            onAutoPlan();
+          }}
+          fullWidth
+          size="lg"
+        />
+        <Button
           title="Enter details manually"
           variant="ghost"
           onPress={() => {
@@ -158,7 +206,7 @@ export function ErrandDiscoverStep({
             onManual();
           }}
           fullWidth
-          size="lg"
+          size="md"
         />
       </Animated.View>
     </>
@@ -169,10 +217,12 @@ export function ErrandDiscoverStep({
 function DiscoverCard({
   place,
   index,
+  dayStops,
   onPress,
 }: {
   place: NearbyPlace;
   index: number;
+  dayStops: DayAnchor[];
   onPress: () => void;
 }) {
   const t = useTheme();
@@ -185,61 +235,121 @@ function DiscoverCard({
   }
   meta.push(formatDistance(place.distanceM));
 
+  // Closeness to the day's nearest other stop — the routing cue that makes a
+  // pick "fit the day". Only shown when there's another located errand to relate
+  // to (otherwise the distance-to-center above already covers home/you).
+  const nearStop = useMemo(
+    () =>
+      dayStops.length
+        ? nearestAnchor({ latitude: place.latitude, longitude: place.longitude }, dayStops)
+        : null,
+    [dayStops, place.latitude, place.longitude],
+  );
+
+  // Google-Maps-style live hours from the structured weekly schedule, evaluated
+  // against the current clock. We pass a 60-min look-ahead as the visit "end" so
+  // a venue closing within the hour reads "Closing soon" instead of a bare
+  // "Open". Falls back to the provider's coarse open-now flag when a place has
+  // no structured periods (Foursquare/OSM).
+  const now = currentHHMM();
+  const hours =
+    place.openingHours && place.openingHours.periods?.length
+      ? getOpeningHoursStatus(place.openingHours, todayISO(), now, addMinutes(now, 60))
+      : null;
+  let hoursLabel: string | null = hours?.statusLabel ?? null;
+  let hoursColor = ON_DIM;
+  if (hours?.statusLabel) {
+    hoursColor =
+      hours.status === 'open'
+        ? t.colors.success
+        : hours.status === 'closingSoon'
+          ? t.colors.warning
+          : hours.status === 'closed'
+            ? t.colors.danger
+            : ON_DIM;
+  } else if (place.openNow != null) {
+    hoursLabel = place.openNow ? 'Open now' : 'Closed';
+    hoursColor = place.openNow ? t.colors.success : t.colors.danger;
+  }
+
   return (
     <Animated.View entering={ENTER(index + 1)} exiting={EXIT(index + 1)}>
       <Pressable
         onPress={onPress}
-        style={({ pressed }) => [
-          styles.card,
-          {
-            backgroundColor: t.colors.surface2,
-            borderColor: t.colors.separator,
-            opacity: pressed ? 0.85 : 1,
-          },
-        ]}
+        style={({ pressed }) => [styles.card, pressed && { opacity: 0.9 }]}
         accessibilityRole="button"
         accessibilityLabel={`Pick ${place.name}`}
       >
-        <View style={styles.cardTop}>
-          {place.photoUrl ? (
-            <Image source={{ uri: place.photoUrl }} style={styles.photo} />
-          ) : (
-            <View style={[styles.photo, styles.photoFallback, { backgroundColor: t.colors.fill1 }]}>
-              <Ionicons name="storefront-outline" size={20} color={t.colors.textTertiary} />
+        {/* Frosted "liquid glass": a dark blur + tint so white text stays crisp
+            on any sheet background; the tint also covers the Android fallback. */}
+        <BlurView tint="dark" intensity={48} style={StyleSheet.absoluteFill} />
+        <View style={[StyleSheet.absoluteFill, { backgroundColor: GLASS_TINT }]} />
+
+        <View style={styles.cardContent}>
+          <View style={styles.cardTop}>
+            {place.photoUrl ? (
+              <Image source={{ uri: place.photoUrl }} style={styles.photo} />
+            ) : (
+              <View style={[styles.photo, styles.photoFallback]}>
+                <Ionicons name="storefront-outline" size={20} color={ON_DIM} />
+              </View>
+            )}
+            <View style={{ flex: 1, gap: 3 }}>
+              <Text variant="body" weight="semibold" numberOfLines={1} style={{ color: ON }}>
+                {place.name}
+              </Text>
+              <Text variant="caption" numberOfLines={1} style={{ color: ON_DIM }}>
+                {meta.join('  ·  ')}
+              </Text>
+              {hoursLabel ? (
+                <Text
+                  variant="caption"
+                  weight="semibold"
+                  numberOfLines={1}
+                  style={{ color: hoursColor }}
+                >
+                  {hoursLabel}
+                </Text>
+              ) : null}
             </View>
-          )}
-          <View style={{ flex: 1, gap: 3 }}>
-            <Text variant="body" weight="semibold" numberOfLines={1}>
-              {place.name}
-            </Text>
-            <Text variant="caption" tone="secondary" numberOfLines={1}>
-              {meta.join('  ·  ')}
-            </Text>
-            {place.openNow != null ? (
+            <Ionicons name="chevron-forward" size={18} color={ON_FAINT} />
+          </View>
+
+          {nearStop ? (
+            <View style={styles.anchorRow}>
+              <Ionicons
+                name={travelIconName(nearStop.estimate.mode) as keyof typeof Ionicons.glyphMap}
+                size={13}
+                color={ACCENT_ON_GLASS}
+              />
               <Text
                 variant="caption"
                 weight="semibold"
-                style={{ color: place.openNow ? t.colors.success : t.colors.danger }}
+                numberOfLines={1}
+                style={{ flex: 1, color: ON_SOFT }}
               >
-                {place.openNow ? 'Open now' : 'Closed'}
+                {`${nearStop.estimate.minutes} min from ${nearStop.anchor.label}`}
               </Text>
-            ) : null}
-          </View>
-          <Ionicons name="chevron-forward" size={18} color={t.colors.textTertiary} />
-        </View>
+            </View>
+          ) : null}
 
-        {place.reasoning ? (
-          <View style={[styles.blurb, { backgroundColor: t.colors.fill1 }]}>
-            <Ionicons name="sparkles-outline" size={13} color={t.colors.accent} />
-            <Text variant="caption" tone="secondary" style={{ flex: 1 }}>
-              {place.reasoning}
-            </Text>
-          </View>
-        ) : place.address ? (
-          <Text variant="caption" tone="tertiary" numberOfLines={1}>
-            {place.address}
-          </Text>
-        ) : null}
+          {place.address ? (
+            <View style={styles.addressRow}>
+              <Ionicons name="location-outline" size={13} color={ON_FAINT} />
+              <Text variant="caption" numberOfLines={1} style={{ flex: 1, color: ON_DIM }}>
+                {place.address}
+              </Text>
+            </View>
+          ) : null}
+
+          {place.reasoning ? (
+            <View style={[styles.blurb]}>
+              <Text variant="caption" style={{ flex: 1, color: ON_SOFT }}>
+                {place.reasoning}
+              </Text>
+            </View>
+          ) : null}
+        </View>
       </Pressable>
     </Animated.View>
   );
@@ -268,7 +378,7 @@ function whereLabel({
   }
   if (nearby) return 'Near you';
   if (area) return `In ${area}`;
-  return 'Near home';
+  return 'Near you';
 }
 
 function capitalize(s: string): string {
@@ -318,10 +428,14 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
   card: {
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: GLASS_BORDER,
+    overflow: 'hidden',
+  },
+  cardContent: {
     gap: 10,
     padding: 12,
-    borderRadius: 16,
-    borderWidth: StyleSheet.hairlineWidth,
   },
   cardTop: {
     flexDirection: 'row',
@@ -336,17 +450,27 @@ const styles = StyleSheet.create({
   photoFallback: {
     alignItems: 'center',
     justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.10)',
+  },
+  addressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  anchorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   blurb: {
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 8,
-    padding: 10,
-    borderRadius: 10,
   },
   footer: {
     paddingHorizontal: 16,
     paddingTop: 10,
+    gap: 4,
     borderTopWidth: StyleSheet.hairlineWidth,
   },
 });
