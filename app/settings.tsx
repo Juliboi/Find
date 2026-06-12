@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Alert,
   Linking,
@@ -28,7 +28,6 @@ import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
-import { useDevClockStore } from '@/store/useDevClockStore';
 import { formatTime } from '@/utils/time';
 
 /** Seed a time picker from a stored "HH:MM" (falls back to 9 PM if unparseable). */
@@ -188,64 +187,6 @@ export default function SettingsScreen() {
       Haptics.selectionAsync().catch(() => undefined);
       void setDailyReviewTime(dateToHHMM(picked));
     }
-  };
-
-  // --- DEV ONLY: fake "now" so we can test the planner against real-world time
-  // (open/closed venues, a morning start, the in-progress path) on demand.
-  const devClockEnabled = useDevClockStore((s) => s.enabled);
-  const devClockAnchorMs = useDevClockStore((s) => s.anchorMs);
-  const setFakeNow = useDevClockStore((s) => s.setFakeNow);
-  const disableDevClock = useDevClockStore((s) => s.disable);
-  // Android picks date + time in two one-shot dialogs; iOS shows one inline.
-  const [androidDevStage, setAndroidDevStage] = useState<null | 'date' | 'time'>(
-    null,
-  );
-  const androidDevDate = useRef<Date>(new Date());
-
-  const devClockValue = useMemo(
-    () => (devClockAnchorMs ? new Date(devClockAnchorMs) : new Date()),
-    [devClockAnchorMs],
-  );
-  const devClockLabel = useMemo(() => {
-    if (!devClockEnabled || !devClockAnchorMs) return null;
-    return new Date(devClockAnchorMs).toLocaleString(undefined, {
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-    });
-  }, [devClockEnabled, devClockAnchorMs]);
-
-  const onToggleDevClock = (next: boolean) => {
-    Haptics.selectionAsync().catch(() => undefined);
-    if (next) setFakeNow(devClockAnchorMs ? new Date(devClockAnchorMs) : new Date());
-    else disableDevClock();
-  };
-
-  const onDevClockChange = (_: DateTimePickerEvent, picked?: Date) => {
-    if (picked) {
-      Haptics.selectionAsync().catch(() => undefined);
-      setFakeNow(picked);
-    }
-  };
-
-  const onAndroidDevDate = (_: DateTimePickerEvent, picked?: Date) => {
-    if (!picked) {
-      setAndroidDevStage(null);
-      return;
-    }
-    androidDevDate.current = picked;
-    setAndroidDevStage('time');
-  };
-
-  const onAndroidDevTime = (_: DateTimePickerEvent, picked?: Date) => {
-    setAndroidDevStage(null);
-    if (!picked) return;
-    const merged = new Date(androidDevDate.current);
-    merged.setHours(picked.getHours(), picked.getMinutes(), 0, 0);
-    Haptics.selectionAsync().catch(() => undefined);
-    setFakeNow(merged);
   };
 
   const dietarySummary = dietary.length
@@ -546,89 +487,6 @@ export default function SettingsScreen() {
           />
         </Card>
 
-        {__DEV__ ? (
-          <Card padded style={{ padding: 0 }}>
-            <View
-              style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}
-            >
-              <Text
-                variant="caption"
-                tone="secondary"
-                uppercase
-                weight="semibold"
-              >
-                Developer
-              </Text>
-            </View>
-            <Row
-              first
-              icon="time-outline"
-              iconBg={devClockEnabled ? t.colors.warningSoft : t.colors.fill1}
-              iconColor={devClockEnabled ? t.colors.warning : undefined}
-              title="Fake current time"
-              subtitle={
-                devClockLabel
-                  ? `Pretending it's ${devClockLabel}`
-                  : 'Test plans against open/closed venues & start times'
-              }
-              trailing={
-                <Switch
-                  value={devClockEnabled}
-                  onValueChange={onToggleDevClock}
-                  trackColor={{ true: t.colors.warning, false: t.colors.fill2 }}
-                />
-              }
-            />
-            {devClockEnabled ? (
-              <Row
-                icon="calendar-outline"
-                iconBg={t.colors.fill1}
-                title="Set to"
-                subtitle="Plans, dates and 'now' all use this instant"
-                trailing={
-                  Platform.OS === 'ios' ? (
-                    <DateTimePicker
-                      value={devClockValue}
-                      mode="datetime"
-                      display="compact"
-                      onChange={onDevClockChange}
-                      themeVariant={t.isDark ? 'dark' : 'light'}
-                    />
-                  ) : (
-                    <Pressable
-                      onPress={() => {
-                        Haptics.selectionAsync().catch(() => undefined);
-                        androidDevDate.current = devClockValue;
-                        setAndroidDevStage('date');
-                      }}
-                      style={[
-                        styles.timePill,
-                        { backgroundColor: t.colors.fill1 },
-                      ]}
-                    >
-                      <Text variant="body" weight="bold" tone="accent">
-                        {devClockLabel ?? 'Pick'}
-                      </Text>
-                    </Pressable>
-                  )
-                }
-              />
-            ) : null}
-            {devClockEnabled ? (
-              <Row
-                icon="refresh-outline"
-                iconBg={t.colors.dangerSoft}
-                iconColor={t.colors.danger}
-                title="Reset to real time"
-                onPress={() => {
-                  Haptics.selectionAsync().catch(() => undefined);
-                  disableDevClock();
-                }}
-              />
-            ) : null}
-          </Card>
-        ) : null}
-
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
@@ -651,23 +509,6 @@ export default function SettingsScreen() {
           display="default"
           minuteInterval={5}
           onChange={onReviewTimeChange}
-        />
-      ) : null}
-
-      {androidDevStage === 'date' && Platform.OS !== 'ios' ? (
-        <DateTimePicker
-          value={androidDevDate.current}
-          mode="date"
-          display="default"
-          onChange={onAndroidDevDate}
-        />
-      ) : null}
-      {androidDevStage === 'time' && Platform.OS !== 'ios' ? (
-        <DateTimePicker
-          value={androidDevDate.current}
-          mode="time"
-          display="default"
-          onChange={onAndroidDevTime}
         />
       ) : null}
 

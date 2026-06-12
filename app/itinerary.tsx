@@ -35,7 +35,6 @@ import type { ThemeColors } from '@/theme/colors';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
-import { usePlanJobsStore, PLANNING_PHASES } from '@/store/usePlanJobsStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import {
   useErrandsStore,
@@ -199,6 +198,13 @@ const PAST_OPACITY = 0.4;
  * while the trip as a whole still flows top-to-bottom continuously.
  */
 type StepRect = { t0: number; t1: number; top: number; bottom: number };
+
+const PLANNING_PHASES = [
+  'Drafting your day…',
+  'Finding the best places…',
+  'Mapping your route…',
+  'Polishing the details…',
+];
 
 const HOME_ID = '__home__';
 
@@ -370,7 +376,7 @@ export default function ItineraryScreen() {
   // ALZHEIMER-HOME / Sevt-Inc doppelgängers an earlier build let through)
   // so old saves heal themselves on the next open instead of carrying that
   // stale enrichment forever.
-  const params = useLocalSearchParams<{ id?: string; jobId?: string }>();
+  const params = useLocalSearchParams<{ id?: string }>();
   const preloaded = useMemo(() => {
     if (!params.id) return null;
     const saved = useSavedItineraries
@@ -380,24 +386,15 @@ export default function ItineraryScreen() {
     return scrubHomePlacesFromSaved(saved, home);
   }, [params.id, home]);
 
-  // When this screen is opened to watch a background build in progress (the
-  // user tapped the homepage skeleton), bind to that job so we can show the
-  // same live skeleton here and swap in the finished day the moment it lands.
-  const planJob = usePlanJobsStore((s) =>
-    params.jobId ? s.jobs.find((j) => j.id === params.jobId) : undefined,
-  );
-  const buildingFromJob = !!planJob && planJob.status === 'building';
-
-  // The last free-text prompt, used as the basis for an on-screen replan. Fresh
-  // creation now runs in the background (see planIt → usePlanJobsStore), so this
-  // is only populated when a built day is reopened and edited in place.
-  const [input] = useState('');
+  const [input, setInput] = useState('');
   const [itinerary, setItinerary] = useState<Itinerary | null>(preloaded);
   const [usedAi, setUsedAi] = useState(!!preloaded);
-  // `routesRefining` is the silent routing pass that runs AFTER a saved trip
-  // auto-heals: the day is already visible, and we only flash a subtle pill to
-  // hint that times may shift in a beat. (The blocking "building" view is now
-  // driven entirely by the background job — see `buildingFromJob`.)
+  // `loading` covers the BLOCKING planning call only — while it's true the
+  // screen shows the planning skeleton. `routesRefining` is for the silent
+  // routing pass that happens AFTER the plan lands or when an existing
+  // saved trip auto-heals: the day is already visible, and we only flash a
+  // subtle pill to hint that times may shift in a beat.
+  const [loading, setLoading] = useState(false);
   const [routesRefining, setRoutesRefining] = useState(false);
   // Tracks the saved-store id for the currently-shown itinerary. Populated
   // when opening a saved trip OR when a fresh plan lands. The recompute call
@@ -417,6 +414,7 @@ export default function ItineraryScreen() {
   // progress fill, the glowing "now / next" card, and greying-out of the past.
   const [nowMin, setNowMin] = useState(() => minutesOfDay(currentHHMM()) ?? 0);
   const [sheetExpanded, setSheetExpanded] = useState(!preloaded);
+  const [phase, setPhase] = useState(0);
 
   // --- live editing state ---------------------------------------------------
   // True while an edit is being applied (route refresh / AI re-plan in flight).
@@ -452,6 +450,7 @@ export default function ItineraryScreen() {
   const updateErrand = useErrandsStore((s) => s.update);
   const removeErrand = useErrandsStore((s) => s.remove);
   const reopenErrand = useErrandsStore((s) => s.reopen);
+  const setErrandsPlanned = useErrandsStore((s) => s.setPlanned);
   // Edit-drawer state — tapping an errand row opens it in (edit-only) mode.
   const [errandDrawerOpen, setErrandDrawerOpen] = useState(false);
   const [errandSeed, setErrandSeed] = useState<ErrandDraft>(EMPTY_ERRAND_DRAFT);
@@ -549,6 +548,19 @@ export default function ItineraryScreen() {
     if (editErrandId) removeErrand(editErrandId);
     setErrandDrawerOpen(false);
   };
+
+  // Cycle the status copy while planning so the wait feels alive.
+  useEffect(() => {
+    if (!loading) {
+      setPhase(0);
+      return;
+    }
+    const id = setInterval(
+      () => setPhase((p) => Math.min(p + 1, PLANNING_PHASES.length - 1)),
+      1500,
+    );
+    return () => clearInterval(id);
+  }, [loading]);
 
   // Drawer snap positions, expressed as the sheet's top edge (Y from top).
   // Collapsed rests higher up (~60% of the screen) so the list leads and the
@@ -1124,130 +1136,136 @@ export default function ItineraryScreen() {
     timeFillY.value = 0;
   };
 
-  // Watching a background build: when the bound job resolves, swap the live
-  // skeleton for the finished day in place (no extra navigation). Failures
-  // drop us onto the plan-landing so the user can retype and retry.
-  useEffect(() => {
-    if (!planJob || itinerary) return;
-    if (planJob.status === 'done' && planJob.savedId) {
-      const saved = useSavedItineraries
-        .getState()
-        .items.find((i) => i.id === planJob.savedId);
-      if (saved) {
-        setItinerary(scrubHomePlacesFromSaved(saved.itinerary, home));
-        setSavedId(planJob.savedId);
-        setUsedAi(true);
-        snapTo(collapsedTop);
-      }
-    }
-    // snapTo/collapsedTop are render-stable enough here; we only want this to
-    // re-fire when the watched job or the loaded itinerary changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [planJob, itinerary, home]);
-
   const planIt = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim();
-    if (!text) return;
+    if (!text || loading) return;
+    // Keep the latest prompt around — it's the basis for any later replan.
+    if (overrideText !== undefined && text !== input) setInput(text);
     Haptics.selectionAsync().catch(() => undefined);
+    // Anything that was already in flight is no longer relevant; bump the seq
+    // so a slow recompute from a previous plan can't slot itself in after
+    // this one has rendered.
+    const seq = ++planSeqRef.current;
+    setLoading(true);
+    setErrorMsg(null);
+    setSavedId(null);
+    resetTracking();
+    snapTo(expandedTop); // show the skeleton full-height while we work
+    try {
+      // Anchor the plan to the day + start/end the user picked in the setup
+      // drawer. The date goes to the planner directly; the start/end times and
+      // places are woven into the prompt so the model lays the first block down
+      // around them and routes the day to the right finish.
+      const startWhere = planStartLocation?.label
+        ? ` from ${planStartLocation.label}`
+        : '';
+      const endWhere = planEndLocation?.label
+        ? ` at ${planEndLocation.label}`
+        : '';
+      // Fold in only the errands the user explicitly ticked in the drawer (never
+      // auto-injected). Done ones are skipped; each line hands the model the
+      // title plus whatever slots are known so it can time/place the stop.
+      const chosenErrands = errands.filter(
+        (e) => selectedErrandIds.has(e.id) && !e.done,
+      );
+      const errandsBlock = chosenErrands.length
+        ? `\n\nAlso work these errands into the day:\n${chosenErrands
+            .map((e) => {
+              const bits: string[] = [];
+              if (e.startTime) {
+                bits.push(e.endTime ? `${e.startTime}–${e.endTime}` : `at ${e.startTime}`);
+              } else if (e.durationMin) {
+                // No fixed time, but a length estimate — tell the model how much
+                // of a gap to reserve for it.
+                bits.push(`~${formatDuration(e.durationMin)}`);
+              }
+              if (e.address) bits.push(`at ${e.address}`);
+              if (e.notes) bits.push(e.notes);
+              return `- ${e.title}${bits.length ? ` (${bits.join(', ')})` : ''}`;
+            })
+            .join('\n')}`
+        : '';
+      // When planning TODAY, the day is already underway: send the planner the
+      // current time so it plans the rest of the day from now (not the morning),
+      // and never let the stated start time sit in the past.
+      const planningToday = effectiveDate === todayISO();
+      const localNow = currentHHMM();
+      const nowArg = planningToday ? localNow : undefined;
+      const startForPrompt =
+        planningToday && planStartTime < localNow ? localNow : planStartTime;
+      const request = `I'm planning my day for ${effectiveDate}. I want to start at ${startForPrompt}${startWhere} and finish by ${planEndTime}${endWhere}.\n\n${text}${errandsBlock}`;
+      const result = await planItinerary(request, {
+        context,
+        date: effectiveDate,
+        now: nowArg,
+        debug: true,
+      });
+      if (planSeqRef.current !== seq) return; // user reset / planned again
+      const itin = result.itinerary;
+      setUsedAi(result.usedAi);
+      setDebug(result.debug ?? null);
+      if (!itin) {
+        setItinerary(null);
+        setErrorMsg('No itinerary was produced. Check the debug section.');
+        return;
+      }
 
-    // Anchor the plan to the day + start/end the user picked in the setup
-    // drawer. The date goes to the planner directly; the start/end times and
-    // places are woven into the prompt so the model lays the first block down
-    // around them and routes the day to the right finish.
-    const startWhere = planStartLocation?.label
-      ? ` from ${planStartLocation.label}`
-      : '';
-    const endWhere = planEndLocation?.label
-      ? ` at ${planEndLocation.label}`
-      : '';
-    // Fold in only the errands the user explicitly ticked in the drawer (never
-    // auto-injected). Done ones are skipped; each line hands the model the
-    // title plus whatever slots are known so it can time/place the stop.
-    const chosenErrands = errands.filter(
-      (e) => selectedErrandIds.has(e.id) && !e.done,
-    );
-    const errandsBlock = chosenErrands.length
-      ? `\n\nAlso work these errands into the day:\n${chosenErrands
-          .map((e) => {
-            const bits: string[] = [];
-            if (e.startTime) {
-              bits.push(e.endTime ? `${e.startTime}–${e.endTime}` : `at ${e.startTime}`);
-            } else if (e.durationMin) {
-              // No fixed time, but a length estimate — tell the model how much
-              // of a gap to reserve for it.
-              bits.push(`~${formatDuration(e.durationMin)}`);
-            }
-            if (e.address) bits.push(`at ${e.address}`);
-            if (e.notes) bits.push(e.notes);
-            return `- ${e.title}${bits.length ? ` (${bits.join(', ')})` : ''}`;
-          })
-          .join('\n')}`
-      : '';
-    // ----- Is TODAY already in progress, or a fresh full day? ---------------
-    // Sending `now` puts the planner in "in-progress" mode: it clamps the first
-    // block to the current clock AND skips the morning (no wake/prep/breakfast —
-    // you supposedly already did it). That's right when you're planning the REST
-    // of an afternoon, but wrong when the day starts in the morning: a plan that
-    // begins at 08:30 should open with waking up, getting ready and breakfast.
-    //
-    // So we only treat TODAY as in-progress when the chosen start is genuinely
-    // PAST the morning. A start at/around the usual wake time — or any start the
-    // user dragged well before the current clock (a deliberate full re-plan) —
-    // is a fresh wake-to-sleep day, so we DON'T send `now` and let the planner
-    // lay out the whole morning. (Not sending `now` also stops it shoving an
-    // early fixed errand, like a 10:30 lunch, into the past.)
-    const planningToday = effectiveDate === todayISO();
-    const localNow = currentHHMM();
-    const startMin = minutesOfDay(planStartTime) ?? 0;
-    const clockNowMin = minutesOfDay(localNow) ?? 0;
-    const wakeMin = minutesOfDay(profileWakeTime ?? '') ?? 7 * 60;
-    const freshMorningStart = startMin <= wakeMin + 90;
-    const deliberateEarlierStart = startMin < clockNowMin - 30;
-    const inProgressToday =
-      planningToday && !freshMorningStart && !deliberateEarlierStart;
-    const startForPrompt = planStartTime;
-    const nowArg = inProgressToday ? localNow : undefined;
-    // A finish time at/before the start (e.g. start 09:00, end 01:00) is a day
-    // that runs PAST MIDNIGHT — spell that out, or the model reads "01:00" as a
-    // moment that already passed this morning and silently drops the end anchor.
-    const endMin = minutesOfDay(planEndTime) ?? 0;
-    const endPhrase =
-      endMin <= startMin
-        ? `${planEndTime} after midnight (early the next morning)`
-        : planEndTime;
-    const request = `I'm planning my day for ${effectiveDate}. I want to start at ${startForPrompt}${startWhere} and finish by ${endPhrase}${endWhere}.\n\n${text}${errandsBlock}`;
+      // Bake the chosen start into the plan so reopening/editing it later always
+      // routes the first leg from the same origin — not from wherever the global
+      // planner-setup drawer is pointed at the time.
+      if (planStartLocation) {
+        itin.startLocation = {
+          label: planStartLocation.label,
+          latitude: planStartLocation.latitude,
+          longitude: planStartLocation.longitude,
+        };
+      }
 
-    // A short, human label for the homepage skeleton while the day builds —
-    // the model's real title takes over once it lands.
-    const firstLine = text.split('\n')[0].trim();
-    const provisionalTitle =
-      firstLine.length > 42
-        ? `${firstLine.slice(0, 41).trimEnd()}…`
-        : firstLine || 'Your day plan';
+      // OPTIMISTIC SHOW. Save and render the model output the instant Gemini
+      // returns, so the user sees their day 2-5 seconds sooner. Routing then
+      // runs in the BACKGROUND (no await on this code path — see below) and
+      // swaps real Google Routes data into the same itinerary id when it's
+      // done. The cards may shift slightly when that happens (travel stubs
+      // strip, clock re-cascades) — the `routesRefining` pill hints at that.
+      const id = saveItinerary(itin);
+      setSavedId(id);
+      setItinerary(itin);
+      // The chosen errands are now folded into this plan: mark them "Planned"
+      // (they move to the Completed group; pull one back to re-include it) and
+      // clear the ticks so a later replan doesn't re-add a stale selection.
+      if (chosenErrands.length) {
+        setErrandsPlanned(
+          chosenErrands.map((e) => e.id),
+          effectiveDate,
+        );
+      }
+      setSelectedErrandIds(new Set());
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => undefined,
+      );
+      // Let the day fade in expanded for a beat, then ease the drawer down
+      // to reveal the mapped route — a small reveal beats a hard cut.
+      setTimeout(() => snapTo(collapsedTop), 520);
 
-    // Hand the build off to the background runner. It outlives this screen, so
-    // the user goes straight back home (where a live skeleton card tracks
-    // progress) instead of waiting on a spinner — and gets pinged the moment
-    // it's ready: an in-app toast if Diem is open, a push notification if not.
-    usePlanJobsStore.getState().startPlan({
-      request,
-      date: effectiveDate,
-      now: nowArg,
-      context,
-      startLocation: planStartLocation,
-      errandIds: chosenErrands.map((e) => e.id),
-      provisionalTitle,
-    });
-
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-      () => undefined,
-    );
-
-    // Back to the homepage — the skeleton card and the "we'll let you know"
-    // note live there. (Fresh-creation only ever arrives here via a push from
-    // home, so a back pop lands exactly where we want.)
-    if (router.canGoBack()) router.back();
-    else router.replace('/');
+      // Drop the blocking spinner now — the rest is silent. Anyone watching
+      // the seq guard knows to bail if a newer plan started while we wait.
+      setLoading(false);
+      setRoutesRefining(true);
+      void recomputeItinerary(itin, contextFor(itin))
+        .then((refreshed) => {
+          if (planSeqRef.current !== seq) return;
+          if (!refreshed.refreshed) return;
+          setItinerary(refreshed.itinerary);
+          updateSavedItinerary(id, refreshed.itinerary);
+        })
+        .finally(() => {
+          if (planSeqRef.current === seq) setRoutesRefining(false);
+        });
+    } catch (e: any) {
+      if (planSeqRef.current !== seq) return;
+      setErrorMsg(String(e?.message ?? e));
+      setLoading(false);
+    }
   };
 
   const reset = () => {
@@ -1341,7 +1359,6 @@ export default function ItineraryScreen() {
       const { itinerary: rerouted } = await recomputeItinerary(
         result.itinerary,
         contextFor(result.itinerary),
-        { optimize: true },
       );
       if (mySeq !== editSeqRef.current) return;
       const cascaded = fitGapsToAnchors(applyRoutedLegs(result.itinerary, rerouted));
@@ -1639,21 +1656,15 @@ export default function ItineraryScreen() {
       Haptics.selectionAsync().catch(() => undefined);
     }
 
-    // Track which anchor is in view by following where the user actually IS:
-    // a located stop focuses its own pin; a placeless block INHERITS the last
-    // place you arrived at (so deep work or a phone call at the cafe keeps the
-    // map on the cafe instead of yanking it home). Only a home arrival (the
-    // synthetic "Back home") sends focus back to the home pin — and the default
-    // stays home, which covers the at-home morning before the first stop and
-    // the wind-down after you're back. This is the fix for "placeless blocks
-    // reroute the map home" — the route line was always right; the camera wasn't.
+    // Track which anchor is in view: a located stop focuses its own pin; any
+    // placeless block (the at-home morning, cooking after the walk, the evening
+    // wind-down, the "Back home" arrival) focuses the home pin — so the map
+    // follows you back home exactly when the cards do.
     let stopId: string | null = home ? HOME_ID : null;
     for (const item of flatItems) {
       const off = itemOffsetsRef.current[item.id];
       if (off == null || off > probe) continue;
-      if (item.place?.coords) stopId = item.id;
-      else if (item.arrival && home) stopId = HOME_ID;
-      // else: placeless, non-arrival block → stay wherever you currently are.
+      stopId = item.place?.coords ? item.id : home ? HOME_ID : stopId;
     }
     if (stopId !== activeStopId) setActiveStopId(stopId);
   };
@@ -1711,22 +1722,13 @@ export default function ItineraryScreen() {
 
   const sections = itinerary?.sections ?? [];
 
-  // "Building" view = watching a background job (opened from the homepage
-  // skeleton). Renders the planning skeleton + rotating status until it lands.
-  const loadingView = buildingFromJob;
-  // The rotating status line, synced to the background job.
-  const activePhase = Math.min(
-    planJob?.phase ?? 0,
-    PLANNING_PHASES.length - 1,
-  );
-
   // The rail only makes sense once a real plan is on screen (not while the
   // prompt form or the loading skeleton is showing).
-  const showRail = !!itinerary && !loadingView;
+  const showRail = !!itinerary && !loading;
 
   // Expanded → the general AI trip title; collapsed → the section you're on
   // (so peeking at the drawer tells you where you are as you scroll).
-  const headerTitle = loadingView
+  const headerTitle = loading
     ? 'Planning your day'
     : !itinerary
     ? 'Plan your day'
@@ -1740,7 +1742,7 @@ export default function ItineraryScreen() {
   const startLabel = planStartLocation?.label ?? 'Current location';
   // The compact when/where controls + errands view share the "no plan yet"
   // state; once a plan exists the timeline + AdjustBar take over.
-  const showPlanLanding = !itinerary && !loadingView;
+  const showPlanLanding = !itinerary && !loading;
 
   return (
     <View style={[styles.container, { backgroundColor: t.colors.background }]}>
@@ -1767,20 +1769,20 @@ export default function ItineraryScreen() {
             <View style={styles.sheetHeader}>
               <View style={{ flex: 1 }}>
                 <Text variant="micro" tone="tertiary" uppercase weight="bold">
-                  {loadingView ? 'Planning' : 'Sandbox · v2'}
+                  {loading ? 'Planning' : 'Sandbox · v2'}
                 </Text>
                 <Text variant="title3" weight="bold" tight numberOfLines={1}>
                   {headerTitle}
                 </Text>
-                {loadingView ? (
-                  <Animated.View key={activePhase} entering={FadeIn.duration(220)}>
+                {loading ? (
+                  <Animated.View key={phase} entering={FadeIn.duration(220)}>
                     <Text variant="bodySm" tone="secondary" style={{ marginTop: 2 }}>
-                      {PLANNING_PHASES[activePhase]}
+                      {PLANNING_PHASES[phase]}
                     </Text>
                   </Animated.View>
                 ) : null}
               </View>
-              {loadingView ? (
+              {loading ? (
                 <ActivityIndicator color={t.colors.accent} />
               ) : routesRefining && itinerary ? (
                 // Background routing is in flight — the day is already on
@@ -1893,7 +1895,7 @@ export default function ItineraryScreen() {
           </View>
         </GestureDetector>
 
-        {rearrangeMode && itinerary && !loadingView ? (
+        {rearrangeMode && itinerary && !loading ? (
           <ReorderableList
             rows={reorderRows}
             onReorder={(orderedIds) => applyEdit({ type: 'reorder', orderedIds })}
@@ -1920,7 +1922,7 @@ export default function ItineraryScreen() {
           }}
           scrollEventThrottle={16}
         >
-          {loadingView ? (
+          {loading ? (
             <PlanningSkeleton />
           ) : !itinerary ? (
             <View style={styles.errandsWrap}>
@@ -2150,7 +2152,7 @@ export default function ItineraryScreen() {
           style={[
             styles.undoToast,
             {
-              bottom: insets.bottom + (sheetExpanded && itinerary && !loadingView ? 92 : 24),
+              bottom: insets.bottom + (sheetExpanded && itinerary && !loading ? 92 : 24),
               backgroundColor: t.colors.surface2,
               borderColor: t.colors.separator,
             },
@@ -2169,14 +2171,14 @@ export default function ItineraryScreen() {
         </Animated.View>
       ) : null}
 
-      {replanPrompt && itinerary && !loadingView && sheetExpanded ? (
+      {replanPrompt && itinerary && !loading && sheetExpanded ? (
         <ReplanChip
           text={replanPrompt}
           bottomInset={insets.bottom}
           onConfirm={confirmReplan}
           onDismiss={cancelReplan}
         />
-      ) : conflicts.length > 0 && itinerary && !loadingView && sheetExpanded ? (
+      ) : conflicts.length > 0 && itinerary && !loading && sheetExpanded ? (
         <ConflictBanner
           conflicts={conflicts}
           itinerary={itinerary}
@@ -2189,7 +2191,7 @@ export default function ItineraryScreen() {
       ) : null}
 
       <AdjustBar
-        visible={!!itinerary && !loadingView && sheetExpanded}
+        visible={!!itinerary && !loading && sheetExpanded}
         busy={editBusy}
         bottomInset={insets.bottom}
         onSubmit={submitAdjust}
@@ -2199,6 +2201,7 @@ export default function ItineraryScreen() {
           day is built the AdjustBar above replaces it. */}
       <PlanComposer
         visible={showPlanLanding}
+        busy={loading}
         placeholder="Describe your day — e.g. deep work, lunch with a friend, then drinks"
         onSubmit={(text) => planIt(text)}
       />

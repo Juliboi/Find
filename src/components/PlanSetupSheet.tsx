@@ -185,13 +185,8 @@ export function PlanSetupSheet({
     const found = initialDate ? fresh.findIndex((d) => d.iso === initialDate) : 0;
     const idx = found >= 0 ? found : 0;
     setDayIndex(idx);
-    // For TODAY, always seed the start to the live clock (which the dev-clock
-    // override drives) so "now" is correct after a midnight rollover or a
-    // fake-time change — never a stale start carried over from an earlier
-    // session. Future days keep the explicit pick or the configured default.
-    const seedTime = fresh[idx]?.isToday
-      ? roundedNowHHMM()
-      : (initialTime ?? dayStartTime);
+    const seedTime =
+      initialTime ?? (fresh[idx]?.isToday ? roundedNowHHMM() : dayStartTime);
     setStartTimeD(hhmmToDate(seedTime));
     setEndTimeD(hhmmToDate(bedTime ?? DEFAULT_DAY_END_TIME));
     setStep(initialStep);

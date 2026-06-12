@@ -15,7 +15,6 @@ import { Itinerary } from '@/types/itinerary';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import type { SchedulerContext } from '@/lib/ai/scheduler';
 import { sanitizeItinerary } from '@/lib/ai/itinerary';
-import { devNow } from '@/store/useDevClockStore';
 
 /**
  * Instant kill-switch. Set `EXPO_PUBLIC_DISABLE_ROUTING=1` in the .env (then
@@ -78,7 +77,6 @@ export interface RecomputeResult {
 export async function recomputeItinerary(
   itinerary: Itinerary,
   context?: SchedulerContext,
-  opts?: { optimize?: boolean },
 ): Promise<RecomputeResult> {
   if (ROUTING_DISABLED || !isSupabaseConfigured || !supabase) {
     return { itinerary, refreshed: false };
@@ -87,10 +85,6 @@ export async function recomputeItinerary(
     const body: Record<string, unknown> = { itinerary };
     const ctx = buildContextPayload(context);
     if (ctx) body.context = ctx;
-    // Fresh plans ask the backend to also reorder movable venue stops for the
-    // least-travel order. Edits/refreshes omit this so the user's arrangement
-    // is never reshuffled.
-    if (opts?.optimize) body.optimize = true;
     // Let the backend price transit/driving legs for their real departure slot.
     // The device zone is the right one for a "today" plan; guard in case a
     // runtime lacks full Intl tz support.
@@ -100,7 +94,7 @@ export async function recomputeItinerary(
     } catch {
       // no tz available — backend falls back to time-agnostic routing
     }
-    body.now = devNow().toISOString();
+    body.now = new Date().toISOString();
     const { data, error } = await supabase.functions.invoke('recompute-itinerary', {
       body,
     });

@@ -35,13 +35,6 @@ import {
   visitFitsHours,
   type VenueOpeningHours,
 } from '../_shared/hours.ts';
-import {
-  detourMeters,
-  distM,
-  isEverydayIntent,
-  midpoint,
-  scoreCandidate,
-} from '../_shared/venuePick.ts';
 
 // The planner needs Google Search grounding AND a large strict-JSON output in
 // one call. Gemini 2.5 Flash handles that combo reliably; lighter models do
@@ -161,9 +154,6 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                     'emoji',
                     'address',
                     'userQuery',
-                    'pinned',
-                    'searchQuery',
-                    'area',
                     'locationType',
                     'coords',
                   ],
@@ -173,14 +163,6 @@ const PLANNER_SCHEMA: Record<string, unknown> = {
                     emoji: { type: 'string' },
                     address: { type: 'string' },
                     userQuery: { type: 'string' },
-                    // true ONLY for an exact venue/address the user named (kept
-                    // verbatim); false/omitted when the model is self-picking.
-                    pinned: { type: 'boolean', nullable: true },
-                    // For a self-pick: the venue TYPE to search ("specialty
-                    // coffee shop") + the area it belongs in ("Karlín"). The
-                    // corridor picker resolves the actual on-route venue.
-                    searchQuery: { type: 'string' },
-                    area: { type: 'string' },
                     locationType: { type: 'string', enum: ['business', 'residence'] },
                     coords: {
                       type: 'object',
@@ -339,19 +321,6 @@ function nameSimilar(a: string, b: string): boolean {
   return union > 0 && inter / union >= 0.5;
 }
 
-// Parcel lockers / pickup points masquerade as the venue type in a Places
-// search — a "pharmacy" query surfaces a BENU "výdejní box", a "groceries" one
-// a Zásilkovna/Z-BOX/AlzaBox locker. You can't actually shop or pick up a
-// counter order there, so they must never win a self-pick. Tuned to known
-// CZ/SK locker brands + generic "pickup/parcel box" wording; deliberately does
-// NOT match a bare "box" (a CrossFit/bouldering "box" is a real gym).
-const PARCEL_LOCKER_RE =
-  /(v[ýy]dejn[íi]\s*(box|m[íi]sto|automat)|z[áa]silkovna|\bz-?box\b|alza\s?box|bal[íi]kovna|packeta|paczkomat|(parcel|pickup|package)\s*(box|shop|locker|point)|smart\s?box)/i;
-
-function isParcelLocker(name: string): boolean {
-  return !!name && PARCEL_LOCKER_RE.test(name);
-}
-
 function extractJsonObject(text: string): any | null {
   if (!text) return null;
   const fenced = text.replace(/```json\s*|\s*```/g, '');
@@ -487,24 +456,16 @@ function buildPlannerPrompt(args: {
   // Google Places validation pass, so we ask for approximate coords.
   const userQueryRule =
     ' WHENEVER the user names a venue or gives an address, you MUST set place.userQuery to their EXACT words for that place — verbatim, copied character-for-character from their request, NOT paraphrased (e.g. user wrote "visit mom at Kadaňská 837/18 dolní Chabry" → place.userQuery = "Kadaňská 837/18 dolní Chabry"; user wrote "hostinec u misku" → place.userQuery = "hostinec u misku"; "max fitness oc krakov" → place.userQuery = "max fitness oc krakov"). We geocode place.userQuery against Google Maps EXACTLY as the user typed it, so it is the single most important field — a paraphrased name like "Mom\'s House" geocodes to the WRONG place. Omit place.userQuery only for at-home items (which have no place at all).' +
-    ' ALSO set place.locationType: "business" for a public business or point of interest (restaurant, pub, gym, shop, museum, office, station) — we fetch its photo, rating and opening hours — or "residence" for a private home / someone\'s flat or address (e.g. visiting mom at her address, a friend\'s house) — we just pin its exact address and show no rating/photo. When unsure, default to "business". ALSO set place.pinned: true on any venue or address the USER named — it marks an EXACT pick we resolve verbatim and never substitute.';
+    ' ALSO set place.locationType: "business" for a public business or point of interest (restaurant, pub, gym, shop, museum, office, station) — we fetch its photo, rating and opening hours — or "residence" for a private home / someone\'s flat or address (e.g. visiting mom at her address, a friend\'s house) — we just pin its exact address and show no rating/photo. When unsure, default to "business".';
   // Opening-hours discipline: a venue the model picks ITSELF must be open for
   // the whole planned block at the scheduled time (accounting for how long the
   // activity takes). User-named venues are sacrosanct — kept verbatim even if
   // they might be closed (the app shows a "consider changing" notice instead).
   const hoursRule =
     ` OPENING HOURS (the day is ${args.date}): for any venue YOU choose yourself (the user did NOT name it), pick one that is OPEN for the ENTIRE planned time block at its scheduled start/end time — factor in how long the activity needs. Never self-select a venue that is closed or about to close at that time; choose an alternative that is open for the whole visit instead. EXCEPTION: if the user NAMED the venue or gave its address, keep it EXACTLY as written even if it might be closed — do NOT substitute it.`;
-  // Self-picked venues are no longer locked to one specific (often far) branch:
-  // the model emits a venue TYPE to search + the area it belongs in, and the
-  // corridor-aware picker downstream chooses the real, on-route venue — which
-  // is what stops a freshly planned day zig-zagging across the city.
-  const selfPickRule =
-    ' SELF-PICKED VENUES: when the user did NOT name a specific place (YOU are choosing it), or named only a BRAND/chain without a branch ("a Max Fitness", "a Billa"), do NOT commit to one specific branch. Set place.pinned: false, set place.searchQuery to the venue TYPE in 2–4 words ("specialty coffee shop", "24h pharmacy", "bouldering gym", "vegan lunch spot"), and set place.area to the neighbourhood it should sit in ("Karlín", "near Anděl"). Still include place.name (a real example you know) and approximate place.coords as a HINT for WHERE in the city it belongs — the app then resolves the real, on-route, currently-open venue near that area. Keep searchQuery generic enough to match several venues, never a single branch. ALWAYS emit this place block for ANY stop that physically happens at a venue — even a quick errand (pick up a prescription, grab a coffee, buy groceries); never leave such a stop with no place. CRUCIAL: the app swaps in the real branch AND recomputes the route to it, so anything you write naming a guessed branch will contradict the venue actually pinned. Keep the whole item generic: the TITLE, the DESCRIPTION, and any travel wording must refer to the spot by TYPE and relative position ("grab toothpaste at a pharmacy by the gym", "morning workout at the gym", "head to a café near the office") — do NOT put a specific shop, mall, branch, street or metro-stop name in the title, description, travel labels or transit steps for a self-picked/brand venue. When you must relate a self-picked stop to another stop, name that other stop BY ITS ROLE ("near the gym", "by the café", "close to the office") — NEVER by a neighbourhood, mall or street, because those other stops may themselves be app-picked and land elsewhere, so a named area in the prose contradicts the real route (e.g. write "grab toothpaste at a pharmacy near the gym", never "a pharmacy at OC Krakov").';
-  const areaOrderRule =
-    ' ROUTE SHAPE: order the located stops so the day flows through neighbourhoods coherently — cluster stops that are near each other and avoid crossing the city and doubling back. A tight, low-travel route matters more than a marginally better-known venue farther away.';
   const venueRule = args.grounded
-    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule + selfPickRule + areaOrderRule
-    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule + selfPickRule + areaOrderRule;
+    ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
+    : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
 
   const contextLines = [
     homeBlock,
@@ -551,7 +512,7 @@ REQUIREMENTS
 ${coverageRule}
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
 ${venueRule}
-5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg. PHONE / ADMIN ERRANDS — anything whose actual action is a call, text, email, online booking, reservation or scheduling ("call Bernard", "reserve a new therapy session", "book a table", "schedule a haircut") is done from wherever the user already is: treat it as AT-HOME and OMIT the "place" field. A place, clinic, neighbourhood or person mentioned in such an errand names WHAT it is about (which therapist, which restaurant) — it is NOT a destination to travel to, so never route the user there or emit a travel leg for it.
+5. AT-HOME activities (wake & prep, breakfast, cooking, showering, languages/reading at home, sleep) HAPPEN AT HOME. For these items, OMIT the "place" field entirely — do NOT emit "place": { "name": "Home", ... } or anything similar. The card will use the title and the user's home pin. Same rule for the implicit return-home leg.
 6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
@@ -584,9 +545,6 @@ Output ONLY a single JSON object, no prose, no markdown fences. Match this schem
             "emoji": "🏋️",
             "address": "Lodžská 850/6, Prague 8",
             "userQuery": "max fitness oc krakov",
-            "pinned": true,
-            "searchQuery": "gym",
-            "area": "Prague 8",
             "locationType": "business",
             "rating": 4.6,
             "coords": { "latitude": 50.13, "longitude": 14.42 }
@@ -1138,149 +1096,6 @@ function openStatusFromBool(b: boolean | null): string | null {
 }
 
 /**
- * Picks the best REAL venue for a flexible stop (an AI self-pick, or a brand
- * the user named without a branch) by staying ON-CORRIDOR: it searches the
- * category/brand biased to the midpoint between the surrounding anchors, then
- * scores each candidate by detour (extra travel added to the day), rating,
- * review volume and whether it's open for the SCHEDULED window — the same math
- * the manual swap browser uses. This is the fix for venues scattering across
- * the city: a gym + a pharmacy now land between the stops that bracket them
- * instead of wherever the model first thought of.
- *
- * `brandFilter`, when set, restricts candidates to the named brand so we pick
- * its on-route branch rather than swapping the brand out. Returns null when
- * nothing suitable turns up, so the caller can fall back to a plain lookup.
- */
-async function pickOnCorridor(args: {
-  searchQuery: string;
-  intent: string;
-  brandFilter?: string | null;
-  prevAnchor?: Coords | null;
-  nextAnchor?: Coords | null;
-  areaHint?: Coords | null;
-  home: Coords | null;
-  city: string | null;
-  apiKey: string;
-  dateISO: string;
-  startHHMM: string;
-  endHHMM?: string | null;
-}): Promise<EnrichedRecord | null> {
-  const base = (args.searchQuery ?? '').trim();
-  if (!base) return null;
-  const query =
-    args.city && !base.toLowerCase().includes(args.city.toLowerCase())
-      ? `${base}, ${args.city}`
-      : base;
-
-  // Seed the search somewhere sane, then bias to the corridor midpoint when we
-  // know the brackets — mirrors find-places' route-aware locationBias.
-  const seed = args.areaHint ?? args.home ?? args.prevAnchor ?? args.nextAnchor ?? null;
-  if (!seed) return null;
-  const prev = args.prevAnchor ?? null;
-  const next = args.nextAnchor ?? null;
-  const clamp = (m: number) => Math.min(10000, Math.max(800, Math.round(m)));
-  let biasCenter: Coords = seed;
-  let radius = 4000;
-  if (prev && next) {
-    biasCenter = midpoint(prev, next);
-    radius = clamp(Math.max(radius, distM(prev, next) / 2 + 1200));
-  } else if (prev) {
-    biasCenter = midpoint(prev, seed);
-    radius = clamp(Math.max(radius, distM(prev, seed) / 2 + 1200));
-  } else if (next) {
-    biasCenter = midpoint(next, seed);
-    radius = clamp(Math.max(radius, distM(next, seed) / 2 + 1200));
-  }
-
-  const candidates = await searchPlaceCandidates(query, biasCenter, radius, args.apiKey, 15);
-  if (candidates.length === 0) return null;
-
-  const everyday = isEverydayIntent(args.intent, [base]);
-  const brand = args.brandFilter?.trim() || null;
-  const homeC = args.home;
-
-  const scored = candidates
-    .map((c, i) => {
-      const coords: Coords = { latitude: c.latitude, longitude: c.longitude };
-      const detourM = detourMeters(prev, next, coords);
-      const fit = visitFitsHours(c.openingHours, args.dateISO, args.startHHMM, args.endHHMM);
-      return {
-        c,
-        coords,
-        status: fit.status,
-        fits: fit.fits,
-        score: scoreCandidate({
-          bestPosition: i,
-          place: {
-            distanceM: homeC ? Math.round(distM(homeC, coords)) : 0,
-            rating: c.rating,
-            ratingCount: c.ratingCount,
-            // Open state AT THE PLANNED VISIT TIME (from visitFitsHours), never
-            // Google's live "open right now" flag — otherwise the real wall
-            // clock, not the day being planned, would nudge venue ranking.
-            openNow:
-              fit.status === 'closed' ? false : fit.status === 'open' ? true : null,
-          },
-          radiusM: radius,
-          everyday,
-          detourM,
-        }),
-      };
-    });
-  // Drop the unusable: parcel lockers / pickup boxes (you can't shop there),
-  // visibly-bad ratings, and the implausibly-far (a same-named venue resolved
-  // in the wrong city).
-  // Quality floor: for everyday commodity errands (pharmacy, grocery, café) the
-  // nearby low-rated chain is exactly what you want — proximity beats stars, so
-  // only screen out the genuinely awful. Destinations you travel to (gym,
-  // museum) keep a real bar. A Dr.Max at 3.0★ next door must NOT lose to a 4.5★
-  // pharmacy 40 min across town.
-  const ratingFloor = everyday ? 2.5 : 3.8;
-  const notLockerOrFar = (x) =>
-    !isParcelLocker(x.c.name) &&
-    !(homeC && haversineMeters(x.coords, homeC) > MAX_PLAUSIBLE_VENUE_M);
-  let viable = scored.filter(
-    (x) => notLockerOrFar(x) && !(x.c.rating != null && x.c.rating < ratingFloor),
-  );
-  // If the quality bar emptied the (route-aware) pool, keep the on-corridor
-  // candidates anyway rather than returning null — null drops the stop to the
-  // non-route-aware home lookup, which is how the pharmacy ended up 40 min away.
-  if (viable.length === 0) viable = scored.filter(notLockerOrFar);
-  // Prefer the user-named brand's on-route branch — but if NONE of its branches
-  // surfaced on this corridor, fall back to the best real venue of the same
-  // TYPE rather than returning null. Returning null drops the stop to the
-  // caller's home-biased lookup of the model's guess, which is exactly how a
-  // gym ended up "pinned at home"; a real on-corridor venue is what the user
-  // asked for ("anywhere, as long as it fits the route and is a real place").
-  const branded = brand ? viable.filter((x) => nameSimilar(x.c.name, brand)) : viable;
-  const eligible = branded.length > 0 ? branded : viable;
-  if (eligible.length === 0) return null;
-
-  // Prefer venues open for the WHOLE visit; never let unknown hours exclude a
-  // candidate. Drop only the definitively-closed unless that's all we have.
-  const usable = eligible.filter((x) => x.status !== 'closed');
-  const pool = usable.length > 0 ? usable : eligible;
-  pool.sort((a, b) => {
-    if (a.fits !== b.fits) return a.fits ? -1 : 1;
-    return b.score - a.score;
-  });
-  const best = pool[0].c;
-
-  const photoUrl = await resolvePhotoUrl(best.photoName, args.apiKey);
-  return {
-    name: best.name,
-    address: best.address,
-    rating: best.rating,
-    ratingCount: best.ratingCount,
-    photoUrl,
-    openNow: best.openNow,
-    openingHours: best.openingHours,
-    latitude: best.latitude,
-    longitude: best.longitude,
-  };
-}
-
-/**
  * Walks the parsed itinerary and merges Google Places fields into every
  * unique venue the model returned. Skips:
  *   - items with no place block (at-home / break items the model wisely omits)
@@ -1318,35 +1133,13 @@ async function enrichItinerary(
     /** Venue type the model assigned ("Czech restaurant"), used to re-pick. */
     category: string;
   }
-  // A unique venue + everything needed to place it on-corridor.
-  interface VenueGroup {
-    slots: Slot[];
-    /** Position of the group's first item in day order — its bracket point. */
-    order: number;
-    /** pinned = user named an EXACT place/address → resolve verbatim + anchor.
-     *  flexible = an AI self-pick or a brand/type → corridor-aware pick. */
-    pinned: boolean;
-    /** What to search for when picking a flexible venue. */
-    searchQuery: string;
-    /** Restrict candidates to this brand when the user named a brand, not a
-     *  specific branch ("a Max Fitness") — we then pick the on-route branch. */
-    brandFilter: string | null;
-    /** The model's approximate coord, used to seed the search area. */
-    areaHint: Coords | null;
-    /** Free-text goal, drives everyday-vs-destination distance sensitivity. */
-    intent: string;
-    /** Resolved venue (filled below); its coords act as an anchor for pinned. */
-    record: EnrichedRecord | null;
-  }
-  const groupsByKey = new Map<string, VenueGroup>();
+  const slotsByKey = new Map<string, Slot[]>();
   const keyOf = (label: string, c: Coords | null) =>
     `${normaliseName(label)}|${c ? `${c.latitude.toFixed(3)},${c.longitude.toFixed(3)}` : 'addr'}`;
 
-  let order = 0;
   for (const section of parsed.sections) {
     if (!section || !Array.isArray(section.items)) continue;
     for (const item of section.items) {
-      const pos = order++;
       const p = item?.place;
       if (!p || typeof p !== 'object') continue;
       const name = typeof p.name === 'string' ? p.name.trim() : '';
@@ -1354,7 +1147,6 @@ async function enrichItinerary(
       const userQuery = typeof p.userQuery === 'string' ? p.userQuery.trim() : '';
       const locationType = typeof p.locationType === 'string' ? p.locationType.trim().toLowerCase() : '';
       const category = typeof p.category === 'string' ? p.category.trim() : '';
-      const searchQueryHint = typeof p.searchQuery === 'string' ? p.searchQuery.trim() : '';
       const startTime = typeof item.startTime === 'string' ? item.startTime : '';
       const endTime = typeof item.endTime === 'string' ? item.endTime : '';
       const durationMinutes = Number.isFinite(Number(item.durationMinutes))
@@ -1380,215 +1172,124 @@ async function enrichItinerary(
         continue;
       }
 
-      const slot: Slot = {
-        item, name, address, userQuery, locationType, coords,
-        startTime, endTime, durationMinutes, category,
-      };
       const k = keyOf(userQuery || name || address, coords);
-      let group = groupsByKey.get(k);
-      if (!group) {
-        // Classify the venue. The model's `pinned` flag is authoritative when
-        // present; absent (legacy / first pass) we keep the SAFE default — a
-        // user-named venue stays verbatim, an AI self-pick becomes flexible so
-        // it gets chosen on-corridor instead of wherever the model guessed.
-        const userNamed = !!userQuery;
-        const pinnedFlag = p.pinned === true ? true : p.pinned === false ? false : null;
-        const pinned = pinnedFlag === true || (pinnedFlag == null && userNamed);
-        const brandFilter = !pinned && userNamed ? name || userQuery : null;
-        const searchQuery = pinned
-          ? userQuery || name || address
-          : brandFilter
-            ? userQuery || name
-            : searchQueryHint || category || name;
-        group = {
-          slots: [],
-          order: pos,
-          pinned,
-          searchQuery,
-          brandFilter,
-          areaHint: coords,
-          intent: `${typeof item?.title === 'string' ? item.title : ''} ${category} ${searchQuery}`.trim(),
-          record: null,
-        };
-        groupsByKey.set(k, group);
-      }
-      group.slots.push(slot);
-    }
-  }
-
-  const groups = Array.from(groupsByKey.values());
-  if (groups.length === 0) return;
-
-  // 1) Resolve the PINNED venues (exact user picks) first — together with home
-  //    they are the anchors a flexible pick brackets its corridor against.
-  await Promise.all(
-    groups
-      .filter((g) => g.pinned)
-      .map(async (g) => {
-        const rep = g.slots[0];
-        const center = rep.coords ?? homeC;
-        if (!center) return;
-        g.record = await lookupGooglePlace({
-          name: rep.name,
-          address: rep.address,
-          userQuery: rep.userQuery,
-          locationType: rep.locationType,
-          center,
-          home: homeC,
-          city,
-          apiKey,
-        });
-      }),
-  );
-
-  // 2) Ordered anchor list: home brackets each end, resolved pinned venues sit
-  //    at their day position. A flexible stop reads the nearest anchor on each
-  //    side to define the corridor it must stay on.
-  interface Anchor {
-    order: number;
-    coords: Coords;
-  }
-  const anchors: Anchor[] = [];
-  if (homeC) {
-    anchors.push({ order: -1, coords: homeC });
-    anchors.push({ order: Number.MAX_SAFE_INTEGER, coords: homeC });
-  }
-  for (const g of groups) {
-    if (g.pinned && g.record) {
-      anchors.push({
-        order: g.order,
-        coords: { latitude: g.record.latitude, longitude: g.record.longitude },
+      if (!slotsByKey.has(k)) slotsByKey.set(k, []);
+      slotsByKey.get(k)!.push({
+        item,
+        name,
+        address,
+        userQuery,
+        locationType,
+        coords,
+        startTime,
+        endTime,
+        durationMinutes,
+        category,
       });
     }
   }
-  const anchorBefore = (pos: number): Coords | null => {
-    let best: Anchor | null = null;
-    for (const a of anchors) if (a.order < pos && (!best || a.order > best.order)) best = a;
-    return best?.coords ?? null;
-  };
-  const anchorAfter = (pos: number): Coords | null => {
-    let best: Anchor | null = null;
-    for (const a of anchors) if (a.order > pos && (!best || a.order < best.order)) best = a;
-    return best?.coords ?? null;
-  };
 
-  // 3) Resolve FLEXIBLE venues on-corridor, in parallel — each depends only on
-  //    anchors (already resolved). If the corridor search comes up empty we
-  //    fall back to the plain home-biased lookup + closed→open re-pick so the
-  //    stop still lands on a real, open venue.
+  if (slotsByKey.size === 0) return;
+
+  // One lookup per unique venue, in parallel.
   await Promise.all(
-    groups
-      .filter((g) => !g.pinned)
-      .map(async (g) => {
-        const rep = g.slots[0];
-        const repEnd = visitEndHHMM(rep.startTime, rep.endTime, rep.durationMinutes);
-        g.record = await pickOnCorridor({
-          searchQuery: g.searchQuery,
-          intent: g.intent,
-          brandFilter: g.brandFilter,
-          prevAnchor: anchorBefore(g.order),
-          nextAnchor: anchorAfter(g.order),
-          areaHint: g.areaHint,
-          home: homeC,
-          city,
-          apiKey,
-          dateISO,
-          startHHMM: rep.startTime,
-          endHHMM: repEnd,
-        });
-        if (g.record) return;
-        const center = rep.coords ?? homeC;
-        if (!center) return;
-        let record = await lookupGooglePlace({
-          name: rep.name,
-          address: rep.address,
-          userQuery: rep.userQuery,
-          locationType: rep.locationType,
-          center,
-          home: homeC,
-          city,
-          apiKey,
-        });
-        if (record && homeC) {
-          const fit = visitFitsHours(record.openingHours, dateISO, rep.startTime, repEnd);
-          if (fit.status === 'closed' || fit.status === 'closingSoon') {
-            const alt = await findOpenAlternative({
-              category: rep.category || rep.item?.title || record.name,
-              excludeName: record.name,
-              home: homeC,
-              city,
-              apiKey,
-              dateISO,
-              startHHMM: rep.startTime,
-              endHHMM: repEnd,
-            });
-            if (alt) record = alt;
+    Array.from(slotsByKey.values()).map(async (slots) => {
+      const { name, address, userQuery, locationType, coords } = slots[0];
+      const center = coords ?? homeC;
+      if (!center) return; // no anchor to bias the search to
+      let record = await lookupGooglePlace({
+        name,
+        address,
+        userQuery,
+        locationType,
+        center,
+        home: homeC,
+        city,
+        apiKey,
+      });
+      // Compact resolution trace — read via `supabase functions logs
+      // plan-itinerary`. Shows what the model gave us (userQuery / name /
+      // address) and what Google matched, so a bad geocode is one line away.
+      console.log(
+        `[enrich] type=${locationType || '?'} uq=${JSON.stringify(userQuery)} ` +
+          `name=${JSON.stringify(name)} addr=${JSON.stringify(address)} → ` +
+          (record
+            ? `${record.name} @${record.latitude.toFixed(4)},${record.longitude.toFixed(4)}` +
+              (homeC
+                ? ` (${Math.round(
+                    haversineMeters({ latitude: record.latitude, longitude: record.longitude }, homeC) /
+                      1000,
+                  )}km from home)`
+                : '')
+            : 'NO MATCH'),
+      );
+      if (!record) {
+        // Couldn't verify the venue. A model coord that sits absurdly far from
+        // home is almost certainly hallucinated (the "routed 61 km away" bug) —
+        // drop it so routing doesn't draw a phantom cross-country leg; the stop
+        // falls back to unlocated instead of teleporting the whole day.
+        if (homeC && coords && haversineMeters(coords, homeC) > MAX_PLAUSIBLE_VENUE_M) {
+          for (const { item } of slots) {
+            if (item.place && typeof item.place === 'object') item.place.coords = undefined;
           }
         }
-        g.record = record;
-      }),
-  );
-
-  // 4) Merge the resolved venue back onto every item in each group.
-  for (const g of groups) {
-    const rep = g.slots[0];
-    const record = g.record;
-    if (!record) {
-      // Couldn't verify the venue. Drop the model's coord when keeping it would
-      // mislead: (a) it sits absurdly far from home (the "routed 61 km away"
-      // hallucination) so routing won't draw a phantom cross-country leg; or
-      // (b) it's a venue WE were meant to pick (not a user-pinned address) yet
-      // the guess sits right on top of home — that renders as a "gym pinned at
-      // home" phantom. Either way the stop falls back to unlocated instead.
-      const c = rep.coords;
-      const farAway = !!(homeC && c && haversineMeters(c, homeC) > MAX_PLAUSIBLE_VENUE_M);
-      const onTopOfHome = !!(homeC && c && !g.pinned && haversineMeters(c, homeC) < 150);
-      if (farAway || onTopOfHome) {
-        for (const { item } of g.slots) {
-          if (item.place && typeof item.place === 'object') item.place.coords = undefined;
+        return;
+      }
+      // Opening-hours awareness. A venue the user NAMED (userQuery set) is kept
+      // verbatim even if it's closed at the visit time — the card shows a
+      // "consider changing" notice. A venue the AI chose ITSELF that won't be
+      // open for the whole planned block is swapped for an open same-category
+      // alternative near home; if none is found we keep it (the card warns).
+      const userNamed = !!userQuery;
+      const repStart = slots[0].startTime;
+      const repEnd = visitEndHHMM(repStart, slots[0].endTime, slots[0].durationMinutes);
+      if (!userNamed && homeC) {
+        const fit = visitFitsHours(record.openingHours, dateISO, repStart, repEnd);
+        if (fit.status === 'closed' || fit.status === 'closingSoon') {
+          const alt = await findOpenAlternative({
+            category: slots[0].category || slots[0].item?.title || record.name,
+            excludeName: record.name,
+            home: homeC,
+            city,
+            apiKey,
+            dateISO,
+            startHHMM: repStart,
+            endHHMM: repEnd,
+          });
+          if (alt) {
+            console.log(
+              `[hours] re-picked AI venue ${JSON.stringify(record.name)} (${fit.status}) → ` +
+                `${JSON.stringify(alt.name)} for ${repStart}-${repEnd || '?'}`,
+            );
+            record = alt;
+          }
         }
       }
-      continue;
-    }
-    // Only an EXACT user pick stays "userNamed" (kept verbatim, no swap nudge).
-    // A brand we resolved to a specific branch is an app choice, not flagged.
-    const userNamed = g.pinned && !!rep.userQuery;
-    // Compact resolution trace — read via `supabase functions logs
-    // plan-itinerary`: what we searched and where Google landed it, so a
-    // scattered pick is one line away.
-    console.log(
-      `[enrich] ${g.pinned ? 'pinned' : 'flexible'} q=${JSON.stringify(g.searchQuery)}` +
-        (g.brandFilter ? ` brand=${JSON.stringify(g.brandFilter)}` : '') +
-        ` → ${record.name} @${record.latitude.toFixed(4)},${record.longitude.toFixed(4)}` +
-        (homeC
-          ? ` (${Math.round(
-              haversineMeters({ latitude: record.latitude, longitude: record.longitude }, homeC) / 1000,
-            )}km from home)`
-          : ''),
-    );
-    for (const { item, startTime, endTime, durationMinutes } of g.slots) {
-      const hint = item.place && typeof item.place === 'object' ? item.place : {};
-      const endForItem = visitEndHHMM(startTime, endTime, durationMinutes);
-      // Scheduled-time status string ("Open · Closes 6:00 PM" / "Closed at
-      // this time"). Falls back to the live openNow flag when hours are
-      // unknown (e.g. a residence or a venue Google has no hours for).
-      const scheduledStatus =
-        openStatusForVisit(record.openingHours, dateISO, startTime, endForItem) ??
-        openStatusFromBool(record.openNow);
-      item.place = {
-        ...hint,
-        name: record.name,
-        address: record.address ?? hint.address ?? null,
-        rating: record.rating ?? (typeof hint.rating === 'number' ? hint.rating : null),
-        ratingCount: record.ratingCount,
-        openStatus: scheduledStatus ?? undefined,
-        openingHours: record.openingHours ?? undefined,
-        userNamed: userNamed || undefined,
-        photoUrl: record.photoUrl,
-        coords: { latitude: record.latitude, longitude: record.longitude },
-      };
-    }
-  }
+
+      for (const { item, startTime, endTime, durationMinutes } of slots) {
+        const hint = item.place && typeof item.place === 'object' ? item.place : {};
+        const endForItem = visitEndHHMM(startTime, endTime, durationMinutes);
+        // Scheduled-time status string ("Open · Closes 6:00 PM" / "Closed at
+        // this time"). Falls back to the live openNow flag when hours are
+        // unknown (e.g. a residence or a venue Google has no hours for).
+        const scheduledStatus =
+          openStatusForVisit(record.openingHours, dateISO, startTime, endForItem) ??
+          openStatusFromBool(record.openNow);
+        item.place = {
+          ...hint,
+          name: record.name,
+          address: record.address ?? hint.address ?? null,
+          rating: record.rating ?? (typeof hint.rating === 'number' ? hint.rating : null),
+          ratingCount: record.ratingCount,
+          openStatus: scheduledStatus ?? undefined,
+          openingHours: record.openingHours ?? undefined,
+          userNamed: userNamed || undefined,
+          photoUrl: record.photoUrl,
+          coords: { latitude: record.latitude, longitude: record.longitude },
+        };
+      }
+    }),
+  );
 }
 
 const HOME_NAME_RE = /^(home|my home|house|residence)$/i;

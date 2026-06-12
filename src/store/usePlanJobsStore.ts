@@ -260,9 +260,9 @@ export const usePlanJobsStore = create<PlanJobsState>((set, get) => {
                 }
               : null,
           };
-          const refreshed = await recomputeItinerary(itin, routeCtx, {
-            optimize: true,
-          }).catch(() => null);
+          const refreshed = await recomputeItinerary(itin, routeCtx).catch(
+            () => null,
+          );
           if (refreshed?.refreshed) {
             useSavedItineraries.getState().update(savedId, refreshed.itinerary);
             const updated = useSavedItineraries

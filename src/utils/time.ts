@@ -1,5 +1,3 @@
-import { devNow } from '@/store/useDevClockStore';
-
 export function formatTime(hhmm?: string): string {
   if (!hhmm) return '';
   const [hStr, mStr] = hhmm.split(':');
@@ -38,7 +36,7 @@ export function formatDuration(minutes: number): string {
 }
 
 export function todayISO(): string {
-  const d = devNow();
+  const d = new Date();
   const y = d.getFullYear();
   const m = (d.getMonth() + 1).toString().padStart(2, '0');
   const day = d.getDate().toString().padStart(2, '0');
@@ -47,7 +45,7 @@ export function todayISO(): string {
 
 /** Local "YYYY-MM-DD" for tomorrow. */
 export function tomorrowISO(): string {
-  const d = devNow();
+  const d = new Date();
   d.setDate(d.getDate() + 1);
   const y = d.getFullYear();
   const m = (d.getMonth() + 1).toString().padStart(2, '0');
@@ -56,7 +54,7 @@ export function tomorrowISO(): string {
 }
 
 export function currentHHMM(): string {
-  const d = devNow();
+  const d = new Date();
   return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes()
     .toString()
     .padStart(2, '0')}`;
