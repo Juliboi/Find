@@ -1,30 +1,37 @@
 // Supabase Edge Function: plan-itinerary
 //
-// The "v2" planning architecture, server-side.
+// The ERRAND-ANCHORED planning architecture, server-side. The AI is the brain
+// that ARRANGES the user's real errands into a day — it does NOT invent a day
+// from a prose description. Errands are the stable backbone:
 //
-//   1. ONE grounded Gemini call (Gemini + Google Search) takes the user's
-//      free-form description of a day and returns the WHOLE itinerary
-//      (sections, items, time blocks, venues, approximate travel legs) in
-//      a single pass — using Google Search to ground real venue names,
-//      addresses, and ratings near the user's home.
-//   2. A per-unique-venue Google Places lookup backfills the data Gemini
-//      can't return: an auth-free CDN photo URL, the canonical place
-//      coordinates, ratingCount, and an "Open now / Closed now" hint.
-//      At-home activities (the model emits no place block for those) and
-//      the home venue itself are skipped so we never resolve "Home" to
-//      some random nearby building.
+//   1. ONE Gemini call arranges the day:
+//        - ANCHORS (already-located errands) are placed VERBATIM — never
+//          renamed, moved, swapped, or re-discovered. They drive the order.
+//        - TASKS (unplaced errands) are scheduled; the model names a real
+//          venue only for the place-y ones (a workout, a coffee out, focused
+//          work at a café), and leaves pure tasks (a call, admin) place-less.
+//        - INTENT (the free-text box) is treated as STYLE/NOTES, not a day to
+//          generate — UNLESS there are no errands at all, in which case it's a
+//          full "plan me a day" request and we discover venues for it.
+//      Errand-driven days run in cheap SCHEMA mode (no Google Search); we only
+//      turn ON grounding for a no-errand request or when the notes explicitly
+//      ask to find/discover somewhere.
+//   2. A per-unique-venue Google Places lookup backfills photo URL, canonical
+//      coords, ratingCount, and an open/closed hint. ANCHORS skip the lookup
+//      (their resolved coords/metadata are trusted); at-home items and the home
+//      venue itself are skipped so we never resolve "Home" to a random building.
+//
+// Routing (real door-to-door legs + the clock cascade) is NOT done here — the
+// client runs it afterward via the recompute-itinerary function.
 //
 // Request body:
-//   { request: string, date?: "YYYY-MM-DD", now?: "HH:MM", fast?: boolean,
+//   { date?: "YYYY-MM-DD", now?: "HH:MM", fast?: boolean,
 //     context?: { home?: { latitude, longitude, label }, ... },
-//     fixedStops?: FixedStop[],   // already-located errands to compose verbatim
-//     compose?: boolean }         // Phase 6: build ONLY from fixedStops, no
-//                                 // discovery → no grounding, cheapest model.
-//
-// Compose mode (compose:true + fixedStops): the model only orders/times/
-// describes the pre-located stops and fills gaps — it never invents venues, so
-// we skip Google Search grounding (schema mode, cheapest model) and skip the
-// per-venue Places lookup for those stops. This is the cost/reliability win.
+//     anchors?: Anchor[],   // located errands, placed verbatim (a.k.a. fixedStops)
+//     tasks?: Task[],        // unplaced errands the planner schedules
+//     intent?: string,       // free-text style/notes (or the whole request when
+//                            // there are no errands); legacy alias: `request`
+//     dayStart?: { time?, label? }, dayEnd?: { time?, label? } }
 //
 // Response body: an Itinerary object (see src/types/itinerary.ts).
 //
@@ -72,14 +79,14 @@ const DEFAULT_FAST_GEMINI_MODEL = 'gemini-3.1-flash-lite';
 const CONFIGURED_FAST_GEMINI_MODEL =
   Deno.env.get('GEMINI_FAST_MODEL') ?? DEFAULT_FAST_GEMINI_MODEL;
 
-// Compose mode (Phase 6) — the day is built from PRE-PLANNED, already-located
-// stops (resolved errands), so the planner only ORDERS / TIMES / DESCRIBES them
-// and fills the gaps; it never discovers venues. With no discovery there's no
-// need for Google Search grounding, so compose always runs in schema mode —
-// where even the cheapest lite model emits reliable JSON (grounding is what made
-// lite models drift empty). This is the cost/reliability win: cheapest + fastest
-// model, no grounding, no per-venue Places lookups. Override with
-//   supabase secrets set GEMINI_COMPOSE_MODEL=gemini-2.5-flash
+// Arrange-only model — an errand day whose stops are ALL already located
+// (anchors, no venue-finding tasks) is pure arrangement: the planner only
+// ORDERS / TIMES / DESCRIBES the located stops and adds connective tissue, so
+// there's nothing to discover and no need for Google Search grounding. It runs
+// in schema mode where even the cheapest lite model emits reliable JSON
+// (grounding is what made lite models drift empty). This is the cost/reliability
+// win: cheapest + fastest model, no grounding, no per-venue Places lookups.
+// Override with: supabase secrets set GEMINI_COMPOSE_MODEL=gemini-2.5-flash
 const DEFAULT_COMPOSE_GEMINI_MODEL = 'gemini-2.5-flash-lite';
 const CONFIGURED_COMPOSE_GEMINI_MODEL =
   Deno.env.get('GEMINI_COMPOSE_MODEL') ?? DEFAULT_COMPOSE_GEMINI_MODEL;
@@ -103,6 +110,14 @@ const CONFIGURED_COMPOSE_GEMINI_MODEL =
 //   supabase secrets set GEMINI_MODEL=gemini-2.5-flash-lite
 const GROUNDING_ENABLED =
   (Deno.env.get('GEMINI_GROUNDING') ?? 'on').toLowerCase() !== 'off';
+
+// On an errand-driven day we stay in cheap schema mode UNLESS the user's notes
+// explicitly ask the planner to FIND / DISCOVER a place — only then do we turn
+// on Google Search grounding. Kept deliberately tight (discovery verbs, not
+// every venue noun) so a note like "have a relaxed day" doesn't needlessly
+// trigger the slow grounded path.
+const INTENT_DISCOVERY_RE =
+  /\b(find|finds|discover|recommend|suggest|explore|somewhere|some place|a place|trendy|hidden gem)\b/i;
 
 // responseSchema used in schema mode. A subset of OpenAPI types (the shape
 // Gemini structured-output accepts). Mirrors the Itinerary the client expects;
@@ -285,10 +300,12 @@ interface Context {
 }
 
 /**
- * A stop the user has ALREADY located (a placed errand, or an auto-place errand
- * the client resolved before planning). The planner places these verbatim and
- * never discovers them, and enrichment uses their trusted coords/metadata
- * directly instead of a Google Places lookup. See Phase 6 (compose mode).
+ * An ANCHOR: an errand the user has ALREADY located (a placed errand, or an
+ * auto-place errand the client resolved before planning). Anchors are the
+ * backbone of the day — the planner places each verbatim (never re-discovers,
+ * renames, or moves it) and builds the day's order + travel around them.
+ * Enrichment uses their trusted coords/metadata directly instead of a Google
+ * Places lookup. (Wire-compatible with the legacy `fixedStops` payload.)
  */
 interface FixedStop {
   /** What the user is doing here, e.g. "Pick up prescription". */
@@ -301,12 +318,43 @@ interface FixedStop {
   endTime?: string;
   durationMin?: number;
   notes?: string;
+  /** "business" (public venue — show rating/photo) or "residence" (private
+   * address — just a pin). Defaults to business when omitted. */
+  locationType?: 'business' | 'residence';
   /** Pre-resolved venue metadata (from when the errand's place was picked) so
    * enrichment can skip Google entirely. */
   photoUrl?: string;
   rating?: number;
   ratingCount?: number;
   openingHours?: VenueOpeningHours;
+}
+
+/**
+ * A TASK: an errand the user wants in the day that is NOT yet located — a phone
+ * call, "deep work", a gym session with no venue picked. The planner schedules
+ * it, and decides whether it needs a venue: place-y tasks (a workout, a coffee
+ * out, focused work better done at a café) get a real model-named venue that
+ * the Google Places pass then validates; pure tasks (a call, admin, reading at
+ * home) get no place at all.
+ */
+interface Task {
+  title: string;
+  startTime?: string;
+  endTime?: string;
+  durationMin?: number;
+  notes?: string;
+  /** The client KNOWS this needs a place (e.g. an unresolved auto-place errand);
+   * the planner must attach a suitable venue. When false/omitted the planner
+   * decides for itself based on what the task is. */
+  wantsVenue?: boolean;
+  /** Hint for the KIND of place to find ("quiet café", "gym"), when known. */
+  placeQuery?: string;
+}
+
+/** One edge of the day frame — where/when the day starts or should finish. */
+interface DayEdge {
+  time?: string;
+  label?: string;
 }
 
 // ----------------------------------------------------------- HTTP helpers
@@ -507,6 +555,9 @@ function normalizeFixedStops(input: any): FixedStop[] {
     const dur = Number(raw.durationMin);
     if (Number.isFinite(dur) && dur > 0 && dur <= 1440) stop.durationMin = Math.round(dur);
     if (typeof raw.notes === 'string' && raw.notes.trim()) stop.notes = raw.notes.trim().slice(0, 300);
+    if (raw.locationType === 'business' || raw.locationType === 'residence') {
+      stop.locationType = raw.locationType;
+    }
     if (typeof raw.photoUrl === 'string' && raw.photoUrl.trim()) stop.photoUrl = raw.photoUrl.trim();
     const rating = Number(raw.rating);
     if (Number.isFinite(rating) && rating >= 0 && rating <= 5) stop.rating = rating;
@@ -521,17 +572,64 @@ function normalizeFixedStops(input: any): FixedStop[] {
   return out;
 }
 
+/**
+ * Shapes the request's `tasks` into validated {@link Task}s. A task needs only a
+ * title; everything else is optional. Caps the list so a runaway client can't
+ * balloon the prompt.
+ */
+function normalizeTasks(input: any): Task[] {
+  if (!Array.isArray(input)) return [];
+  const out: Task[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const title =
+      typeof raw.title === 'string' && raw.title.trim()
+        ? raw.title.trim().slice(0, 160)
+        : '';
+    if (!title) continue;
+    const task: Task = { title };
+    if (isHHMM(raw.startTime)) task.startTime = raw.startTime;
+    if (isHHMM(raw.endTime)) task.endTime = raw.endTime;
+    const dur = Number(raw.durationMin);
+    if (Number.isFinite(dur) && dur > 0 && dur <= 1440) task.durationMin = Math.round(dur);
+    if (typeof raw.notes === 'string' && raw.notes.trim()) task.notes = raw.notes.trim().slice(0, 300);
+    if (raw.wantsVenue === true) task.wantsVenue = true;
+    if (typeof raw.placeQuery === 'string' && raw.placeQuery.trim()) {
+      task.placeQuery = raw.placeQuery.trim().slice(0, 120);
+    }
+    out.push(task);
+    if (out.length >= 25) break;
+  }
+  return out;
+}
+
+/** Validates one edge of the day frame (`dayStart` / `dayEnd`). */
+function normalizeDayEdge(input: any): DayEdge | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const edge: DayEdge = {};
+  if (isHHMM(input.time)) edge.time = input.time;
+  if (typeof input.label === 'string' && input.label.trim()) {
+    edge.label = input.label.trim().slice(0, 160);
+  }
+  return edge.time || edge.label ? edge : undefined;
+}
+
 // ----------------------------------------------------------- Gemini prompt
 
 function buildPlannerPrompt(args: {
-  userText: string;
+  /** The user's free-text — STYLE/NOTES on an errand day, or the whole request
+   *  on a no-errand discovery day. May be empty when the day is pure errands. */
+  intent: string;
   home: HomePin | null;
   date: string;
   grounded: boolean;
-  /** Already-located stops (placed/resolved errands) to compose verbatim. */
-  fixedStops?: FixedStop[];
-  /** Compose mode: the day is built ONLY from fixedStops — no venue discovery. */
-  compose?: boolean;
+  /** ANCHORS — already-located errands the planner must place verbatim. */
+  anchors?: FixedStop[];
+  /** TASKS — unplaced errands the planner schedules (and venues if place-y). */
+  tasks?: Task[];
+  /** Where/when the day should start and finish. */
+  dayStart?: DayEdge;
+  dayEnd?: DayEdge;
   userName?: string;
   wakeTime?: string;
   bedTime?: string;
@@ -551,19 +649,32 @@ function buildPlannerPrompt(args: {
   now?: string;
 }): string {
   const home = args.home;
-  const inProgress = !!args.now;
+  // `now` arrives ONLY when the day is genuinely underway: the client compares
+  // the current time (real wall clock OR the dev fake clock) against the user's
+  // head-out time and sends `now` only once it's PAST. So its mere presence means
+  // "in progress" — plan the remainder from now and skip the morning. Absent (a
+  // future day, or a today-plan at/before head-out — including a fake clock pinned
+  // to the morning) the day is FRESH: open with the morning routine and plan it all.
+  const dayUnderway = !!args.now;
+  const includeMorning = !dayUnderway && !!args.wakeTime;
+  const anchors = args.anchors ?? [];
+  const tasks = args.tasks ?? [];
+  // Errand-driven: the day is built from the user's real errands (anchors and/or
+  // tasks). Otherwise it's a no-errand "plan me a day" request where the model
+  // discovers and connects its own places.
+  const errandDriven = anchors.length > 0 || tasks.length > 0;
   const homeBlock = home
     ? `- Home: "${home.label}" at latitude ${home.latitude}, longitude ${home.longitude}.`
     : '- The user has not pinned a home location. Keep venue picks generic and assume the day happens close to wherever they start.';
-  const originDefault = home?.label ?? 'home';
+  const originDefault = args.dayStart?.label ?? home?.label ?? 'home';
 
   // ----- Personalisation context lines (only what we actually know) -----
   const nameLine = args.userName
     ? `- The user's name is ${args.userName}. You may address them warmly by name in the title/summary, but never force it.`
     : '';
-  // It is already partway through today, so the wake time is irrelevant — only
-  // the wind-down/bed anchor still matters for where the remaining day ends.
-  const rhythmLine = inProgress
+  // Once the day is underway the wake time is irrelevant — only the wind-down/bed
+  // anchor still matters for where the remaining day ends.
+  const rhythmLine = dayUnderway
     ? args.bedTime
       ? `- The user usually winds down around ${args.bedTime}; end the plan with a wind-down/bed anchor near then.`
       : ''
@@ -577,7 +688,9 @@ function buildPlannerPrompt(args: {
         }.`
       : '';
   // When the day is already underway, anchor the whole plan to "now" up front.
-  const nowLine = args.now
+  // (A today-plan made BEFORE head-out is still treated as a fresh full day, so
+  // no "in progress" framing — we want the morning, not a trimmed remainder.)
+  const nowLine = dayUnderway
     ? `- RIGHT NOW it is ${args.now} on ${args.date}: the day being planned is TODAY and is already in progress.`
     : '';
   const dietLine =
@@ -590,14 +703,28 @@ function buildPlannerPrompt(args: {
         : '';
 
   // ----- Morning ramp-up, meal windows, wind-down (sleep-hygiene) lines -----
-  // Morning ramp only matters when planning a fresh day from the top; on a
-  // day already in progress the user is long past waking.
+  // The day-frame start is the user's HEAD-OUT time (their first away-from-home
+  // commitment), NOT when they wake — so on a still-fresh day (see
+  // `includeMorning`) we prepend the at-home morning routine (wake → get ready →
+  // breakfast) before it.
+  const headOutTime = includeMorning ? args.dayStart?.time : undefined;
   const morningLine =
-    !inProgress && args.wakeTime && args.wakeUpDurationMin
-      ? `- Morning ramp-up: the user needs about ${args.wakeUpDurationMin} min after waking to fully get going. Keep the first stretch gentle (coffee, shower, easy prep) and avoid demanding or high-focus activities before about ${addMinutesHHMM(
-          args.wakeTime,
-          args.wakeUpDurationMin,
-        )}.`
+    includeMorning
+      ? `- MORNING ROUTINE (at home, BEFORE heading out): the day-frame start${
+          headOutTime ? ` (${headOutTime})` : ''
+        } is when the user HEADS OUT for their first away-from-home commitment — NOT when they wake. Open the plan EARLIER, at home: a gentle wake/get-up block around ${
+          args.wakeTime
+        }${
+          args.wakeUpDurationMin
+            ? `, then about ${args.wakeUpDurationMin} min to get ready (shower, dress, coffee)`
+            : ''
+        }, and breakfast (inside its window when one is given)${
+          headOutTime ? `, all wrapped up by ${headOutTime} so they leave on time` : ''
+        }. These are AT-HOME items — omit the place field. Keep this first stretch easy: no demanding or high-focus activity before about ${
+          args.wakeUpDurationMin
+            ? addMinutesHHMM(args.wakeTime, args.wakeUpDurationMin)
+            : args.wakeTime
+        }. If the user pinned nothing before the head-out time, that gap is EXPECTED — fill it with this morning routine, not invented errands.`
       : '';
 
   const fmtWindow = (w?: MealWindow): string | null => {
@@ -649,34 +776,77 @@ function buildPlannerPrompt(args: {
   // they might be closed (the app shows a "consider changing" notice instead).
   const hoursRule =
     ` OPENING HOURS (the day is ${args.date}): for any venue YOU choose yourself (the user did NOT name it), pick one that is OPEN for the ENTIRE planned time block at its scheduled start/end time — factor in how long the activity needs. Never self-select a venue that is closed or about to close at that time; choose an alternative that is open for the whole visit instead. EXCEPTION: if the user NAMED the venue or gave its address, keep it EXACTLY as written even if it might be closed — do NOT substitute it.`;
-  const venueRule = args.compose
-    ? '4. DO NOT invent, search for, or name any NEW business or venue beyond the PRE-PLANNED STOPS listed above. Those are the ONLY located venues in the day — place each one EXACTLY as given (copy its name verbatim into place.name, the same name into place.userQuery, and the EXACT given latitude/longitude into place.coords). For every OTHER activity (meals, getting ready, downtime, exercise, reading, chores), keep it AT HOME (omit the place field entirely) or model it as a "gap"/"break" — never attach a made-up venue to it.' + userQueryRule + hoursRule
+  const venueRule = errandDriven
+    ? '4. VENUES. The ANCHORS above are already located — place EACH one EXACTLY as given: copy its name verbatim into place.name, the same name into place.userQuery, the EXACT given latitude/longitude into place.coords, and set place.locationType. NEVER rename, move, swap, drop, or re-search an anchor. For a TASK that needs a venue (one marked "needs a place", or one that clearly happens somewhere — a workout, a coffee/meal out, focused work the user wants to do out of the house, a shop run, an appointment): name a REAL, SPECIFIC venue you actually know exists near home (include the branch, e.g. "Max Fitness Bílá Labuť"), set place.category to its type, and give your best APPROXIMATE coords — it is validated and geocoded against Google Places afterward, so approximate is fine. Do NOT set place.userQuery for a venue YOU chose; leaving it empty is what lets us verify your pick and swap it if it turns out closed. Stay within ~3 km of home where reasonable; never beyond ~8 km unless necessary. A pure at-home / no-place task (a phone call, admin, reading or a nap at home) gets NO place. If the user NAMED a venue or address in their notes, use THAT exact place verbatim (and DO set place.userQuery to their words).' + userQueryRule + hoursRule
     : args.grounded
     ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
     : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
 
-  // PRE-PLANNED STOPS — already-located errands the user picked. The model must
-  // place these verbatim (never re-discover or move them) and build the day's
-  // order + travel around them. In compose mode these are the ONLY venues.
-  const fixed = args.fixedStops ?? [];
-  const fmtFixedStop = (s: FixedStop): string => {
+  // ANCHORS — already-located errands the user picked. The model places each
+  // verbatim (never re-discover, rename, or move) and builds the day around them.
+  const fmtAnchor = (s: FixedStop): string => {
     const when = s.startTime
       ? s.endTime
-        ? ` (${s.startTime}–${s.endTime})`
-        : ` (at ${s.startTime})`
+        ? ` — PINNED ${s.startTime}–${s.endTime} (START exactly at ${s.startTime}, do NOT move)`
+        : ` — PINNED to START exactly at ${s.startTime} (do NOT move)`
       : s.durationMin
-        ? ` (~${s.durationMin} min)`
+        ? ` (~${s.durationMin} min, time flexible)`
         : '';
     const note = s.notes ? ` — ${s.notes}` : '';
-    return `- "${s.title}" → ${s.name} [${s.latitude.toFixed(5)}, ${s.longitude.toFixed(5)}]${when}${note}`;
+    const lt = s.locationType ? ` {${s.locationType}}` : '';
+    return `- "${s.title}" → ${s.name}${lt} [${s.latitude.toFixed(5)}, ${s.longitude.toFixed(5)}]${when}${note}`;
   };
-  const fixedStopsBlock = fixed.length
-    ? `\n\nPRE-PLANNED STOPS — already chosen and located by the user. You MUST include each as an item placed EXACTLY here: copy the venue name verbatim into place.name, set place.userQuery to that same name, and set place.coords to the EXACT latitude/longitude given. Do NOT search for, rename, move, swap, or replace them — they are fixed. Schedule each at its given time (or sensibly when none is given), reserve its duration, and order/route the rest of the day around them:\n${fixed.map(fmtFixedStop).join('\n')}`
+  const anchorsBlock = anchors.length
+    ? `\n\nANCHORS — stops the user has ALREADY chosen and located. These are the BACKBONE of the day. Include EVERY one as an item placed EXACTLY here: copy the venue name verbatim into place.name, set place.userQuery to that same name, set place.coords to the EXACT latitude/longitude given, and set place.locationType. NEVER rename, move, swap, drop, or re-search them — they are fixed. When an anchor shows a PINNED time, schedule it to START at EXACTLY that clock time and reserve EXACTLY its stated length — never nudge it earlier/later or stretch it to absorb travel, a meal, or the morning routine. Only an anchor with NO given time may be placed sensibly. Order, time, and route everything else AROUND these pinned times:\n${anchors.map(fmtAnchor).join('\n')}`
     : '';
+
+  // TASKS — unplaced errands. The model schedules each; venue rule (#4) decides
+  // whether it gets a model-named place or stays place-less (a call, admin).
+  const fmtTask = (t: Task): string => {
+    const when = t.startTime
+      ? t.endTime
+        ? ` — PINNED ${t.startTime}–${t.endTime} (START exactly at ${t.startTime}, do NOT move)`
+        : ` — PINNED to START exactly at ${t.startTime} (do NOT move)`
+      : t.durationMin
+        ? ` (~${t.durationMin} min, time flexible)`
+        : '';
+    const need = t.wantsVenue ? ' — needs a place; find a suitable venue near home' : '';
+    const hint = t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
+    const note = t.notes ? ` — ${t.notes}` : '';
+    return `- "${t.title}"${when}${need}${hint}${note}`;
+  };
+  const tasksBlock = tasks.length
+    ? `\n\nTASKS — things the user wants in the day that are NOT yet located. A task showing a PINNED time MUST start at EXACTLY that clock time and reserve EXACTLY its stated length — do not move it; one with no time you place sensibly:\n${tasks.map(fmtTask).join('\n')}`
+    : '';
+
+  // The free-text box: STYLE/NOTES that colour an errand day, or the whole
+  // request on a no-errand discovery day.
+  const intentLabel = errandDriven ? 'STYLE & NOTES' : 'USER REQUEST';
+  const intentBlock =
+    args.intent && args.intent.trim()
+      ? `\n\n${intentLabel} (the user's own words${
+          errandDriven
+            ? ' — honour the vibe and any preferences, but the ANCHORS and TASKS above are what the day is actually made of'
+            : ''
+        }):\n"""\n${args.intent.trim()}\n"""`
+      : '';
+
+  const frameLine = [
+    args.dayStart?.time
+      ? `starts at ${args.dayStart.time}${args.dayStart.label ? ` from ${args.dayStart.label}` : ''}`
+      : '',
+    args.dayEnd?.time
+      ? `finishes by ${args.dayEnd.time}${args.dayEnd.label ? ` at ${args.dayEnd.label}` : ''}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('; ');
+  const frameContextLine = frameLine ? `- Day frame: ${frameLine}.` : '';
 
   const contextLines = [
     homeBlock,
     `- Today is ${args.date}.`,
+    frameContextLine,
     nowLine,
     nameLine,
     rhythmLine,
@@ -689,13 +859,26 @@ function buildPlannerPrompt(args: {
     .filter(Boolean)
     .join('\n');
 
-  // Requirement #2 (day coverage) has two shapes. A future day is planned
-  // wake-to-sleep; today is ALREADY underway, so we plan only the remainder
-  // from "now" and never replay the morning (the "still creates the whole day"
-  // bug). Both keep the same gap-vs-break discipline for open stretches.
-  const coverageRule = inProgress
-    ? `2. The day is ALREADY UNDERWAY — it is currently ${args.now}. Plan ONLY the remaining part of today, beginning at the user's stated start time above (which is at or after ${args.now}). The FIRST block must start then — NEVER schedule anything earlier than ${args.now}, and do NOT replay parts of the day that have already happened (waking up, getting ready, breakfast/lunch already eaten). Plan only what still lies ahead. Still flow continuously with no holes: emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place for any open stretch of 20+ minutes; reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry).`
-    : `2. Cover the WHOLE day continuously — never leave invisible holes in the clock. Wake → prep → breakfast → depart → travel → activity → rest → travel home → shower → etc. When the day has genuine breathing room (time to relax, recharge, or do whatever they feel like), emit an EXPLICIT free-time block with "kind": "gap", "flexibility": "flexible", a friendly title ("Free time", "Relax", "Downtime"), a realistic duration, and NO place — give 20+ minutes of slack its own gap block rather than padding other activities. Reserve "kind": "break" for a SPECIFIC rest/chore the user named (a nap, a shower, laundry); use "gap" for open, unstructured time the user can later name or fill themselves.`;
+  // Requirement #2 (day coverage). On an ERRAND-driven day the errands ARE the
+  // day — we forbid inventing filler and only add the connective tissue needed
+  // to make them flow. On a no-errand discovery day the model builds the day
+  // from the request. Both plan only the remainder when the day's underway, and
+  // keep the gap-vs-break discipline for open stretches.
+  const inProgressClause = dayUnderway
+    ? ` The day is ALREADY UNDERWAY — it is currently ${args.now}: plan ONLY what still lies ahead, beginning at the stated start time (at or after ${args.now}), and NEVER schedule anything earlier than ${args.now} or replay what already happened (waking, getting ready, meals already eaten).`
+    : '';
+  // The at-home wake/wind-down allowance. On a fresh day with a known wake time
+  // we WANT the morning routine (wake → prep → breakfast) and a wind-down →
+  // sleep close — they're expected, not "invented filler". On a day already
+  // underway we don't replay the morning; with no rhythm known we stay minimal.
+  const morningAllowance = includeMorning
+    ? ' OPEN the day with the at-home morning routine (wake → get ready → breakfast) BEFORE the head-out start time, and CLOSE it with a wind-down → sleep sequence — these personal routines are EXPECTED and never count as invented filler.'
+    : dayUnderway
+      ? ''
+      : ' Add at most ONE light "get ready"/wake block at the start and ONE wind-down/sleep block at the end, and only when the user\'s rhythm calls for it.';
+  const coverageRule = errandDriven
+    ? `2. The ANCHORS and TASKS above ARE the day — build it AROUND them. Add ONLY the connective tissue that makes them flow: travel between stops, a meal when the user has a meal window and no meal errand covers it, and short rests. Do NOT invent extra activities, errands, or chores the user did not mention (no made-up "TikTok setup", "reserve therapy", or random shopping). You do NOT need to fill every minute: give any genuine open stretch of 20+ minutes its own "kind": "gap" block ("flexibility": "flexible", a friendly title, NO place).${morningAllowance}${inProgressClause}`
+    : `2. Build the day from the user's request above, from the stated start to a sensible end. Flow continuously without invisible holes, but don't over-pad: give any genuine open stretch of 20+ minutes its own "kind": "gap" block ("flexibility": "flexible", a friendly title, NO place) rather than inflating activities. Reserve "kind": "break" for a SPECIFIC rest/chore (a nap, a shower).${inProgressClause}`;
 
   const transportRule =
     car && car.owns && car.useToday
@@ -712,36 +895,35 @@ function buildPlannerPrompt(args: {
     (args.meals.breakfast || args.meals.lunch || args.meals.dinner)
   );
   const routineRule =
-    args.windDownTime || hasMeals || (!inProgress && args.wakeUpDurationMin)
+    args.windDownTime || hasMeals || (includeMorning && args.wakeUpDurationMin)
       ? `\n13. DAILY RHYTHM & SLEEP HYGIENE — shape the day around the user's routine above.${
           hasMeals
             ? ' Schedule each meal ("kind": "meal") to START within its stated window, using "window" flexibility with windowStart/windowEnd set to that range so it can flex inside it but not drift outside.'
             : ''
         }${
-          !inProgress && args.wakeUpDurationMin
+          includeMorning && args.wakeUpDurationMin
             ? " Ease into the morning — keep the wake-up ramp gentle and don't schedule demanding focus work until the user is fully up."
             : ''
         }${
           args.windDownTime
-            ? ` After ${args.windDownTime}, schedule ONLY calm, sleep-friendly activities — never place a high-energy block in the wind-down window — and still close the day with the single fixed sleep/lights-out anchor near ${
+            ? ` After ${args.windDownTime}, schedule ONLY calm, sleep-friendly activities — and this is exactly where any at-home wind-down TASKS the user has (skincare, reading, stretching, journaling) belong, placed back-to-back as the evening settles. Never put a high-energy block in the wind-down window, and close the day with the single fixed sleep/lights-out anchor near ${
                 args.bedTime ?? 'bedtime'
               }.`
             : ''
         } This governs only activities YOU add: if the USER explicitly asks for something (a late workout, a movie, a night out), keep it even if it bends the routine.`
       : '';
 
-  return `You are a professional day planner who orders activities so they save time, make sense, flow smoothly, and feel mindful and realistic.
+  const intro = errandDriven
+    ? `You are a thoughtful, practical day planner. The user's ERRANDS — the ANCHORS and TASKS below — are the backbone of the day. Your job is to ARRANGE them into one smooth, realistic, well-routed day: order them sensibly, time them, route between them, and add only the minimal connective tissue they need. You are NOT writing a day from scratch, and you do NOT add activities the user did not ask for.`
+    : `You are a thoughtful, practical day planner who builds a great day from the user's request: real, specific venues near home, ordered to save time, flowing smoothly and mindfully.`;
+
+  return `${intro}
 
 CONTEXT
-${contextLines}
-
-USER REQUEST (their own words, between triple quotes):
-"""
-${args.userText}
-"""${fixedStopsBlock}
+${contextLines}${anchorsBlock}${tasksBlock}${intentBlock}
 
 REQUIREMENTS
-1. Order the activities to save time and respect every constraint the user mentioned (no-later-than, max-time-between, prerequisites). Constraints may be in prose — read carefully.
+1. PINNED TIMES ARE LAW. Any anchor or task shown with a clock time MUST start at EXACTLY that time and last EXACTLY its stated duration — this outranks travel, meals, the morning routine, and tidiness. NEVER slide a pinned item to make room for a commute or another block; instead arrange, compress, or drop the FLEXIBLE things around it. If a commute genuinely cannot fit before a pinned start, keep the pin and let the user arrive late rather than moving it. Also honour any other constraints in their notes (no-later-than, max-time-between, prerequisites). Order the rest of the day to save travel and make sense.
 ${coverageRule}
 3. NEVER teleport. Between any two stops in different places, the user has to physically move. Model that movement via the "travelFromPrev" field on the SECOND stop, NOT as its own card — do NOT emit a "kind": "travel" item just to describe a short hop. The ONE exception is a long inter-city journey that is itself a meaningful block of the day (e.g. a 2-hour train ride, a flight): emit a "kind": "travel" item whose startTime/endTime/durationMinutes ARE the journey, with the transit breakdown attached as "travelFromPrev.steps" — and do NOT precede it with a "travel to station" lead-in item.
 ${venueRule}
@@ -749,8 +931,8 @@ ${venueRule}
 6. Be precise about travel. Break transit journeys into concrete steps: walk to stop → bus/tram/metro → walk to destination. Include line labels ("Bus 152", "Metro C") and stop names when you actually know them. Mark every leg "estimated": true — you do not have live routing. If you're not sure of transit details, use a single estimated leg with realistic minutes instead of inventing line numbers.
 7. Group items into sections with catchy headlines ("Morning Reset", "Gym & Recovery", "Languages", "Wind Down").
 8. Each item needs realistic startTime / endTime / durationMinutes, plus a 1–2 sentence description.
-9. Use the user's stated start time. Wrap the day with a sensible end (e.g. "before sleep" implies sleep prep around 22:30–23:30 unless they said otherwise).
-10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) hard real-world commitments locked to an external clock the user gave or clearly implied — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.${transportRule}${dietaryRule}${routineRule}
+9. The day-frame start time is when the user HEADS OUT (their first away-from-home commitment), NOT when they wake. Whenever the day hasn't started yet (a future day, or a today-plan where the current time is still at/before head-out), you MUST schedule the at-home morning routine (wake → get ready → breakfast) BEFORE the head-out time, then begin the out-and-about plan at the start time. Only skip the morning when the day is already underway (a current time is given that is PAST head-out). Wrap the day with a sensible end near its finish time (fall back to the user's usual rhythm when no frame is given).
+10. Set "flexibility" deliberately — it is what lets the day re-flow when edited, so DEFAULT TO "flexible" and use "fixed" sparingly. Use "fixed" ONLY for (a) an ANCHOR or TASK the user pinned to a clock time, or a hard real-world commitment locked to an external clock — a reservation, ticketed event, class, meeting, appointment, or transport departure — and (b) exactly ONE closing bedtime/end anchor (e.g. a "Sleep" / "Lights out" block at 22:30). An ANCHOR or TASK given WITHOUT a time stays "flexible" — place it sensibly. Mark EVERYTHING ELSE "flexible": workouts and gym, self-care and routines (skincare, shower, getting ready), deep work, meals at home, walks, and sightseeing with no ticket. A personal routine like nightly skincare is FLEXIBLE — never "fixed" — unless the user explicitly pinned it to a clock time. "gap" and "break" blocks are ALWAYS "flexible". Use "window" for things bound to a range (venue opening hours, "before the last train"). ALWAYS end the day with that single fixed bedtime/end anchor: it is the one hard endpoint that lets a longer activity eat into nearby "gap" time instead of pushing the night past its end.${transportRule}${dietaryRule}${routineRule}
 
 Output ONLY a single JSON object, no prose, no markdown fences. Match this schema. OMIT optional fields you don't have rather than inventing. Use null for unknown ratings; do not make up transit line numbers.
 
@@ -1659,23 +1841,50 @@ Deno.serve(async (req: Request) => {
   }
 
   let payload: {
-    request?: string;
+    // Errand-anchored contract:
+    anchors?: any;
+    tasks?: any;
+    intent?: string;
+    dayStart?: any;
+    dayEnd?: any;
+    // Shared:
     date?: string;
     now?: string;
     context?: any;
     fast?: boolean;
+    // Legacy aliases (replan / adjust / jobs still send prose + fixedStops):
+    request?: string;
     fixedStops?: any;
-    compose?: boolean;
   };
   try {
     payload = await req.json();
   } catch {
     return jsonResponse({ error: 'Invalid JSON body' }, 400);
   }
-  const request = typeof payload.request === 'string' ? payload.request.trim() : '';
-  if (!request) {
-    return jsonResponse({ error: 'Missing `request` text.' }, 400);
+
+  // ANCHORS — already-located errands. Accept the new `anchors` key or the
+  // legacy `fixedStops` alias.
+  const anchors = normalizeFixedStops(payload.anchors ?? payload.fixedStops);
+  // TASKS — unplaced errands the planner schedules.
+  const tasks = normalizeTasks(payload.tasks);
+  // The free-text box. Back-compat: a legacy prose `request` (replan/adjust)
+  // maps onto `intent`.
+  const intent =
+    typeof payload.intent === 'string' && payload.intent.trim()
+      ? payload.intent.trim()
+      : typeof payload.request === 'string'
+        ? payload.request.trim()
+        : '';
+  // Must carry SOMETHING to plan — at least one errand or some text.
+  if (anchors.length === 0 && tasks.length === 0 && !intent) {
+    return jsonResponse(
+      { error: 'Nothing to plan — provide `anchors`, `tasks`, or `intent` text.' },
+      400,
+    );
   }
+
+  const dayStart = normalizeDayEdge(payload.dayStart);
+  const dayEnd = normalizeDayEdge(payload.dayEnd);
   const date = typeof payload.date === 'string' ? payload.date : todayISO();
   // Current local time, sent by the client only when planning today — drives
   // the "plan from now, don't replay the morning" path in the prompt.
@@ -1684,30 +1893,43 @@ Deno.serve(async (req: Request) => {
   // Re-plans of an existing day ask for the cheaper/faster grounded model.
   const fast = payload.fast === true;
 
-  // Phase 6 — the client's already-located stops (placed / auto-resolved
-  // errands). Compose mode kicks in when the client asks for it AND there are
-  // fixed stops to build from: it forces schema mode (no Google Search
-  // grounding) on the cheapest model, since with no venue discovery there's
-  // nothing to ground. Anything else stays on the current grounded path.
-  const fixedStops = normalizeFixedStops(payload.fixedStops);
-  const compose = payload.compose === true && fixedStops.length > 0;
-  const grounded = compose ? false : GROUNDING_ENABLED;
-  const primaryModel = compose
-    ? CONFIGURED_COMPOSE_GEMINI_MODEL
-    : fast
+  // Errand-driven days ARRANGE the user's real errands and need NO live venue
+  // discovery — place-y tasks get a model-named venue the Google Places pass
+  // then validates — so they run in schema mode on the cheap/fast model. We
+  // only turn ON Google Search grounding when there's nothing to anchor to (a
+  // pure "plan me a day" request) or the user's notes explicitly ask to find /
+  // discover somewhere. This is the "no mode switch" behaviour: it adapts to
+  // how much the model actually has to discover.
+  const errandDriven = anchors.length > 0 || tasks.length > 0;
+  const wantsDiscovery = !errandDriven || INTENT_DISCOVERY_RE.test(intent);
+  const grounded = GROUNDING_ENABLED && wantsDiscovery;
+  // A schema day that only ARRANGES located anchors + pure tasks (nothing needs
+  // the model to discover a venue) runs the cheapest model — fast and cheap. As
+  // soon as a task needs a model-named venue we use the reliable default for
+  // better picks. Grounded discovery needs a Flash-class model (lite drifts
+  // empty when grounding); a fast replan uses the cheaper grounded model.
+  const anyTaskWantsVenue = tasks.some((t) => t.wantsVenue || !!t.placeQuery);
+  const arrangeOnly = errandDriven && !anyTaskWantsVenue;
+  const primaryModel = grounded
+    ? fast
       ? CONFIGURED_FAST_GEMINI_MODEL
+      : CONFIGURED_GEMINI_MODEL
+    : arrangeOnly
+      ? CONFIGURED_COMPOSE_GEMINI_MODEL
       : CONFIGURED_GEMINI_MODEL;
 
-  // 1) Single Gemini call that produces the whole itinerary (grounded with
-  //    live search, or schema-constrained — see GROUNDING_ENABLED / compose).
+  // 1) Single Gemini call that arranges the day (schema-constrained for errand
+  //    days, grounded with live search for discovery — see grounded above).
   const prompt = buildPlannerPrompt({
-    userText: request,
+    intent,
     home: context.home ?? null,
     date,
     now,
     grounded,
-    fixedStops,
-    compose,
+    anchors,
+    tasks,
+    dayStart,
+    dayEnd,
     userName: context.userName,
     wakeTime: context.wakeTime,
     bedTime: context.bedTime,
@@ -1727,8 +1949,8 @@ Deno.serve(async (req: Request) => {
   });
   // Self-heal a primary that fails or returns junk — a bad GEMINI_MODEL
   // override, the cheaper fast-replan model emitting an empty GROUNDED
-  // response, or a compose-model hiccup. Retry once on the known-reliable
-  // default (keeping the same grounded flag, so compose stays schema mode)
+  // response, or a lite-model hiccup. Retry once on the known-reliable default
+  // (keeping the same grounded flag, so a schema-mode day stays schema mode)
   // rather than failing the whole request (which would drop the client to its
   // offline sample).
   if (!gem.ok && primaryModel !== DEFAULT_GEMINI_MODEL) {
@@ -1758,7 +1980,7 @@ Deno.serve(async (req: Request) => {
   const googleKey = Deno.env.get('GOOGLE_PLACES_API_KEY');
   if (googleKey) {
     try {
-      await enrichItinerary(parsed, context.home ?? null, googleKey, date, fixedStops);
+      await enrichItinerary(parsed, context.home ?? null, googleKey, date, anchors);
     } catch {
       // ignore — the unenriched plan is still useful
     }

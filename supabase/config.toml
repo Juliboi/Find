@@ -24,5 +24,8 @@ verify_jwt = false
 [functions.parse-errand]
 verify_jwt = false
 
+[functions.decompose-intent]
+verify_jwt = false
+
 [functions.weather]
 verify_jwt = false

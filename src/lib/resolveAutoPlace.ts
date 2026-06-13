@@ -39,10 +39,12 @@ function centroid(points: Coords[]): Coords | null {
 }
 
 /**
- * Resolves each auto-place errand to its best-fit venue. Searches around the
+ * Resolves each auto-place errand to its best-fit venues. Searches around the
  * centroid of the day's known points and ranks by least detour along the
- * start→end corridor. Returns a map of errandId → chosen place; errands that
- * resolve to nothing are simply absent from the map.
+ * start→end corridor. Returns a map of errandId → RANKED candidate list (best
+ * first): the caller anchors the day on `[0]` and keeps the rest as swappable
+ * ALTERNATIVES surfaced on the itinerary card. Errands that resolve to nothing
+ * are simply absent from the map.
  */
 export async function resolveAutoPlaceVenues(opts: {
   items: AutoPlaceItem[];
@@ -53,9 +55,12 @@ export async function resolveAutoPlaceVenues(opts: {
   start: Coords | null;
   /** Route corridor for least-detour ranking (day end). */
   end: Coords | null;
-}): Promise<Map<string, NearbyPlace>> {
+  /** How many ranked candidates to keep per errand (best + alternatives). */
+  limit?: number;
+}): Promise<Map<string, NearbyPlace[]>> {
   const { items, anchors, start, end } = opts;
-  const out = new Map<string, NearbyPlace>();
+  const limit = Math.min(10, Math.max(1, Math.round(opts.limit ?? 6)));
+  const out = new Map<string, NearbyPlace[]>();
   if (items.length === 0) return out;
 
   // Anchor the search on the day's geography; without any known point there's
@@ -70,9 +75,9 @@ export async function resolveAutoPlaceVenues(opts: {
       const q = it.query.trim();
       if (!q) return;
       try {
-        const res = await findPlaces(q, q, center, route, { limit: 6 });
-        const best = res.places[0];
-        if (best) out.set(it.id, best);
+        const res = await findPlaces(q, q, center, route, { limit });
+        const candidates = res.places.slice(0, limit);
+        if (candidates.length) out.set(it.id, candidates);
       } catch {
         // best-effort: caller falls back to the prose hint
       }

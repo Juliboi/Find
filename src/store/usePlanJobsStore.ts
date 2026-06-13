@@ -1,7 +1,12 @@
 import { AppState } from 'react-native';
 import { create } from 'zustand';
 import type { SchedulerContext } from '@/lib/ai/scheduler';
-import { planItinerary } from '@/lib/ai/itinerary';
+import {
+  planItinerary,
+  type PlanAnchor,
+  type PlanDayEdge,
+  type PlanTask,
+} from '@/lib/ai/itinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import { useErrandsStore } from '@/store/useErrandsStore';
@@ -62,9 +67,18 @@ export interface ReadyToast {
   tone: 'done' | 'error';
 }
 
-/** Everything the runner needs to build a day, handed over from the screen. */
+/** Everything the runner needs to build a day, handed over from the screen.
+ *  Mirrors the errand-anchored planner contract (see `planItinerary`). */
 export interface StartPlanInput {
-  request: string;
+  /** ANCHORS — located errands placed verbatim (the day's backbone). */
+  anchors?: PlanAnchor[];
+  /** TASKS — unplaced errands the planner schedules. */
+  tasks?: PlanTask[];
+  /** Free-text style/notes (or the whole request on a no-errand day). */
+  intent?: string;
+  /** Where/when the day should start and finish. */
+  dayStart?: PlanDayEdge;
+  dayEnd?: PlanDayEdge;
   date: string;
   now?: string;
   context: SchedulerContext;
@@ -203,10 +217,17 @@ export const usePlanJobsStore = create<PlanJobsState>((set, get) => {
       // The build pipeline, decoupled from any screen lifecycle.
       void (async () => {
         try {
-          const result = await planItinerary(input.request, {
+          console.log(
+            `[plan-trace] START source=startPlan job=${id} date=${input.date} anchors=${input.anchors?.length ?? 0} tasks=${input.tasks?.length ?? 0}`,
+          );
+          const result = await planItinerary(input.intent ?? '', {
             context: input.context,
             date: input.date,
             now: input.now,
+            anchors: input.anchors,
+            tasks: input.tasks,
+            dayStart: input.dayStart,
+            dayEnd: input.dayEnd,
           });
           const itin = result.itinerary;
           if (!itin) {

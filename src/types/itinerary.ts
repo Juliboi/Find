@@ -211,6 +211,14 @@ export interface ItineraryPlace {
   photoUrl?: string;
   /** Source/citation URL the venue details were grounded on, when any. */
   sourceUrl?: string;
+  /**
+   * Other strong candidates for this stop, ranked best-first. Kept so the card
+   * can surface a few swappable thumbnails for an auto-placed ("Diem picks the
+   * spot") venue. The planner never sets this — the client attaches it after
+   * planning from the discover pre-pass. Each alternative is a flat place (its
+   * own `alternatives` is never populated, to avoid nesting).
+   */
+  alternatives?: ItineraryPlace[];
 }
 
 /**

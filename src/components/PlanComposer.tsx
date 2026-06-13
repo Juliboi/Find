@@ -29,7 +29,14 @@ interface Props {
   /** True while the planner is working (disables the field, shows a spinner). */
   busy?: boolean;
   placeholder?: string;
-  /** Fired when the user sends non-empty text. The field clears itself after. */
+  /**
+   * Allow sending with an EMPTY field — used when the day already has a backbone
+   * (the user ticked errands), so they can plan straight from those without
+   * typing anything. The free-text is then optional style/notes.
+   */
+  allowEmpty?: boolean;
+  /** Fired when the user sends. May be empty text when {@link allowEmpty}. The
+   *  field clears itself after. */
   onSubmit: (text: string) => void;
   style?: StyleProp<ViewStyle>;
 }
@@ -51,6 +58,7 @@ export function PlanComposer({
   visible,
   busy,
   placeholder = 'Describe your day…',
+  allowEmpty = false,
   onSubmit,
   style,
 }: Props) {
@@ -102,11 +110,11 @@ export function PlanComposer({
     transform: [{ scale: press.value }],
   }));
 
-  const canSend = text.trim().length > 0 && !busy;
+  const canSend = (text.trim().length > 0 || allowEmpty) && !busy;
 
   const submit = () => {
     const clean = text.trim();
-    if (!clean || busy) {
+    if ((!clean && !allowEmpty) || busy) {
       Keyboard.dismiss();
       return;
     }

@@ -33,12 +33,12 @@ export interface ItineraryResult {
 }
 
 /**
- * An already-located stop handed to the planner to compose verbatim — a placed
- * errand, or an auto-place errand the client resolved before planning (Phase 6).
- * The planner places it exactly (no discovery) and enrichment uses its coords +
- * metadata directly instead of a Google Places lookup.
+ * An ANCHOR — an already-located errand handed to the planner to place verbatim
+ * (a placed errand, or an auto-place errand the client resolved before
+ * planning). The planner never re-discovers, renames, or moves it, and
+ * enrichment uses its coords + metadata directly instead of a Google lookup.
  */
-export interface PlanFixedStop {
+export interface PlanAnchor {
   title: string;
   name: string;
   latitude: number;
@@ -47,10 +47,38 @@ export interface PlanFixedStop {
   endTime?: string;
   durationMin?: number;
   notes?: string;
+  /** "business" (public venue) or "residence" (private address). */
+  locationType?: 'business' | 'residence';
   photoUrl?: string;
   rating?: number;
   ratingCount?: number;
   openingHours?: VenueOpeningHours;
+}
+
+/** Back-compat alias for the previous name. */
+export type PlanFixedStop = PlanAnchor;
+
+/**
+ * A TASK — an errand the user wants in the day that is NOT yet located (a call,
+ * "deep work", a workout with no venue picked). The planner schedules it and
+ * decides whether it needs a venue: set {@link wantsVenue} when the client KNOWS
+ * it does (e.g. an unresolved auto-place errand).
+ */
+export interface PlanTask {
+  title: string;
+  startTime?: string;
+  endTime?: string;
+  durationMin?: number;
+  notes?: string;
+  wantsVenue?: boolean;
+  /** Hint for the kind of place to find ("quiet café", "gym"). */
+  placeQuery?: string;
+}
+
+/** One edge of the day frame — where/when the day starts or should finish. */
+export interface PlanDayEdge {
+  time?: string;
+  label?: string;
 }
 
 interface PlanItineraryOptions {
@@ -70,20 +98,21 @@ interface PlanItineraryOptions {
    */
   fast?: boolean;
   /**
-   * Already-located stops (placed / resolved errands) the planner must compose
-   * verbatim rather than discover. Sent structurally so it never re-searches or
-   * swaps the user's chosen venues.
+   * ANCHORS — already-located errands (placed / resolved) the planner places
+   * verbatim. The backbone of the day; never re-searched or swapped.
    */
-  fixedStops?: PlanFixedStop[];
+  anchors?: PlanAnchor[];
   /**
-   * Compose mode (Phase 6): build the day ONLY from `fixedStops` with no venue
-   * discovery, letting the planner skip Google Search grounding and run the
-   * cheapest model. The client sets this only when the day needs no discovery.
+   * TASKS — unplaced errands the planner schedules. It picks a venue only for
+   * the place-y ones; pure tasks (a call, admin) stay place-less.
    */
-  compose?: boolean;
+  tasks?: PlanTask[];
+  /** Where/when the day should start and finish. */
+  dayStart?: PlanDayEdge;
+  dayEnd?: PlanDayEdge;
 }
 
-function buildContextPayload(
+export function buildContextPayload(
   ctx?: SchedulerContext,
 ): Record<string, unknown> | undefined {
   if (!ctx) return undefined;
@@ -245,7 +274,26 @@ function sanitizePlace(raw: any): ItineraryPlace | undefined {
         : undefined,
     photoUrl: asString(raw.photoUrl),
     sourceUrl: asString(raw.sourceUrl),
+    // Carry swappable alternatives through sanitize so they survive saves and
+    // recomputes (the recompute round-trip and any later edit re-sanitize the
+    // itinerary). Flatten one level — an alternative never keeps its own.
+    alternatives: sanitizeAlternatives(raw.alternatives),
   };
+}
+
+/**
+ * Sanitize the optional ranked alternative venues onto a place. Each is a flat
+ * {@link ItineraryPlace} (its own `alternatives` is dropped to avoid nesting).
+ * Returns undefined when there are none usable so the key stays absent.
+ */
+function sanitizeAlternatives(raw: any): ItineraryPlace[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: ItineraryPlace[] = [];
+  for (const r of raw) {
+    const p = sanitizePlace(r);
+    if (p) out.push({ ...p, alternatives: undefined });
+  }
+  return out.length ? out : undefined;
 }
 
 const TRAVEL_MODES: ItineraryTravelMode[] = ['walk', 'bike', 'transit', 'drive'];
@@ -425,33 +473,40 @@ export function sanitizeItinerary(data: any): Itinerary | null {
 
 // --- public API -------------------------------------------------------------
 //
-// One thin call to the `plan-itinerary` edge function, which does the real
-// work: a single grounded Gemini call to produce the whole day, then a
-// per-unique-venue Google Places enrichment pass to backfill photos /
-// ratings / opening hours. Falls back to a curated sample when Supabase
-// isn't configured at all (purely offline dev), so the screen and the
-// downstream rescheduling/store code are always exercisable.
+// One thin call to the errand-anchored `plan-itinerary` edge function. It
+// ARRANGES the user's real errands into a day: ANCHORS (located errands) are
+// placed verbatim, TASKS (unplaced errands) are scheduled and given a venue
+// only when place-y, and `intent` is style/notes (or the whole request on a
+// no-errand day). The function then runs a Google Places enrichment pass to
+// backfill photos / ratings / opening hours. Falls back to a curated sample
+// when Supabase isn't configured at all (purely offline dev).
 
 export async function planItinerary(
-  request: string,
+  intent: string,
   options: PlanItineraryOptions = {},
 ): Promise<ItineraryResult> {
-  const text = request.trim();
+  const text = intent.trim();
   const debug: ItineraryDebug | undefined = options.debug
     ? { request: null, response: null }
     : undefined;
 
-  if (!text) {
+  // A day needs SOMETHING to plan — at least one errand or some free-text intent.
+  const hasErrands =
+    (options.anchors?.length ?? 0) > 0 || (options.tasks?.length ?? 0) > 0;
+  if (!text && !hasErrands) {
     return { itinerary: null, usedAi: false, debug };
   }
 
   if (isSupabaseConfigured && supabase) {
-    const body: Record<string, unknown> = { request: text };
+    const body: Record<string, unknown> = {};
+    if (text) body.intent = text;
+    if (options.anchors && options.anchors.length) body.anchors = options.anchors;
+    if (options.tasks && options.tasks.length) body.tasks = options.tasks;
+    if (options.dayStart) body.dayStart = options.dayStart;
+    if (options.dayEnd) body.dayEnd = options.dayEnd;
     if (options.date) body.date = options.date;
     if (options.now) body.now = options.now;
     if (options.fast) body.fast = true;
-    if (options.fixedStops && options.fixedStops.length) body.fixedStops = options.fixedStops;
-    if (options.compose) body.compose = true;
     const ctx = buildContextPayload(options.context);
     if (ctx) body.context = ctx;
     if (debug) debug.request = body;

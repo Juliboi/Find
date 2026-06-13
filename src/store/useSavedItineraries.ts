@@ -34,7 +34,7 @@ export interface SavedItinerary {
    * Marks this entry as the chosen plan for its `date`. At most one entry
    * per day carries this (the store enforces it on `activate`). When no
    * entry for a day is flagged, the day's active plan defaults to the
-   * earliest-created one — see `activePlanForDate`.
+   * most-recently-created one — see `activePlanForDate`.
    */
   isActive?: boolean;
   itinerary: Itinerary;
@@ -283,13 +283,15 @@ export function plansForDate(items: SavedItinerary[], date: string): SavedItiner
 
 /**
  * The active plan for `date`: the explicitly-activated entry if there is
- * one, otherwise the earliest-created plan for that day. Undefined when the
- * day has no saved plans.
+ * one, otherwise the MOST-RECENTLY-created plan for that day (the last one
+ * the user generated — what they almost always mean by "today's plan").
+ * Undefined when the day has no saved plans. `plansForDate` sorts oldest
+ * first, so the newest is the last element.
  */
 export function activePlanForDate(
   items: SavedItinerary[],
   date: string,
 ): SavedItinerary | undefined {
   const forDay = plansForDate(items, date);
-  return forDay.find((i) => i.isActive) ?? forDay[0];
+  return forDay.find((i) => i.isActive) ?? forDay[forDay.length - 1];
 }
