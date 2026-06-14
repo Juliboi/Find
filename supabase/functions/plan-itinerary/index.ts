@@ -349,6 +349,10 @@ interface Task {
   wantsVenue?: boolean;
   /** Hint for the KIND of place to find ("quiet café", "gym"), when known. */
   placeQuery?: string;
+  /** This commitment happens at home / online (a video call, telehealth, remote
+   * work). It has NO physical venue: schedule it at home and NEVER invent or
+   * search a place for it. Outranks wantsVenue. */
+  atHome?: boolean;
 }
 
 /** One edge of the day frame — where/when the day starts or should finish. */
@@ -593,9 +597,15 @@ function normalizeTasks(input: any): Task[] {
     const dur = Number(raw.durationMin);
     if (Number.isFinite(dur) && dur > 0 && dur <= 1440) task.durationMin = Math.round(dur);
     if (typeof raw.notes === 'string' && raw.notes.trim()) task.notes = raw.notes.trim().slice(0, 300);
-    if (raw.wantsVenue === true) task.wantsVenue = true;
-    if (typeof raw.placeQuery === 'string' && raw.placeQuery.trim()) {
-      task.placeQuery = raw.placeQuery.trim().slice(0, 120);
+    if (raw.atHome === true) task.atHome = true;
+    // An at-home/online commitment never has a venue — drop any conflicting hints.
+    if (task.atHome) {
+      task.wantsVenue = false;
+    } else {
+      if (raw.wantsVenue === true) task.wantsVenue = true;
+      if (typeof raw.placeQuery === 'string' && raw.placeQuery.trim()) {
+        task.placeQuery = raw.placeQuery.trim().slice(0, 120);
+      }
     }
     out.push(task);
     if (out.length >= 25) break;
@@ -744,7 +754,7 @@ function buildPlannerPrompt(args: {
     if (d) mealParts.push(`dinner ${d}`);
   }
   const mealsLine = mealParts.length
-    ? `- Preferred meal windows: ${mealParts.join('; ')}. Schedule each meal so it starts inside its window.`
+    ? `- Preferred meal windows: ${mealParts.join('; ')}. Schedule each meal so it starts inside its window. When a meal is eaten OUT, pick a venue CLOSE to the stops right before/after it (least detour) — never a famous spot across town; a meal at home needs no venue.`
     : '';
 
   const screenClause =
@@ -777,7 +787,7 @@ function buildPlannerPrompt(args: {
   const hoursRule =
     ` OPENING HOURS (the day is ${args.date}): for any venue YOU choose yourself (the user did NOT name it), pick one that is OPEN for the ENTIRE planned time block at its scheduled start/end time — factor in how long the activity needs. Never self-select a venue that is closed or about to close at that time; choose an alternative that is open for the whole visit instead. EXCEPTION: if the user NAMED the venue or gave its address, keep it EXACTLY as written even if it might be closed — do NOT substitute it.`;
   const venueRule = errandDriven
-    ? '4. VENUES. The ANCHORS above are already located — place EACH one EXACTLY as given: copy its name verbatim into place.name, the same name into place.userQuery, the EXACT given latitude/longitude into place.coords, and set place.locationType. NEVER rename, move, swap, drop, or re-search an anchor. For a TASK that needs a venue (one marked "needs a place", or one that clearly happens somewhere — a workout, a coffee/meal out, focused work the user wants to do out of the house, a shop run, an appointment): name a REAL, SPECIFIC venue you actually know exists near home (include the branch, e.g. "Max Fitness Bílá Labuť"), set place.category to its type, and give your best APPROXIMATE coords — it is validated and geocoded against Google Places afterward, so approximate is fine. Do NOT set place.userQuery for a venue YOU chose; leaving it empty is what lets us verify your pick and swap it if it turns out closed. Stay within ~3 km of home where reasonable; never beyond ~8 km unless necessary. A pure at-home / no-place task (a phone call, admin, reading or a nap at home) gets NO place. If the user NAMED a venue or address in their notes, use THAT exact place verbatim (and DO set place.userQuery to their words).' + userQueryRule + hoursRule
+    ? '4. VENUES. The ANCHORS above are already located — place EACH one EXACTLY as given: copy its name verbatim into place.name, the same name into place.userQuery, the EXACT given latitude/longitude into place.coords, and set place.locationType. NEVER rename, move, swap, drop, or re-search an anchor. For a TASK that needs a venue (one marked "needs a place", or one that clearly happens somewhere — a workout, a coffee/meal out, focused work the user wants to do out of the house, a shop run, an appointment): name a REAL, SPECIFIC venue you actually know exists (include the branch, e.g. "Max Fitness Bílá Labuť"), set place.category to its type, and give your best APPROXIMATE coords — it is validated and geocoded against Google Places afterward, so approximate is fine. LOCATION IS CRUCIAL: put that venue CLOSE TO the stops scheduled immediately BEFORE and AFTER it so the day flows without backtracking — only fall back to "near home" when the task sits at the very start or end of the day. Minimise detour and NEVER pick a famous venue across town just because it is well-known; keep self-chosen venues within ~3 km of the neighbouring stops where reasonable and never beyond ~8 km. Do NOT set place.userQuery for a venue YOU chose; leaving it empty is what lets us verify your pick and swap it if it turns out closed. A task marked AT-HOME / ONLINE (a video or phone call, telehealth, remote work, a virtual class) has NO venue at all — schedule it at home and OMIT the place field; NEVER invent or search a venue for it. A pure at-home / no-place task (a phone call, admin, reading or a nap at home) also gets NO place. If the user NAMED a venue or address in their notes, use THAT exact place verbatim (and DO set place.userQuery to their words).' + userQueryRule + hoursRule
     : args.grounded
     ? '4. For every place the user goes to, use Google Search to find a REAL, SPECIFIC venue near home. Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Do NOT pick a famous venue across town just because it\'s well-known. Return real name, address, rating (0–5), and an opening-status hint when known. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM (street, number, district) into place.address.' + userQueryRule + hoursRule
     : '4. For every place the user goes to, name a REAL, SPECIFIC venue you know near home (include the branch, e.g. "Max Fitness Bílá Labuť", not just "Max Fitness"). Strongly prefer venues within ~3 km of home; never beyond ~8 km unless genuinely necessary. Give the real name, address, and your best APPROXIMATE coords — these are validated and geocoded against Google Places afterward, so approximate is fine. CRITICAL — when the user NAMES a venue or gives an address (e.g. "hostinec U Mišků", "Max Fitness OC Krakov", "Kadaňská 837/18, Dolní Chabry"): use THAT EXACT place — never swap it for a different similarly-named venue. Copy the user\'s exact venue name into place.name and their exact address VERBATIM into place.address.' + userQueryRule + hoursRule;
@@ -810,8 +820,12 @@ function buildPlannerPrompt(args: {
       : t.durationMin
         ? ` (~${t.durationMin} min, time flexible)`
         : '';
-    const need = t.wantsVenue ? ' — needs a place; find a suitable venue near home' : '';
-    const hint = t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
+    const need = t.atHome
+      ? ' — AT-HOME / ONLINE: this has NO physical venue. Schedule it at home and OMIT the place field entirely — do NOT search for, invent, or attach a venue.'
+      : t.wantsVenue
+        ? ' — needs a place; find a suitable venue close to the stops scheduled right BEFORE/AFTER it (least detour), not across town'
+        : '';
+    const hint = !t.atHome && t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
     const note = t.notes ? ` — ${t.notes}` : '';
     return `- "${t.title}"${when}${need}${hint}${note}`;
   };

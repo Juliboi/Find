@@ -53,6 +53,8 @@ export interface DecomposeUnresolved {
   id: string;
   title: string;
   placeQuery?: string;
+  /** The errand's own notes — carries signals like "online" the title hides. */
+  notes?: string;
 }
 
 export interface DecomposeInput {

@@ -386,6 +386,8 @@ function whereLabel({
     switch (result.centerSource) {
       case 'gps':
         return 'Near you';
+      case 'place':
+        return result.centerLabel ? `Near ${result.centerLabel}` : 'Nearby';
       case 'area':
         return result.centerLabel ? `In ${result.centerLabel}` : 'In the area';
       case 'home':
@@ -395,7 +397,7 @@ function whereLabel({
     }
   }
   if (nearby) return 'Near you';
-  if (area) return `In ${area}`;
+  if (area) return `Near ${area}`;
   return 'Near you';
 }
 

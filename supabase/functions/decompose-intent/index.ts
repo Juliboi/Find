@@ -207,6 +207,7 @@ interface UnresolvedInput {
   id?: string;
   title?: string;
   placeQuery?: string;
+  notes?: string;
 }
 
 function describeContext(ctx: any): string {
@@ -276,7 +277,8 @@ function buildPrompt(args: {
         .map((u, i) => {
           const id = u.id ?? `errand-${i}`;
           const hint = u.placeQuery ? ` (current hint: "${u.placeQuery}")` : '';
-          return `  - id="${id}": "${u.title ?? ''}"${hint}`;
+          const note = u.notes ? ` — notes: "${u.notes}"` : '';
+          return `  - id="${id}": "${u.title ?? ''}"${hint}${note}`;
         })
         .join('\n')
     : '  (none)';
@@ -311,7 +313,7 @@ YOUR JOB — produce "items", each a single real stop or at-home activity:
 2. POSITION flexible venues in the RIGHT neighbourhood. Look at the already-located stops + home: pick the area where the day is clearly happening and write a SPECIFIC, geocodable query that names the area, e.g. user said "go to a max fitness gym" and the day is around Karlín → query "Max Fitness gym, Karlín, Prague", area "Karlín". Keep the brand/specifics the user gave. Do NOT invent a venue name the user didn't give — name the CATEGORY + brand + area so a places search can find the real branch.
 3. CO-LOCATE compatible activities. If an activity naturally happens at a stop that ALREADY exists in the located list (e.g. "deep work" or "prepare marketing" when there's a café anchor), set placement="colocate" and colocateWith=<that anchor's id>; do NOT give it its own query. Leave its query null.
 4. MERGE activities that obviously share ONE venue into a SINGLE item with a combined title (e.g. "drink coffee" + "tiktok reels & marketing prep" → one item titled "Coffee & content prep", placement="find", query a café in the day's area). Prefer merging over creating two items at the same place.
-5. AT-HOME / no-venue activities (skincare, reading before sleep, a nap, a call, journaling, stretching) → placement="home", query null. These have no place; the planner schedules them at home.
+5. AT-HOME / no-venue activities → placement="home", query null. These have no place; the planner schedules them at home. This covers self-care (skincare, reading before sleep, a nap, journaling, stretching) AND anything ONLINE / REMOTE: a video or phone call, telehealth or online therapy, remote work, a virtual class or webinar. If an activity's words (title OR notes) say online / virtual / remote / zoom / meet / teams / video call / phone call / by phone, it has NO venue — ALWAYS placement="home", NEVER "find", even if a clock time is given.
 6. For each VAGUE ERRAND listed above, RE-EMIT it as one item: set sourceId to its id, keep its meaning, and upgrade its query to a specific neighbourhood-aware one (placement="find"), or placement="home" if it's truly place-less.
 7. durationMin: convert explicit lengths ("2 hours"→120, "1.5h"→90, "45 min"→45); else null.
 8. startTime/endTime: LEAVE NULL unless the user gave an explicit clock time — the downstream planner decides timing. "HH:MM" 24h when set.

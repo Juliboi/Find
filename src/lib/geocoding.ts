@@ -154,6 +154,13 @@ export interface ResolvedPlace {
   label: string;
   latitude: number;
   longitude: number;
+  /**
+   * Google place type labels (e.g. ["lodging","point_of_interest","establishment"]
+   * for a hotel, ["locality","political"] for a city). Lets callers tell a
+   * SPECIFIC venue/landmark apart from a broad neighbourhood/city. Empty for the
+   * Nominatim fallback, which doesn't expose comparable types.
+   */
+  types?: string[] | null;
   /** Google place id, kept so callers can re-fetch fresh details later. */
   placeId?: string | null;
   /** Long-lived CDN photo URL (Google provider only). */
@@ -256,6 +263,9 @@ export async function resolvePlace(
             typeof place.label === 'string' ? place.label : 'Selected location',
           latitude: place.latitude,
           longitude: place.longitude,
+          types: Array.isArray(place.types)
+            ? place.types.filter((t: unknown): t is string => typeof t === 'string')
+            : null,
           placeId: typeof place.placeId === 'string' ? place.placeId : null,
           photoUrl: typeof place.photoUrl === 'string' ? place.photoUrl : null,
           rating: typeof place.rating === 'number' ? place.rating : null,

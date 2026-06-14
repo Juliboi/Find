@@ -20,6 +20,10 @@ export interface AutoPlaceItem {
   id: string;
   /** The search category, e.g. "pharmacy", "coffee". */
   query: string;
+  /** The brain's neighbourhood for this item ("Karlín, Prague"), when known.
+   * When set, the search centres on that area instead of the day's centroid, so
+   * a chain resolves to the branch in the RIGHT part of town. */
+  area?: string;
 }
 
 /** Average of the supplied coordinates, or null when there are none. */
@@ -48,8 +52,8 @@ function centroid(points: Coords[]): Coords | null {
  */
 export async function resolveAutoPlaceVenues(opts: {
   items: AutoPlaceItem[];
-  /** The day's known points (start, end, home, located errands) — seeds the
-   * search center. */
+  /** The day's known points (start, end, home, located errands) — the fallback
+   * search center when an item has no area, and the seed for geocoding areas. */
   anchors: Coords[];
   /** Route corridor for least-detour ranking (day start). */
   start: Coords | null;
@@ -63,19 +67,56 @@ export async function resolveAutoPlaceVenues(opts: {
   const out = new Map<string, NearbyPlace[]>();
   if (items.length === 0) return out;
 
-  // Anchor the search on the day's geography; without any known point there's
-  // nothing meaningful to search around, so leave everything unresolved.
-  const center = centroid(anchors) ?? start ?? end;
-  if (!center) return out;
+  // The day's average point: the fallback center for items with no area, and the
+  // seed used to geocode area names. Without any known point there's nothing to
+  // search around, so leave everything unresolved.
+  const dayCenter = centroid(anchors) ?? start ?? end;
 
-  const route = start || end ? { prev: start ?? undefined, next: end ?? undefined } : undefined;
+  // Geocode each DISTINCT neighbourhood the brain named into its own search
+  // center (cheap + cached via findPlaces). This is what makes "Max Fitness gym,
+  // Karlín" resolve to the Karlín-area branch instead of whichever branch is
+  // nearest the day's centroid — the "gym in Holešovice not Karlín" fix.
+  const areaCenters = new Map<string, Coords | null>();
+  const distinctAreas = Array.from(
+    new Set(items.map((it) => it.area?.trim()).filter((a): a is string => !!a)),
+  );
+  await Promise.all(
+    distinctAreas.map(async (area) => {
+      try {
+        const res = await findPlaces(area, area, dayCenter ?? undefined, undefined, {
+          limit: 1,
+        });
+        const top = res.places[0];
+        areaCenters.set(
+          area,
+          top ? { latitude: top.latitude, longitude: top.longitude } : null,
+        );
+      } catch {
+        areaCenters.set(area, null);
+      }
+    }),
+  );
+
+  const corridor =
+    start || end ? { prev: start ?? undefined, next: end ?? undefined } : undefined;
 
   await Promise.all(
     items.map(async (it) => {
       const q = it.query.trim();
       if (!q) return;
+      const area = it.area?.trim();
+      const areaCenter = area ? areaCenters.get(area) ?? null : null;
+      // Center on the brain's neighbourhood when we resolved one; else the day's
+      // centroid. Without any center there's nothing to search around.
+      const center = areaCenter ?? dayCenter;
+      if (!center) return;
+      // With an explicit area center, rank by proximity to it (tight radius, no
+      // start→end corridor) so the area wins. Otherwise keep the corridor's
+      // least-detour ranking around the day's centroid.
+      const route = areaCenter ? undefined : corridor;
+      const searchOpts = areaCenter ? { limit, radiusM: 4000 } : { limit };
       try {
-        const res = await findPlaces(q, q, center, route, { limit });
+        const res = await findPlaces(q, q, center, route, searchOpts);
         const candidates = res.places.slice(0, limit);
         if (candidates.length) out.set(it.id, candidates);
       } catch {

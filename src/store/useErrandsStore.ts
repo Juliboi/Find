@@ -78,10 +78,12 @@ export interface Errand {
   /**
    * Provenance. `'user'` (or absent, on legacy rows) is an errand the user
    * created themselves; `'freestyle'` is one the planning BRAIN decomposed from
-   * the plan's free-text field. Freestyle errands are visible now for testing
-   * and trivially hideable later (Phase 2).
+   * the plan's free-text field. `'test'` is a DEV-only debug errand seeded by the
+   * "Generate test plan" harness — isolated from real errands (its own cleanup),
+   * never auto-marked Planned, and only ever removed by hand or a re-seed.
+   * Freestyle errands are visible now for testing and trivially hideable later.
    */
-  source?: 'user' | 'freestyle';
+  source?: 'user' | 'freestyle' | 'test';
   /** The raw text the user typed, kept so we can re-parse / show provenance. */
   rawText: string;
   /**
@@ -203,7 +205,12 @@ function normalizeInput(input: ErrandInput): ErrandInput {
     autoPlace: autoPlace ? true : undefined,
     placeQuery: autoPlace ? clean(input.placeQuery) ?? clean(input.title) : undefined,
     notes: clean(input.notes),
-    source: input.source === 'freestyle' ? 'freestyle' : 'user',
+    source:
+      input.source === 'freestyle'
+        ? 'freestyle'
+        : input.source === 'test'
+          ? 'test'
+          : 'user',
     rawText: clean(input.rawText) ?? clean(input.title) ?? '',
   };
 }

@@ -41,14 +41,21 @@ interface Props {
   onToggleSelect?: () => void;
   /**
    * Completed-section mode. When 'planned' or 'done' the row shows a status tag
-   * and a done-reflecting leading control: tapping it marks a planned errand
-   * done, or returns a done one to the active list. A planned row also gets a
-   * trailing "pull back to active" button (`onReopen`). Omit (or pass 'open')
-   * for a normal active row — all existing behaviour is untouched.
+   * and a leading control: ticking a planned errand DELETES it ({@link onDelete})
+   * — "checked off, done with it, gone" — while a done one's control returns it
+   * to the active list. A planned row also gets a trailing "pull back to active"
+   * undo button (`onReopen`). Omit (or pass 'open') for a normal active row —
+   * all existing behaviour is untouched.
    */
   status?: ErrandStatus;
   /** Pull the errand back to the active list (clears done + plannedDate). */
   onReopen?: () => void;
+  /**
+   * Completed-section only: permanently remove the errand. Wired to the leading
+   * checkbox of a PLANNED row so ticking it off clears the errand for good
+   * (the trailing undo arrow remains for "pull back to active" instead).
+   */
+  onDelete?: () => void;
 }
 
 /**
@@ -92,6 +99,7 @@ export function ErrandRow({
   onToggleSelect,
   status,
   onReopen,
+  onDelete,
 }: Props) {
   const t = useTheme();
   const meta = metaParts(errand).join(' · ');
@@ -129,16 +137,18 @@ export function ErrandRow({
     <Pressable
       onPress={() => {
         Haptics.selectionAsync().catch(() => undefined);
+        // Completed section: ticking a planned errand clears it for good; a done
+        // one's control returns it to the active list (undo is the trailing arrow).
         if (isDone) onReopen?.();
-        else onToggleDone();
+        else onDelete?.();
       }}
       hitSlop={10}
-      accessibilityRole="checkbox"
+      accessibilityRole={isDone ? 'checkbox' : 'button'}
       accessibilityState={{ checked: isDone }}
       accessibilityLabel={
         isDone
           ? `Return ${errand.title} to active errands`
-          : `Mark ${errand.title} done`
+          : `Check off and remove ${errand.title}`
       }
       style={[
         styles.check,

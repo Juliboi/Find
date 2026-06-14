@@ -73,6 +73,10 @@ export interface PlanTask {
   wantsVenue?: boolean;
   /** Hint for the kind of place to find ("quiet café", "gym"). */
   placeQuery?: string;
+  /** This commitment happens at home / online (a video call, telehealth, remote
+   * work) — it has NO physical venue. The planner must schedule it at home and
+   * never invent or search a place for it. Outranks {@link wantsVenue}. */
+  atHome?: boolean;
 }
 
 /** One edge of the day frame — where/when the day starts or should finish. */

@@ -30,6 +30,7 @@ import { useHomeStore } from '@/store/useHomeStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
 import { formatTime } from '@/utils/time';
 import { useDevClockStore } from '@/store/useDevClockStore';
+import { seedTestPlan } from '@/lib/dev/seedTestPlan';
 
 /** Seed a time picker from a stored "HH:MM" (falls back to 9 PM if unparseable). */
 function hhmmToDate(hhmm: string): Date {
@@ -700,6 +701,21 @@ export default function SettingsScreen() {
               title="Replay onboarding"
               subtitle="Walk the full first-run setup again"
               onPress={replayOnboarding}
+            />
+            <Row
+              icon="flask-outline"
+              iconBg={t.colors.accentSoft}
+              iconColor={t.colors.accentText}
+              title="Generate test plan"
+              subtitle="Reseed tomorrow's fixed errands + auto-plan"
+              onPress={() => {
+                Haptics.selectionAsync().catch(() => undefined);
+                const { intent } = seedTestPlan();
+                router.push({
+                  pathname: '/itinerary',
+                  params: { autoplan: '1', seedIntent: intent },
+                });
+              }}
             />
             <Row
               icon="search-outline"

@@ -63,6 +63,16 @@ const ROUTES_TRAVEL_MODE: Record<TravelMode, string> = {
   drive: 'DRIVE',
 };
 
+// Idle this long (or longer) before a fixed/window anchor becomes a visible
+// free-time block instead of an invisible hole. Matches the client's
+// GAP_MIN_MINUTES (app/itinerary.tsx) so server + client agree on what counts
+// as a real gap worth surfacing.
+const GAP_FILL_MIN_MINUTES = 20;
+// Id prefix for gaps the SERVER synthesizes. Lets every recompute strip its own
+// previous idle-fillers and rebuild them against the new clock (idempotent),
+// without ever touching user-made or AI-made gaps (which carry other ids).
+const SYNTH_GAP_PREFIX = 'srv-gap-';
+
 export function pickMode(distanceM: number): TravelMode {
   if (distanceM <= 1300) return 'walk';
   return 'transit';
@@ -603,6 +613,91 @@ function stripAiTravelItems(parsed: any): void {
   );
 }
 
+/**
+ * Removes the gap blocks a PREVIOUS run synthesized (id prefix `srv-gap-`), so
+ * re-routing is idempotent: each pass strips its own old idle-fillers and
+ * recomputes fresh ones against the new clock. User-made and AI-made gaps (any
+ * other id) are left untouched.
+ */
+function stripSyntheticGaps(parsed: any): void {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+  for (const s of parsed.sections) {
+    if (s && Array.isArray(s.items)) {
+      s.items = s.items.filter(
+        (it: any) =>
+          !(
+            it?.kind === 'gap' &&
+            typeof it?.id === 'string' &&
+            it.id.startsWith(SYNTH_GAP_PREFIX)
+          ),
+      );
+    }
+  }
+  parsed.sections = parsed.sections.filter(
+    (s: any) => s && Array.isArray(s.items) && s.items.length > 0,
+  );
+}
+
+/**
+ * Turns unfilled idle before a fixed/window anchor into a real, visible `gap`
+ * block, so the day never shows an invisible hole between two stops (the
+ * "breakfast ends 09:45, therapy at 11:00, nothing in between" problem). Runs
+ * AFTER the clock cascade and only fills the EMPTY space ahead of each anchor —
+ * the synthesized block spans [prevEnd, anchorLeaveBy], so it shifts nothing
+ * already placed. Idempotent via the `srv-gap-` id prefix (see above).
+ */
+function fillIdleGaps(parsed: any): void {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+  const items = flattenItems(parsed);
+  if (items.length === 0) return;
+
+  // Key the insertion on the anchor item itself (flattenItems returns the same
+  // object refs that live in the sections), so we can splice gaps back in by
+  // identity regardless of section boundaries.
+  const insertBefore = new Map<any, any>();
+  let counter = 0;
+  let prevEnd: number | null = null;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const start = parseHHMM(it?.startTime);
+    const isAnchor = it?.flexibility === 'fixed' || it?.flexibility === 'window';
+    if (i > 0 && isAnchor && start != null && prevEnd != null) {
+      const travel = Number(it?.travelFromPrev?.minutes) || 0;
+      const idle = start - travel - prevEnd;
+      if (idle >= GAP_FILL_MIN_MINUTES) {
+        insertBefore.set(it, {
+          id: `${SYNTH_GAP_PREFIX}${counter++}`,
+          title: 'Free time',
+          kind: 'gap',
+          flexibility: 'flexible',
+          startTime: fmtHHMM(prevEnd),
+          endTime: fmtHHMM(prevEnd + idle),
+          durationMinutes: idle,
+          gapBeforeMin: 0,
+          place: null,
+          travelFromPrev: null,
+          orderIndex: 0,
+        });
+      }
+    }
+    const end =
+      parseHHMM(it?.endTime) ?? (start != null ? start + itemDuration(it) : null);
+    if (end != null) prevEnd = end;
+  }
+
+  if (insertBefore.size === 0) return;
+  for (const s of parsed.sections) {
+    if (!Array.isArray(s.items)) continue;
+    const out: any[] = [];
+    for (const it of s.items) {
+      const g = insertBefore.get(it);
+      if (g) out.push(g);
+      out.push(it);
+    }
+    s.items = out;
+  }
+}
+
 /** Routes one hop, attaching the transit step breakdown, with a fallback. */
 async function computeLeg(
   origin: Coords,
@@ -667,6 +762,9 @@ export async function routeAndSchedule(
 
   // Drop any stray AI-emitted "travel" cards; we draw travel ourselves.
   if (stripTravel) stripAiTravelItems(parsed);
+  // Always drop our own previously-synthesized idle gaps so this pass rebuilds
+  // them fresh against the new clock (idempotent across repeated recomputes).
+  stripSyntheticGaps(parsed);
 
   // 1) Travel legs (needs a Google key to route with). Each hop's endpoints
   //    are already known (from the place coords), so the hops don't depend on
@@ -854,6 +952,15 @@ export async function routeAndSchedule(
     const item = items[i];
     const legMin = Number(item?.travelFromPrev?.minutes);
     if (Number.isFinite(legMin) && legMin > 0) cursor += legMin;
+    // Honour intended free time captured before this block (the client's
+    // `gapBeforeMin`), mirroring src/lib/itinerary/edits.ts, so a recompute
+    // preserves the day's breathing room instead of compacting it back to
+    // back. A fixed anchor's snap (below) still overrides this. Gap blocks
+    // never carry their own "gap before" (that would double-count free time).
+    if (i > 0 && item?.kind !== 'gap') {
+      const gapBefore = Number(item?.gapBeforeMin);
+      if (Number.isFinite(gapBefore) && gapBefore > 0) cursor += gapBefore;
+    }
     let start = cursor;
     if (item?.flexibility === 'fixed') {
       const fixed = parseHHMM(item.startTime);
@@ -885,4 +992,10 @@ export async function routeAndSchedule(
     }
     cursor = start + dur;
   }
+
+  // 3) Turn any unfilled idle before a fixed/window anchor into a visible
+  //    free-time block, so the day never shows an invisible hole between two
+  //    stops. Purely additive in the empty space ahead of each anchor — it
+  //    shifts nothing already placed.
+  fillIdleGaps(parsed);
 }

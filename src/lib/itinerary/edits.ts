@@ -40,9 +40,30 @@ function newGapId(): string {
 /** Title used for an unnamed gap. Merges prefer a real (user/AI) name over this. */
 const DEFAULT_GAP_TITLE = 'Free time';
 
+// Idle this long (or longer) before a fixed/window anchor becomes a visible
+// free-time block instead of an invisible hole. Mirrors the server
+// (supabase/functions/_shared/routing.ts) and the screen's GAP_MIN_MINUTES so
+// the optimistic paint matches the routed result.
+const GAP_FILL_MIN_MINUTES = 20;
+// Id prefix for gaps SYNTHESIZED by the deterministic idle-fill (client or
+// server). Lets each fill strip its own previous fillers and rebuild them,
+// without ever touching user-made or AI-made gaps (which carry other ids).
+const SYNTH_GAP_PREFIX = 'srv-gap-';
+
+let synthGapCounter = 0;
+
 /** True for an elastic free-time block (the user can name / split / resize it). */
 export function isGap(item: ItineraryItem): boolean {
   return item.kind === 'gap';
+}
+
+/** True for a gap the deterministic idle-fill synthesized (vs. user/AI gaps). */
+function isSyntheticGap(item: ItineraryItem): boolean {
+  return (
+    item.kind === 'gap' &&
+    typeof item.id === 'string' &&
+    item.id.startsWith(SYNTH_GAP_PREFIX)
+  );
 }
 
 /** True when a gap still has the generic name (so it's safe to absorb/rename on merge). */
@@ -285,6 +306,75 @@ function mapItems(itin: Itinerary, fn: (item: ItineraryItem) => ItineraryItem): 
   return {
     ...itin,
     sections: itin.sections.map((s) => ({ ...s, items: s.items.map(fn) })),
+  };
+}
+
+/** Drops gaps a previous idle-fill synthesized, so refilling stays idempotent. */
+function stripSyntheticGaps(itin: Itinerary): Itinerary {
+  return {
+    ...itin,
+    sections: itin.sections
+      .map((s) => ({ ...s, items: s.items.filter((it) => !isSyntheticGap(it)) }))
+      .filter((s) => s.items.length > 0),
+  };
+}
+
+/**
+ * Mirrors the server's idle-fill (`fillIdleGaps` in
+ * `supabase/functions/_shared/routing.ts`): turns unfilled idle before a
+ * fixed/window anchor into a visible `gap` block so the optimistic paint matches
+ * the routed result, with no invisible holes. Expects an ALREADY-CASCADED
+ * itinerary (reads start/end times) and only fills empty space, so it shifts
+ * nothing already placed. Idempotent — strips its own previous fillers first.
+ *
+ * Deliberately NOT folded into `cascadeTimes`: that runs inside the
+ * `fitGapsToAnchors` shrink loop, where re-inserting full-size gaps each pass
+ * would undo the shrink and never converge. This is a finalize-only step.
+ */
+export function fillIdleGaps(itin: Itinerary): Itinerary {
+  const base = stripSyntheticGaps(itin);
+  const items = flatten(base);
+  if (items.length === 0) return base;
+
+  const insertBeforeId = new Map<string, ItineraryItem>();
+  let prevEnd: number | null = null;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const start = minutesOfDay(it.startTime);
+    const isAnchor = it.flexibility === 'fixed' || it.flexibility === 'window';
+    if (i > 0 && isAnchor && start != null && prevEnd != null) {
+      const travel = Number(it.travelFromPrev?.minutes) || 0;
+      const idle = start - travel - prevEnd;
+      if (idle >= GAP_FILL_MIN_MINUTES) {
+        synthGapCounter += 1;
+        insertBeforeId.set(it.id, {
+          id: `${SYNTH_GAP_PREFIX}${Date.now().toString(36)}-${synthGapCounter}`,
+          title: DEFAULT_GAP_TITLE,
+          kind: 'gap',
+          flexibility: 'flexible',
+          startTime: fmtHHMM(prevEnd),
+          endTime: fmtHHMM(prevEnd + idle),
+          durationMinutes: idle,
+          gapBeforeMin: 0,
+          orderIndex: 0,
+        });
+      }
+    }
+    const end =
+      minutesOfDay(it.endTime) ?? (start != null ? start + itemDuration(it) : null);
+    if (end != null) prevEnd = end;
+  }
+
+  if (insertBeforeId.size === 0) return base;
+  return {
+    ...base,
+    sections: base.sections.map((s) => ({
+      ...s,
+      items: s.items.flatMap((it) => {
+        const g = insertBeforeId.get(it.id);
+        return g ? [g, it] : [it];
+      }),
+    })),
   };
 }
 
@@ -1017,10 +1107,14 @@ export function applyOp(itin: Itinerary, op: EditOp): CascadeResult {
       return splitGap(itin, op.id, op.firstMinutes);
     case 'renameItem':
       return renameItem(itin, op.id, op.title);
-    case 'replaceItinerary':
+    case 'replaceItinerary': {
       // A wholesale replacement (used by AI replan today). Cascade it through
-      // the same path so the new plan gets gap-tracking too.
-      return cascadeTimes(op.itinerary);
+      // the same path so the new plan gets gap-tracking too, then surface any
+      // idle before a fixed/window anchor as a visible gap block — matching the
+      // server so a replan never paints invisible holes.
+      const { itinerary, conflicts } = cascadeTimes(op.itinerary);
+      return { itinerary: fillIdleGaps(itinerary), conflicts };
+    }
   }
 }
 

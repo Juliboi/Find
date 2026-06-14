@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   AppState,
   Image,
   Keyboard,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   View,
   useWindowDimensions,
@@ -22,7 +24,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import * as Haptics from 'expo-haptics';
 import * as Notifications from 'expo-notifications';
-import { useDayStore } from '@/store/useDayStore';
 import {
   useSavedItineraries,
   plansForDate,
@@ -58,7 +59,7 @@ import { PlanPeek } from '@/components/PlanPeek';
 import { parseErrandRemote, type ErrandDraft } from '@/lib/ai/parseErrand';
 import { type DiscoveryIntent } from '@/lib/discover';
 import { isDailyReviewResponse } from '@/lib/notifications';
-import { formatTime, formatDuration, todayISO, tomorrowISO } from '@/utils/time';
+import { todayISO, tomorrowISO } from '@/utils/time';
 import {
   DAYTIME_PALETTES,
   getDayPart,
@@ -179,11 +180,6 @@ export default function HomeScreen() {
   const firstName = fullName?.trim().split(/\s+/)[0] ?? '';
   const homeHeading = firstName ? `Hey, ${firstName}` : 'Hey there';
 
-  const plans = useDayStore((s) => s.plans);
-  const isScheduling = useDayStore((s) => s.isScheduling);
-  const isComposing = useDayStore((s) => s.isComposing);
-  const isWorking = isScheduling || isComposing;
-
   const savedTrips = useSavedItineraries((s) => s.items);
   // The homepage is strictly "today": the day's active plan (the one the user
   // pinned, else the first they created that day) is the card, and any other
@@ -215,6 +211,51 @@ export default function HomeScreen() {
   const toggleErrandDone = useErrandsStore((s) => s.toggleDone);
   const reopenErrand = useErrandsStore((s) => s.reopen);
   const removeErrand = useErrandsStore((s) => s.remove);
+
+  // DEV: export the OPEN, dated errands — exactly what the home "Scheduled" list
+  // shows — as JSON for AI Studio. Sourced from `groupErrands().scheduled`, so it
+  // deliberately EXCLUDES completed/planned leftovers (e.g. a "skincare"
+  // freestyle errand left over + marked Planned by an earlier plan) and DOES
+  // include later days like tomorrow's clinic — the mismatch the raw "everything
+  // dated today" version caused. Shares via the OS sheet (its "Copy" hits the
+  // clipboard) and always logs to Metro as a fallback — no native module/rebuild.
+  const copyScheduledErrands = useCallback(async () => {
+    const scheduled = groupErrands(errands, { focusDate: today, today }).scheduled;
+    const payload = scheduled.map((e) => ({
+      title: e.title,
+      startTime: e.startTime ?? null,
+      endTime: e.endTime ?? null,
+      durationMin: e.durationMin ?? null,
+      date: e.date ?? null,
+      address: e.address ?? null,
+      latitude: e.latitude ?? null,
+      longitude: e.longitude ?? null,
+      placeId: e.placeId ?? null,
+      autoPlace: e.autoPlace ?? false,
+      placeQuery: e.placeQuery ?? null,
+      rating: e.rating ?? null,
+      ratingCount: e.ratingCount ?? null,
+      notes: e.notes ?? null,
+      source: e.source ?? 'user',
+    }));
+    if (payload.length === 0) {
+      Alert.alert('No errands', 'No scheduled errands to copy yet.');
+      return;
+    }
+    const json = JSON.stringify(payload, null, 2);
+    // Always log it: the Metro console is the guaranteed grab-point even if the
+    // share sheet is dismissed.
+    console.log(`[errands-copy] ${payload.length} scheduled errand(s)\n${json}`);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+      () => undefined,
+    );
+    try {
+      await Share.share({ message: json });
+    } catch {
+      // dismissed / unavailable — the console log above is the fallback.
+    }
+  }, [errands, today]);
+
   // The home list focuses on today: today's dated errands lead the Scheduled
   // group, then "Anytime" (capped), then a collapsible "Completed" section.
   const errandGroups = useMemo(
@@ -328,9 +369,6 @@ export default function HomeScreen() {
 
   const gradientHeight = Math.round(height * 0.8);
 
-  const next = plans[0];
-  const moreCount = Math.max(0, plans.length - 1);
-
   const [setupOpen, setSetupOpen] = useState(false);
   // When the planner is opened from the daily reminder we seed it to tomorrow;
   // every other entry point (the card, the "+" composer) leaves this undefined
@@ -385,59 +423,6 @@ export default function HomeScreen() {
     };
     cardA11y = 'Building your plan — tap to watch it come together';
     cardFullBody = <PlanBuildingCard job={buildingJob} />;
-  } else if (isWorking) {
-    cardBody = (
-      <>
-        <ActivityIndicator color={t.colors.accent} />
-        <View style={styles.cardText}>
-          <Text variant="micro" uppercase weight="bold" tone="secondary">
-            Planning
-          </Text>
-          <Text variant="body" weight="semibold">
-            Building your schedule…
-          </Text>
-        </View>
-      </>
-    );
-  } else if (next) {
-    cardOnPress = () => {
-      Haptics.selectionAsync().catch(() => undefined);
-      router.push('/itinerary');
-    };
-    cardA11y = "Open today's plan";
-    cardBody = (
-      <>
-        <View style={[styles.dot, { backgroundColor: t.colors.accent }]} />
-        <View style={styles.cardText}>
-          <Text variant="micro" uppercase weight="bold" tone="accent">
-            Up next
-          </Text>
-          <Text variant="body" weight="semibold" numberOfLines={1}>
-            {next.title || next.rawText}
-          </Text>
-          <Text variant="caption" tone="secondary" numberOfLines={1}>
-            {[
-              next.startTime ? formatTime(next.startTime) : null,
-              formatDuration(next.durationMinutes),
-            ]
-              .filter(Boolean)
-              .join(' · ')}
-          </Text>
-        </View>
-        {moreCount > 0 ? (
-          <View style={[styles.morePill, { backgroundColor: t.colors.fill1 }]}>
-            <Text variant="caption" weight="semibold" tone="secondary">
-              +{moreCount}
-            </Text>
-          </View>
-        ) : null}
-        <Ionicons
-          name="chevron-forward"
-          size={18}
-          color={t.colors.textTertiary}
-        />
-      </>
-    );
   } else if (activeToday) {
     cardOnPress = () => {
       Haptics.selectionAsync().catch(() => undefined);
@@ -529,18 +514,31 @@ export default function HomeScreen() {
             <Text variant="title1" weight="bold" tight style={{ color: ON }}>
               {homeHeading}
             </Text>
-            <Pressable
-              onPress={() => {
-                Haptics.selectionAsync().catch(() => undefined);
-                router.push('/settings');
-              }}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel="Settings"
-              style={({ pressed }) => [styles.gear, pressed && { opacity: 0.6 }]}
-            >
-              <Ionicons name="settings-outline" size={19} color={ON} />
-            </Pressable>
+            <View style={styles.headerActions}>
+              {__DEV__ ? (
+                <Pressable
+                  onPress={copyScheduledErrands}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy scheduled errands"
+                  style={({ pressed }) => [styles.gear, pressed && { opacity: 0.6 }]}
+                >
+                  <Ionicons name="copy-outline" size={18} color={ON} />
+                </Pressable>
+              ) : null}
+              <Pressable
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  router.push('/settings');
+                }}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="Settings"
+                style={({ pressed }) => [styles.gear, pressed && { opacity: 0.6 }]}
+              >
+                <Ionicons name="settings-outline" size={19} color={ON} />
+              </Pressable>
+            </View>
           </View>
 
           <View style={styles.hero}>
@@ -566,12 +564,11 @@ export default function HomeScreen() {
           </View>
 
           <Pressable
-            disabled={!cardOnPress}
             onPress={cardOnPress}
-            accessibilityRole={cardOnPress ? 'button' : undefined}
+            accessibilityRole="button"
             accessibilityLabel={cardA11y}
             style={({ pressed }) =>
-              pressed && cardOnPress
+              pressed
                 ? { opacity: 0.9, transform: [{ scale: 0.99 }] }
                 : undefined
             }
@@ -591,7 +588,7 @@ export default function HomeScreen() {
             </GlassSurface>
           </Pressable>
 
-          {!isWorking && otherTodayCount > 0 ? (
+          {otherTodayCount > 0 ? (
             <Pressable
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
@@ -690,6 +687,7 @@ export default function HomeScreen() {
                       errand={errand}
                       onToggleDone={() => toggleErrandDone(errand.id)}
                       onReopen={() => reopenErrand(errand.id)}
+                      onDelete={() => removeErrand(errand.id)}
                       status={errandStatus(errand, today)}
                       showSeparator={i < errandGroups.completed.length - 1}
                     />
@@ -831,6 +829,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingTop: 6,
     paddingBottom: 6,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   gear: {
     width: 40,

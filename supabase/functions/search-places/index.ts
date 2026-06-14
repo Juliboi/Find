@@ -268,6 +268,13 @@ interface PlaceDetails {
   address: string | null;
   latitude: number;
   longitude: number;
+  /**
+   * Google place type labels (e.g. ["lodging","point_of_interest","establishment"]
+   * for a hotel, ["locality","political"] for a city). Lets callers tell a
+   * SPECIFIC venue/landmark anchor apart from a broad area when deciding how
+   * tightly to search "around" it.
+   */
+  types: string[];
   // Rich venue metadata — what makes the picked place show a photo, rating,
   // and opening hours instead of a bare label.
   photoUrl: string | null;
@@ -290,7 +297,7 @@ async function details(
     headers: {
       'X-Goog-Api-Key': apiKey,
       'X-Goog-FieldMask':
-        'id,displayName,formattedAddress,shortFormattedAddress,location,' +
+        'id,displayName,formattedAddress,shortFormattedAddress,location,types,' +
         'rating,userRatingCount,priceLevel,photos,' +
         'currentOpeningHours.openNow,currentOpeningHours.periods,currentOpeningHours.weekdayDescriptions,' +
         'regularOpeningHours.periods,regularOpeningHours.weekdayDescriptions',
@@ -320,6 +327,7 @@ async function details(
     address,
     latitude: lat,
     longitude: lon,
+    types: Array.isArray(p?.types) ? p.types.filter((t: unknown) => typeof t === 'string') : [],
     photoUrl,
     rating: typeof p?.rating === 'number' ? p.rating : null,
     ratingCount: typeof p?.userRatingCount === 'number' ? p.userRatingCount : null,

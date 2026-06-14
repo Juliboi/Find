@@ -160,16 +160,17 @@ INTENT — choose exactly one:
     • an explicit search ("find", "where", "recommend", "suggest", "any");
     • proximity ("near me", "nearby", "closest", "around here");
     • a place CATEGORY combined with a NEIGHBOURHOOD/area ("coffee in Karlín", "pharmacy near Karlín", "good ramen in Žižkov");
+    • a place CATEGORY anchored to a SPECIFIC landmark, hotel, business, station, mall, or venue via "near"/"around"/"close to"/"by" — the named place is just the REFERENCE POINT to search around, NOT the venue you are visiting ("gym near Hilton Prague", "coffee around Charles Bridge", "atm close to the main station", "lunch by the Anděl mall"). Keep intent "discover" and copy that landmark VERBATIM into discovery.area.
     • a SOLO place CATEGORY with no venue chosen yet — this holds EVEN when the category is the ONLY thing said, and even with a date and/or time but NO area and NO person ("gym tomorrow 18:00", "haircut at 3", "dinner at 8", "yoga Saturday morning"). Going to a TYPE of place you have not picked yet (gym, café, pharmacy, salon, pool, climbing wall, a restaurant for lunch/dinner) is "discover": we surface options and let the user pick or let Diem pick.
     • a place CATEGORY that ALSO has a person AND an area/proximity ("coffee with Admir in Karlín at 10", "Natalie Karlín coffee at 12:00").
   A quality adjective on a category is STILL a category, NOT a venue name ("good ramen", "nice coffee", "cheap sushi" → query "ramen"/"coffee"/"sushi"). The user has NOT named one specific venue.
 - "plan": a fixed activity, reminder, or task. Signals:
-    • a specific NAMED venue or street address you could already point to on a map ("Kolkovna at Pankrác", "sport centrum Cimice", "Pirktova 12");
+    • a specific NAMED venue or street address you are GOING TO — named with "at"/"@" or stated as the place itself, one you could already point to on a map ("Kolkovna at Pankrác", "sport centrum Cimice", "Pirktova 12"). NOTE: a category sought NEAR/AROUND a named place ("gym near Hilton Prague") is NOT this — there the named place is only a search anchor, so it stays "discover".
     • a person-centric/social plan named with a PERSON but NO area/neighbourhood ("lunch with Nikol", "drinks with the team", "dinner with Sara") — the venue gets sorted out socially, so we don't surface options. (Add an area or "find" and it flips to "discover": "lunch with Nikol in Karlín".)
     • a COMMUNICATION or possession/TASK verb acting on a person or place — "call", "phone", "ring", "text", "email", "message", "book", "buy", "get", "pick up", "pay", "return" — these are reminders to DO something, NOT a place to go choose. They are "plan" EVEN when they name a category ("call the pharmacy", "buy milk", "email the dentist", "pick up a prescription");
     • a timed commitment NOT tied to a place category — a meeting, work block, or appointment ("standup at 10", "deep work 2–4", "meeting at 14:00"). NOTE: "gym/café/pharmacy/salon/dinner at <time>" DOES name a place category → that is "discover", not "plan".
 
-Rule of thumb: a COMMUNICATION/TASK verb ("call/text/email/buy/book/pick up …") → ALWAYS "plan". A specific NAMED venue/address → "plan". Otherwise: if there's no place at all (or only a person, with no area) → "plan"; if the user would still need to pick among options of a place CATEGORY → "discover" — and that includes a bare category with just a time ("gym at 18:00" → discover). A line can be a timed plan AND a discovery at once (e.g. a 12:00 coffee whose café isn't chosen yet) — that is "discover" (we pick the place, then it becomes the timed errand).
+Rule of thumb: a COMMUNICATION/TASK verb ("call/text/email/buy/book/pick up …") → ALWAYS "plan". A specific NAMED venue/address you are GOING TO ("at"/"@" a place) → "plan". But a place CATEGORY you still need to pick is "discover" — EVEN when it is anchored "near/around/close to" a named landmark or business ("gym near Hilton Prague" → discover, with "Hilton Prague" as the area anchor), and even when it is just a bare category with a time ("gym at 18:00" → discover). Otherwise: if there's no place at all (or only a person, with no area) → "plan". A line can be a timed plan AND a discovery at once (e.g. a 12:00 coffee whose café isn't chosen yet) — that is "discover" (we pick the place, then it becomes the timed errand).
 
 Fields (fill for BOTH intents):
 - title: short, clean, Capitalized activity, WITHOUT the time/date/place baked in, but KEEP the person/context. ("Natalie Karlín coffee at 12:00" → "Coffee with Natalie"; "call the pharmacy" → "Call the pharmacy"; "buy milk" → "Buy milk"; "find a pharmacy" → "Pharmacy").
@@ -180,7 +181,7 @@ Fields (fill for BOTH intents):
 - notes: any leftover detail worth keeping ("bring documents"), else null.
 - discovery: REQUIRED object when intent="discover", null when intent="plan":
     - query: the place CATEGORY to search, cleaned — NO verbs, NO area, NO "near me", NO quality adjective ("pharmacy","coffee","ramen","coworking or cafe","tennis court").
-    - area: the neighbourhood/area to search around if the user named one ("Karlín","Žižkov","Vinohrady"); else null.
+    - area: the place to search AROUND when the user named one — EITHER a neighbourhood/district ("Karlín","Žižkov","Vinohrady") OR a SPECIFIC landmark, hotel, business, station, mall, or venue used as a reference point ("Hilton Prague","Charles Bridge","Anděl","Náměstí Míru"). Copy it EXACTLY as the user wrote it: keep the FULL name, and NEVER shorten a specific place to its city or district (NOT "Hilton Prague" → "Prague", NOT "Anděl mall" → "Smíchov"). null only if the user named no place to search around.
     - nearby: true ONLY for proximity to the user ("near me","nearby","closest","around here"); else false.
 
 Examples:
@@ -194,6 +195,8 @@ Examples:
 "find a pharmacy" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":false}}
 "pharmacy near me" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":true}}
 "find a pharmacy near karlin" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":"Karlín","nearby":false}}
+"gym session near hilton prague" → {"intent":"discover","title":"Gym","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"gym","area":"Hilton Prague","nearby":false}}
+"coffee around charles bridge" → {"intent":"discover","title":"Coffee","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"coffee","area":"Charles Bridge","nearby":false}}
 "good ramen in zizkov" → {"intent":"discover","title":"Ramen","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"ramen","area":"Žižkov","nearby":false}}
 "coffee with admir in karlin tomorrow at 10" → {"intent":"discover","title":"Coffee with Admir","date":"<tomorrow's date>","startTime":"10:00","endTime":"10:45","address":null,"notes":null,"discovery":{"query":"coffee","area":"Karlín","nearby":false}}
 "natalie karlin coffee at 12:00" → {"intent":"discover","title":"Coffee with Natalie","date":null,"startTime":"12:00","endTime":"12:45","address":null,"notes":null,"discovery":{"query":"coffee","area":"Karlín","nearby":false}}

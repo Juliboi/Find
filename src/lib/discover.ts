@@ -28,8 +28,13 @@ import {
 import { autocompletePlaces, resolvePlace } from '@/lib/geocoding';
 import type { LlmTokenUsage } from '@/lib/usage';
 
-/** Where the candidate search was centered, and how we got there. */
-export type DiscoverCenterSource = 'gps' | 'area' | 'home' | 'none';
+/**
+ * Where the candidate search was centered, and how we got there.
+ *   - 'place': anchored on a SPECIFIC named venue/landmark the user gave
+ *     ("near Hilton Prague") — searched tightly AROUND that point.
+ *   - 'area':  anchored on a broad neighbourhood/district ("in Karlín").
+ */
+export type DiscoverCenterSource = 'gps' | 'area' | 'place' | 'home' | 'none';
 
 export interface DiscoverParams {
   /** What the user is looking for, e.g. "pharmacy", "coworking or cafe". */
@@ -193,14 +198,16 @@ function dedupe(items: string[]): string[] {
 }
 
 /**
- * Geocodes a free-text area to a single center. Reuses the location-picker
+ * Geocodes a free-text anchor to a single center. Reuses the location-picker
  * pipeline (Google autocomplete + details, with a Nominatim fallback built into
  * `autocompletePlaces`/`resolvePlace`), biased toward the user when known.
+ * Carries the resolved place's `types` so the caller can tell a SPECIFIC
+ * venue/landmark ("Hilton Prague") apart from a broad area ("Karlín").
  */
 async function geocodeArea(
   area: string,
   bias: Coords | null,
-): Promise<{ center: Coords; label: string } | null> {
+): Promise<{ center: Coords; label: string; types: string[] } | null> {
   try {
     const predictions = await autocompletePlaces(area, bias);
     if (predictions.length > 0) {
@@ -216,6 +223,7 @@ async function geocodeArea(
             longitude: resolved.longitude,
           },
           label: resolved.label,
+          types: Array.isArray(resolved.types) ? resolved.types : [],
         };
       }
     }
@@ -223,6 +231,44 @@ async function geocodeArea(
     // fall through — caller treats null as "couldn't geocode the area".
   }
   return null;
+}
+
+// Google place types that name a BROAD geographic region rather than a single
+// point. An anchor resolving to one of these (and to NO establishment/POI type)
+// is a neighbourhood/city we search WIDELY inside; anything else is a specific
+// venue/landmark we search TIGHTLY around.
+const BROAD_AREA_TYPES = new Set([
+  'locality',
+  'sublocality',
+  'sublocality_level_1',
+  'sublocality_level_2',
+  'neighborhood',
+  'administrative_area_level_1',
+  'administrative_area_level_2',
+  'administrative_area_level_3',
+  'administrative_area_level_4',
+  'administrative_area_level_5',
+  'postal_code',
+  'postal_town',
+  'colloquial_area',
+  'country',
+  'continent',
+  'archipelago',
+]);
+
+/**
+ * True when a resolved anchor is a SPECIFIC point (a hotel, landmark, station,
+ * business, …) rather than a broad area. Google tags real venues with
+ * `establishment`/`point_of_interest`; cities and districts never carry those.
+ * Unknown types (e.g. the Nominatim fallback) are treated as broad so we don't
+ * over-tighten a search we're unsure about.
+ */
+function isPreciseAnchor(types: string[]): boolean {
+  if (!types.length) return false;
+  if (types.includes('establishment') || types.includes('point_of_interest')) {
+    return true;
+  }
+  return !types.some((t) => BROAD_AREA_TYPES.has(t));
 }
 
 interface ResolvedCenter {
@@ -250,7 +296,12 @@ async function resolveCenter(input: {
   const areaName = area?.trim();
   if (areaName && areaName.length >= 2) {
     const geo = await geocodeArea(areaName, fallbackCenter);
-    if (geo) return { center: geo.center, label: geo.label, source: 'area' };
+    if (geo) {
+      // A specific venue/landmark ("Hilton Prague") becomes a 'place' anchor we
+      // search tightly around; a neighbourhood ("Karlín") stays a wide 'area'.
+      const source: DiscoverCenterSource = isPreciseAnchor(geo.types) ? 'place' : 'area';
+      return { center: geo.center, label: geo.label, source };
+    }
     // Geocode miss: search around a known center but keep the area name in the
     // query text so Google still returns the right neighbourhood.
     if (fallbackCenter) {
@@ -275,7 +326,9 @@ async function resolveCenter(input: {
 
 /**
  * Default radius by search kind: tight for "near me", medium around a named
- * area, wide for a general city-level search from home.
+ * neighbourhood, wide for a general city-level search from home. A precise
+ * venue/landmark anchor (center source 'place') is handled by the caller with
+ * an even tighter radius so "near X" stays genuinely near X.
  */
 function defaultRadiusM(params: DiscoverParams): number {
   if (params.nearby) return 2500;
@@ -322,7 +375,11 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
     };
   }
 
-  const radiusM = params.radiusM ?? defaultRadiusM(params);
+  // A specific venue/landmark anchor ("near Hilton Prague") searches TIGHTLY
+  // around the resolved point, so "near X" returns places actually near X
+  // rather than ranked across the whole city the landmark sits in.
+  const radiusM =
+    params.radiusM ?? (resolved.source === 'place' ? 2500 : defaultRadiusM(params));
   // Discovery never filters by "open now": the user is choosing a place for a
   // possibly-later time, so closed-right-now venues must still appear (their
   // open/closed status is shown on each card, not used to hide them).
