@@ -7,6 +7,8 @@ import { useHomeStore } from '@/store/useHomeStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { usePlanSetupStore } from '@/store/usePlanSetupStore';
 import { useErrandsStore } from '@/store/useErrandsStore';
+import { usePeopleStore } from '@/store/usePeopleStore';
+import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import {
   normalizeTime,
@@ -81,6 +83,14 @@ function applyProfileToStores(row: ProfileRow) {
   // Wake time seeds the planner's default day-start, so the answer actually
   // does something instead of just sitting in a column.
   if (wake) usePlanSetupStore.getState().setDayStartTime(wake);
+  // Bedtime is the day's HARD end — onboarding labels "Sleep" as exactly that —
+  // so it seeds the planner's "finish by". The wind-down hour is only when the
+  // evening turns calm; it flows through separately as a constraint, NOT as the
+  // day's end. Seeding the end from wind-down made the planner wrap the whole
+  // day at wind-down and drop "Sleep" hours early (a 23:00 sleeper "going to
+  // bed at 21:00").
+  const dayEnd = bed ?? normalizeTime(row.wind_down_time);
+  if (dayEnd) usePlanSetupStore.getState().setDayEndTime(dayEnd);
 }
 
 /**
@@ -91,12 +101,16 @@ function applyProfileToStores(row: ProfileRow) {
  */
 function syncUserData(userId: string) {
   void useErrandsStore.getState().syncFromRemote(userId);
+  void usePeopleStore.getState().syncFromRemote(userId);
+  void useRecurringErrandsStore.getState().syncFromRemote(userId);
   void useSavedItineraries.getState().syncFromRemote(userId);
 }
 
 /** Wipe synced caches on sign-out so the next user never sees the last one's data. */
 function clearUserData() {
   useErrandsStore.getState().reset();
+  usePeopleStore.getState().reset();
+  useRecurringErrandsStore.getState().reset();
   useSavedItineraries.getState().reset();
 }
 

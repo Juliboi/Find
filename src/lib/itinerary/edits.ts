@@ -777,7 +777,7 @@ export function setLegMode(
     item.id === id && item.travelFromPrev
       ? {
           ...item,
-          travelFromPrev: { ...item.travelFromPrev, mode, estimated: true },
+          travelFromPrev: { ...item.travelFromPrev, mode, modeLocked: true, estimated: true },
         }
       : item,
   );
@@ -797,7 +797,7 @@ export function setDayTransportMode(
     item.travelFromPrev
       ? {
           ...item,
-          travelFromPrev: { ...item.travelFromPrev, mode, estimated: true },
+          travelFromPrev: { ...item.travelFromPrev, mode, modeLocked: true, estimated: true },
         }
       : item,
   );

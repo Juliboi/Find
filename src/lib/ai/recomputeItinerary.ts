@@ -61,6 +61,20 @@ function buildContextPayload(
       label: ctx.currentLocation.label ?? undefined,
     };
   }
+  // The day's planned opening hour. Seeds the clock cascade when the first block
+  // has no time yet (a fresh compose's morning), so the day opens at the user's
+  // chosen start instead of the cascade's 08:00 default.
+  if (ctx.dayStartTime) out.dayStart = ctx.dayStartTime;
+  // The user's sleep time — the day's hard end. Lets the router push an
+  // early-landing "Sleep" block to bedtime and fill the evening with wind-down,
+  // instead of wrapping the day hours before the user actually goes to bed.
+  if (ctx.bedTime) out.bedTime = ctx.bedTime;
+  // Car availability today, so the router never forces a car-mode leg the user
+  // can't take (and honours a "drive" lock only when it's actually drivable).
+  out.car = {
+    owns: ctx.hasCar === true,
+    useToday: ctx.hasCar === true && ctx.useCarToday !== false,
+  };
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

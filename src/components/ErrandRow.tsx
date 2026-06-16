@@ -56,6 +56,13 @@ interface Props {
    * (the trailing undo arrow remains for "pull back to active" instead).
    */
   onDelete?: () => void;
+  /** Mark this row as a recurring occurrence (shows a repeat glyph). */
+  repeats?: boolean;
+  /**
+   * Show a trailing "options" button (used by recurring occurrences for
+   * skip-this-week / edit-series). When set it replaces the plain chevron.
+   */
+  onOptions?: () => void;
 }
 
 /**
@@ -100,6 +107,8 @@ export function ErrandRow({
   status,
   onReopen,
   onDelete,
+  repeats = false,
+  onOptions,
 }: Props) {
   const t = useTheme();
   const meta = metaParts(errand).join(' · ');
@@ -280,6 +289,9 @@ export function ErrandRow({
         {autoPlace && !photo && !dim && !completed ? (
           <Ionicons name="sparkles" size={12} color={t.colors.accentText} />
         ) : null}
+        {repeats && !dim && !completed ? (
+          <Ionicons name="repeat" size={14} color={t.colors.textTertiary} />
+        ) : null}
         {completed && !isDone && onReopen ? (
           <Pressable
             onPress={() => {
@@ -298,7 +310,26 @@ export function ErrandRow({
             />
           </Pressable>
         ) : null}
-        {onPress ? (
+        {onOptions ? (
+          // Recurring occurrence: a dedicated options button (skip / edit
+          // series). Nested Pressable so its taps don't bubble to the row body.
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              onOptions();
+            }}
+            hitSlop={12}
+            accessibilityRole="button"
+            accessibilityLabel={`Options for ${errand.title}`}
+            style={({ pressed }) => [styles.editButton, pressed && { opacity: 0.5 }]}
+          >
+            <Ionicons
+              name="ellipsis-horizontal"
+              size={18}
+              color={t.colors.textSecondary}
+            />
+          </Pressable>
+        ) : onPress ? (
           selectable ? (
             // Select mode: the row body toggles selection, so editing lives in
             // this dedicated right-side button (a nested Pressable, so its taps

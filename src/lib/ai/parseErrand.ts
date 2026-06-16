@@ -12,6 +12,11 @@ import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { todayISO } from '@/utils/time';
 import { detectDiscovery, type DiscoveryIntent } from '@/lib/discover';
 import { logTokenUsage, shapeUsage, type LlmTokenUsage } from '@/lib/usage';
+import {
+  personAliases,
+  usePeopleStore,
+  type PersonPlace,
+} from '@/store/usePeopleStore';
 import type { VenueOpeningHours } from '@/types/itinerary';
 
 /** The fields the parser fills. `null` means "the user didn't say". */
@@ -91,10 +96,19 @@ export async function parseErrandRemote(
     return { draft: { ...EMPTY }, intent: 'plan', discovery: null };
   }
 
+  // The saved people (name + nicknames) let the orchestrator tell "at Ondra's
+  // place" (use their place) from "cinema with Ondra" (just a companion). We
+  // send only ids + aliases — the matched place's coordinates are resolved here
+  // on-device from the people store, never round-tripped through the model.
+  const people = usePeopleStore.getState().items.map((p) => ({
+    id: p.id,
+    names: [p.name, ...p.nicknames],
+  }));
+
   if (isSupabaseConfigured && supabase) {
     try {
       const { data, error } = await supabase.functions.invoke('parse-errand', {
-        body: { text: clean, date: today },
+        body: { text: clean, date: today, people },
       });
       if (!error && data && typeof data === 'object' && !('error' in (data as object))) {
         const shaped = shapeRemote(data as Record<string, unknown>, clean);
@@ -151,7 +165,48 @@ function shapeRemote(data: Record<string, unknown>, rawText: string): ParsedErra
   // The discovered venue is chosen later — don't keep a half-guessed address.
   if (intent === 'discover') draft.address = null;
 
-  return { draft, intent, discovery, usage: shapeUsage(data.usage) };
+  // "Chill at Ondra's place" → swap in Ondra's saved place (with coordinates).
+  // Only for plan intent; a "with X" / "call X" companion comes back with
+  // usePersonPlace=false, so this is a no-op there.
+  const finalDraft =
+    intent === 'plan'
+      ? applyPersonPlace(draft, data.personId, data.usePersonPlace === true)
+      : draft;
+
+  return { draft: finalDraft, intent, discovery, usage: shapeUsage(data.usage) };
+}
+
+/**
+ * When the orchestrator flagged a saved person whose place we should use, swap
+ * that person's saved place (label + coordinates) into the draft, replacing any
+ * raw address text the model echoed. Resolves the person on-device by id.
+ */
+function applyPersonPlace(
+  draft: ErrandDraft,
+  personId: unknown,
+  usePersonPlace: boolean,
+): ErrandDraft {
+  if (!usePersonPlace || typeof personId !== 'string' || !personId.trim()) {
+    return draft;
+  }
+  const person = usePeopleStore
+    .getState()
+    .items.find((p) => p.id === personId.trim());
+  return person?.place ? withPersonPlace(draft, person.place) : draft;
+}
+
+/** Overwrite a draft's place fields with a saved person's fixed place. */
+function withPersonPlace(draft: ErrandDraft, place: PersonPlace): ErrandDraft {
+  return {
+    ...draft,
+    address: place.label,
+    latitude: place.latitude ?? null,
+    longitude: place.longitude ?? null,
+    placeId: place.placeId ?? null,
+    // A person's fixed place is a real spot, not a "let Diem find it" auto-place.
+    autoPlace: false,
+    placeQuery: null,
+  };
 }
 
 /** Validate the model's discovery object; null if there's no usable category. */
@@ -174,6 +229,12 @@ function shapeDiscovery(raw: unknown): DiscoveryIntent | null {
  */
 function localParse(text: string, today: string): ParsedErrand {
   const base = localParseErrand(text, today);
+  // People win over discovery: "chill at Ondra's place" is a fixed spot, not a
+  // category to go choose. A companion line ("cinema with Ondra") returns null.
+  const personPlace = resolvePersonPlaceLocally(text);
+  if (personPlace) {
+    return { draft: withPersonPlace(base, personPlace), intent: 'plan', discovery: null };
+  }
   const detected = detectDiscovery(text);
   if (detected) {
     return {
@@ -185,6 +246,47 @@ function localParse(text: string, today: string): ParsedErrand {
     };
   }
   return { draft: base, intent: 'plan', discovery: null };
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Offline mirror of the orchestrator's people rule. Returns a saved person's
+ * place ONLY when the line is possessive / "at <name>'s" ("chill at Ondra's
+ * place", "at Ondra's", "Ondra's flat") — and never when the person is a
+ * companion or the target of a communication ("cinema with Ondra", "call
+ * Ondra"). Null when no saved person's place applies.
+ */
+function resolvePersonPlaceLocally(text: string): PersonPlace | null {
+  const people = usePeopleStore.getState().items;
+  if (!people.length) return null;
+  // Normalize "ondra's" → "ondras" so one set of patterns covers both.
+  const hay = ` ${text.toLowerCase().replace(/'s\b/g, 's')} `;
+  for (const person of people) {
+    if (!person.place?.label) continue;
+    for (const alias of personAliases(person)) {
+      const a = escapeRegExp(alias.replace(/'s\b/g, 's'));
+      // Companion / communication → this person is NOT a place. Bail entirely.
+      if (
+        new RegExp(
+          `\\b(with|call|calling|text|texting|message|messaging|meet|meeting|see|ring|phone|email|emailing|dm)\\s+${a}\\b`,
+        ).test(hay)
+      ) {
+        return null;
+      }
+      // "at <alias>" / "at <alias>s" → going to their place.
+      if (new RegExp(`\\bat\\s+${a}s?\\b`).test(hay)) return person.place;
+      // "<alias>s place/home/flat/…" → their place, even without "at".
+      if (
+        new RegExp(`\\b${a}s\\s+(place|home|flat|apartment|house|spot|pad)\\b`).test(hay)
+      ) {
+        return person.place;
+      }
+    }
+  }
+  return null;
 }
 
 function capitalize(s: string): string {

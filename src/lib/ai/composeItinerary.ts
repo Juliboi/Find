@@ -115,7 +115,7 @@ function num(v: unknown): number | null {
  * an old deploy must never feed the assembler a malformed block) and keep the
  * same placement-consistency invariants the assembler relies on.
  */
-function shapeBlocks(raw: unknown, anchorIds: Set<string>): ComposedBlock[] {
+export function shapeBlocks(raw: unknown, anchorIds: Set<string>): ComposedBlock[] {
   if (!Array.isArray(raw)) return [];
   const out: ComposedBlock[] = [];
   for (const r of raw) {

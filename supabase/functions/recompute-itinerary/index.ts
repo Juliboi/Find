@@ -69,6 +69,18 @@ function normalizeContext(input: any): Context {
       };
     }
   }
+  if (input.car && typeof input.car === 'object') {
+    ctx.car = {
+      owns: input.car.owns === true,
+      useToday: input.car.useToday !== false,
+    };
+  }
+  if (typeof input.dayStart === 'string' && /^\d{1,2}:\d{2}$/.test(input.dayStart)) {
+    ctx.dayStart = input.dayStart;
+  }
+  if (typeof input.bedTime === 'string' && /^\d{1,2}:\d{2}$/.test(input.bedTime)) {
+    ctx.bedTime = input.bedTime;
+  }
   return ctx;
 }
 

@@ -34,7 +34,12 @@ import { useTheme } from '@/theme/useTheme';
 import type { ThemeColors } from '@/theme/colors';
 import { useHomeStore, selectEndOfDay } from '@/store/useHomeStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
-import { usePlanSetupStore } from '@/store/usePlanSetupStore';
+import {
+  usePlanSetupStore,
+  MEAL_KEYS,
+  type MealKey,
+} from '@/store/usePlanSetupStore';
+import { mealErrandLabel } from '@/lib/meals';
 import { useProfileStore } from '@/store/useProfileStore';
 import {
   useErrandsStore,
@@ -43,6 +48,8 @@ import {
   type Errand,
   type ErrandInput,
 } from '@/store/useErrandsStore';
+import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
+import { materializeRecurringForDate } from '@/lib/recurring';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
@@ -66,6 +73,7 @@ import {
   type AssembleAnchor,
   type AssembleTask,
 } from '@/lib/ai/composeAssemble';
+import { refineItinerary } from '@/lib/ai/refineItinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
 import { requestAdjustOps } from '@/lib/ai/adjustItinerary';
 import { collectDayAnchors } from '@/lib/dayAnchors';
@@ -225,14 +233,23 @@ const PLANNING_PHASES = [
 
 const HOME_ID = '__home__';
 
-// Unified compose brain (v3) rollout flag. When `EXPO_PUBLIC_UNIFIED_COMPOSE=1`,
-// planning runs through the single `compose-itinerary` brain + deterministic
-// Places resolve + assembly, instead of the legacy decompose-intent +
-// plan-itinerary two-pass. Off by default so the proven path stays the
-// production behaviour until the new one is validated (see the plan's
-// validate-rollout step). The unified path degrades gracefully to legacy if the
-// brain returns nothing.
-const UNIFIED_COMPOSE = process.env.EXPO_PUBLIC_UNIFIED_COMPOSE === '1';
+// Unified compose brain (v3) rollout flag. Planning runs through the single
+// `compose-itinerary` brain + deterministic Places resolve + assembly, instead
+// of the legacy decompose-intent + plan-itinerary two-pass. DEFAULT ON (this is
+// now the validated path); set `EXPO_PUBLIC_UNIFIED_COMPOSE=0` to force the
+// legacy two-pass. The unified path also degrades gracefully to legacy if the
+// brain returns nothing. (Legacy is kept as the runtime fallback; "Direction C"
+// — one full-control planner with venue/route/hours tools — is the documented
+// next fallback if this underperforms; see the planner overhaul plan.)
+const UNIFIED_COMPOSE = process.env.EXPO_PUBLIC_UNIFIED_COMPOSE !== '0';
+
+// AI refine pass (v3 second pass). After the unified path produces + grounds a
+// day, a single `refine-itinerary` call re-plans on top of the REAL venues +
+// travel + opening hours (reorder, retime, fill gaps, split errands, swap/retime
+// closed venues). DEFAULT ON; set `EXPO_PUBLIC_REFINE=0` to disable. Degrades
+// gracefully to the pre-refine grounded day on any failure or no-op (including
+// before `refine-itinerary` is deployed), so turning it on is always safe.
+const REFINE = process.env.EXPO_PUBLIC_REFINE !== '0';
 
 // Don't flag tiny slivers as "free time" — only gaps worth noticing.
 const GAP_MIN_MINUTES = 20;
@@ -457,6 +474,8 @@ export default function ItineraryScreen() {
   const dietary = useProfileStore((s) => s.dietary);
   const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
   const useCarToday = usePlanSetupStore((s) => s.useCarToday);
+  const planMealModes = usePlanSetupStore((s) => s.mealModes);
+  const planMealLinks = usePlanSetupStore((s) => s.mealLinks);
   const saveItinerary = useSavedItineraries((s) => s.save);
   const updateSavedItinerary = useSavedItineraries((s) => s.update);
   const activatePlan = useSavedItineraries((s) => s.activate);
@@ -470,6 +489,9 @@ export default function ItineraryScreen() {
   const planEndTime = usePlanSetupStore((s) => s.endTime);
   const planEndLocation = usePlanSetupStore((s) => s.endLocation);
   const setDayPlan = usePlanSetupStore((s) => s.setDayPlan);
+  const clearMealLinksForErrand = usePlanSetupStore(
+    (s) => s.clearMealLinksForErrand,
+  );
   const effectiveDate = isPastDay(planDate) ? todayISO() : planDate;
   const [setupOpen, setSetupOpen] = useState(false);
   // Which step the setup drawer opens to: 0 = pick the day, 1 = start & end.
@@ -591,13 +613,18 @@ export default function ItineraryScreen() {
   // re-adding ones the user has unticked. See `seedSelectedErrands`.
   const errandSeedDateRef = useRef<string | null>(null);
   const seenDayErrandsRef = useRef<Set<string>>(new Set());
-  const toggleErrandSelected = (id: string) =>
+  const toggleErrandSelected = (id: string) => {
+    // Unticking an errand also drops any confirmed meal link to it, so a dining
+    // errand the user removed from the plan stops standing in for its meal (in
+    // the setup drawer's meals step and the planner's meal-venue context alike).
+    if (selectedErrandIds.has(id)) clearMealLinksForErrand(id);
     setSelectedErrandIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+  };
 
   // Active candidates are open errands only; planned/done ones drop into the
   // Completed group below. `groupErrands` does the status split + sorting and
@@ -616,6 +643,15 @@ export default function ItineraryScreen() {
   const anytimeErrands = errandGroups.anytime;
   const completedErrands = errandGroups.completed;
   const [showCompletedErrands, setShowCompletedErrands] = useState(false);
+
+  // Materialize the planned day's recurring occurrences so they become real
+  // dated errands for `effectiveDate`. They then flow through everything below
+  // as ordinary errands: `dayErrands` picks them up, the preselect effect ticks
+  // them on ("always preselected"), and "mark planned" works unchanged.
+  const recurringTemplates = useRecurringErrandsStore((s) => s.items);
+  useEffect(() => {
+    materializeRecurringForDate(effectiveDate);
+  }, [effectiveDate, recurringTemplates]);
 
   // Open dated errands for the planned day are the user's clear intent, so they
   // get preselected. `groupErrands` already excludes done/planned ones.
@@ -732,6 +768,20 @@ export default function ItineraryScreen() {
   // Memoised so it's stable across renders — effects that depend on `context`
   // (auto-refresh, log dumper) only re-fire when the underlying pins actually
   // change, not on every parent re-render.
+  // Resolve each meal's linked dining errand (set in the planner drawer) to a
+  // venue label the planning brain can use as that meal — so a "Dinner at Café
+  // Savoy" errand becomes dinner instead of the brain inventing a separate one.
+  const mealVenuesForCtx = useMemo(() => {
+    const out: Partial<Record<MealKey, string>> = {};
+    for (const meal of MEAL_KEYS) {
+      const id = planMealLinks?.[meal];
+      if (!id) continue;
+      const e = errands.find((x) => x.id === id);
+      if (e) out[meal] = mealErrandLabel(e);
+    }
+    return out;
+  }, [planMealLinks, errands]);
+
   const context = useMemo<SchedulerContext>(
     () => ({
       home,
@@ -743,6 +793,7 @@ export default function ItineraryScreen() {
             label: planStartLocation.label,
           }
         : undefined,
+      dayStartTime: planStartTime,
       userName,
       wakeTime: profileWakeTime,
       bedTime: profileBedTime,
@@ -757,6 +808,8 @@ export default function ItineraryScreen() {
       allowScreenWindDown,
       hasCar,
       useCarToday,
+      mealModes: planMealModes,
+      mealVenues: mealVenuesForCtx,
       dietary,
       dietaryNotes,
     }),
@@ -764,6 +817,7 @@ export default function ItineraryScreen() {
       home,
       effectiveEndOfDay,
       planStartLocation,
+      planStartTime,
       userName,
       profileWakeTime,
       profileBedTime,
@@ -778,6 +832,8 @@ export default function ItineraryScreen() {
       allowScreenWindDown,
       hasCar,
       useCarToday,
+      planMealModes,
+      mealVenuesForCtx,
       dietary,
       dietaryNotes,
     ],
@@ -1388,6 +1444,15 @@ export default function ItineraryScreen() {
     if (startCoord) dayAnchorCoords.push(startCoord);
     if (endCoord) dayAnchorCoords.push(endCoord);
 
+    // The drawer "Start time" is the user's explicit, per-day signal of when the
+    // day BEGINS, so it must anchor the morning routine. Without this the brain
+    // opens the day at the profile's default wake (e.g. 08:00) and ignores the
+    // 09:00 the user just picked in the drawer. Once the day is already underway
+    // no morning is generated (includeMorning is false), so we leave the wake as
+    // it is then.
+    const composeCtx = buildContextPayload(context);
+    if (composeCtx && !dayUnderway && startForFrame) composeCtx.wakeTime = startForFrame;
+
     tracePlan('(1) COMPOSE BRAIN REQUEST — full merged day (one pass)', {
       intent: text,
       date: effectiveDate,
@@ -1404,7 +1469,7 @@ export default function ItineraryScreen() {
       tasks: composeTasks,
       dayStart: { time: startForFrame, label: planStartLocation?.label },
       dayEnd: { time: planEndTime, label: planEndLocation?.label },
-      context: buildContextPayload(context),
+      context: composeCtx,
       home: home
         ? { label: home.label, latitude: home.latitude, longitude: home.longitude }
         : undefined,
@@ -1478,17 +1543,79 @@ export default function ItineraryScreen() {
     setLoading(false);
     setRoutesRefining(true);
     console.log(`[plan-trace] RECOMPUTE source=compose-bg seq=${seq}`);
-    void recomputeItinerary(itin, contextFor(itin))
-      .then((refreshed) => {
+    void (async () => {
+      try {
+        // Pass 1 — GROUND the day: resolve real door-to-door travel legs,
+        // cascade the clock, synthesise idle gaps. (Venues already resolved.)
+        const grounded = await recomputeItinerary(itin, contextFor(itin));
         if (planSeqRef.current !== seq) return;
-        if (!refreshed.refreshed) return;
-        attachAlternatives(refreshed.itinerary, altByCoordKey);
-        setItinerary(refreshed.itinerary);
-        updateSavedItinerary(id, refreshed.itinerary);
-      })
-      .finally(() => {
+        let current = itin;
+        if (grounded.refreshed) {
+          current = grounded.itinerary;
+          attachAlternatives(current, altByCoordKey);
+          setItinerary(current);
+          updateSavedItinerary(id, current);
+        }
+
+        // Pass 2 (flag-gated) — AI REFINE on the grounded day: re-plan against
+        // REAL venues + travel + opening hours (reorder, fill gaps, retime,
+        // split, swap closed), then re-assemble + re-route the revision. Any
+        // failure or no-op leaves the grounded day exactly as it is.
+        if (!REFINE || !grounded.refreshed) return;
+        tracePlan('(4) REFINE REQUEST — grounded day → refine brain', {
+          date: effectiveDate,
+          now: nowArg ?? null,
+        });
+        const refined = await refineItinerary({
+          itinerary: current,
+          intent: text,
+          date: effectiveDate,
+          now: nowArg,
+          dayStart: { time: startForFrame, label: planStartLocation?.label },
+          dayEnd: { time: planEndTime, label: planEndLocation?.label },
+          context: composeCtx,
+          anchors: composeAnchors,
+          tasks: composeTasks,
+        });
+        if (planSeqRef.current !== seq) return;
+        if (!refined.changed || refined.blocks.length === 0) {
+          tracePlan('(5) REFINE — no change', refined.notes || null);
+          return;
+        }
+        tracePlan('(5) REFINE RESPONSE — revised blocks', {
+          notes: refined.notes,
+          blocks: refined.blocks,
+        });
+
+        const { itinerary: refinedItin, altByCoordKey: refinedAlts } =
+          await assembleComposedDay({
+            blocks: refined.blocks,
+            title: current.title || 'Your day',
+            summary: current.summary ?? '',
+            city: current.city ?? '',
+            date: effectiveDate,
+            anchorsById,
+            tasksById,
+            dayAnchorCoords,
+            start: startCoord,
+            end: endCoord,
+          });
+        if (planSeqRef.current !== seq || !refinedItin) return;
+        // Keep the day's id + baked start across the revision so it updates the
+        // same saved record and re-routes the first leg from the same origin.
+        refinedItin.id = current.id;
+        refinedItin.startLocation = current.startLocation ?? refinedItin.startLocation;
+
+        const regrounded = await recomputeItinerary(refinedItin, contextFor(refinedItin));
+        if (planSeqRef.current !== seq) return;
+        const out = regrounded.refreshed ? regrounded.itinerary : refinedItin;
+        attachAlternatives(out, refinedAlts);
+        setItinerary(out);
+        updateSavedItinerary(id, out);
+      } finally {
         if (planSeqRef.current === seq) setRoutesRefining(false);
-      });
+      }
+    })();
     return true;
   };
 
@@ -2122,9 +2249,24 @@ export default function ItineraryScreen() {
       console.log(
         `[plan-trace] START source=escalateReplan editSeq=${mySeq} current=${editSeqRef.current} overrun=${overrun?.itemId ?? 'none'}`,
       );
+      // Carry the day frame (start/end time + locations) into the replan so a
+      // fast rebalance keeps the same bookends — otherwise it would drop the
+      // wind-down/wake frame and collapse the day onto defaults.
+      const setup = usePlanSetupStore.getState();
+      const replanDate = routed.date ?? todayISO();
+      const planningToday = replanDate === todayISO();
+      const localNow = currentHHMM();
+      const dayUnderway = planningToday && !!setup.startTime && localNow > setup.startTime;
+      const dayStart: PlanDayEdge = { time: dayUnderway ? localNow : setup.startTime };
+      if (setup.startLocation?.label) dayStart.label = setup.startLocation.label;
+      const dayEnd: PlanDayEdge = { time: setup.endTime };
+      if (setup.endLocation?.label) dayEnd.label = setup.endLocation.label;
       const result = await planItinerary(request, {
         context: contextFor(routed),
-        date: routed.date ?? todayISO(),
+        date: replanDate,
+        now: dayUnderway ? localNow : undefined,
+        dayStart,
+        dayEnd,
         fast: true,
       });
       if (mySeq !== editSeqRef.current) return;
@@ -3108,6 +3250,7 @@ export default function ItineraryScreen() {
         initialDate={effectiveDate}
         initialTime={planStartTime}
         initialStep={setupStep}
+        selectedErrandIds={selectedErrandIds}
       />
 
       <ErrandDrawer
@@ -4296,7 +4439,13 @@ function TravelLegRow({
   // duration is the real door-to-door span, not the cascade's slack-padded one.
   const realSpan = gFrame.length ? gFrame[gFrame.length - 1].g1 - gFrame[0].g0 : 0;
   const headerLeaveBy = usingReal && stepTimes.length ? stepTimes[0].start : leaveBy;
-  const headerMinutes = usingReal && realSpan > 0 ? realSpan : leg.minutes;
+  // The real span should track the routed door-to-door minutes. If the unwrapped
+  // step frame produces something implausible (a midnight roll or a stale
+  // schedule can balloon it into a "15 hr 5 min"/"905 min" header), fall back to
+  // the server's authoritative leg minutes rather than showing the absurd value.
+  const realSpanPlausible =
+    realSpan > 0 && realSpan <= Math.max(leg.minutes * 2 + 30, 360);
+  const headerMinutes = usingReal && realSpanPlausible ? realSpan : leg.minutes;
 
   // Hop times on the rail's ABSOLUTE (midnight-unwrapped) axis. First unwrap the
   // hops among themselves (a journey can roll past midnight: alight 00:32 after

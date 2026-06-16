@@ -273,9 +273,9 @@ function describeContext(ctx: any, includeMorning: boolean): string {
   if (ctx.home?.label) lines.push(`- Home base: ${ctx.home.label}.`);
   if (includeMorning && ctx.wakeTime) {
     lines.push(
-      `- Wakes around ${ctx.wakeTime}${
-        ctx.wakeUpDurationMin ? `, ~${ctx.wakeUpDurationMin} min to get ready` : ''
-      }. Open the day at home with wake → get ready → breakfast BEFORE the head-out time.`,
+      `- The day STARTS at ${ctx.wakeTime}${
+        ctx.wakeUpDurationMin ? ` (~${ctx.wakeUpDurationMin} min to get ready)` : ''
+      }. Open AT HOME exactly then with wake → get ready → breakfast — schedule NOTHING before ${ctx.wakeTime} — then head out to the stops.`,
     );
   }
   if (ctx.bedTime) {
@@ -288,19 +288,30 @@ function describeContext(ctx: any, includeMorning: boolean): string {
     const parts: string[] = [];
     for (const name of ['breakfast', 'lunch', 'dinner']) {
       const w = meals[name];
-      if (w && (w.start || w.end)) {
-        parts.push(`${name} ${w.start ?? ''}${w.start && w.end ? '–' : ''}${w.end ?? ''}`.trim());
+      if (!w) continue;
+      const win =
+        w.start || w.end
+          ? `${w.start ?? ''}${w.start && w.end ? '–' : ''}${w.end ?? ''}`.trim()
+          : 'anytime';
+      let pref = ' → no preference (you decide home vs out)';
+      if (w.venue) {
+        pref = ` → at ${w.venue} (the user's OWN errand — treat THAT errand as this meal; do NOT add a separate ${name})`;
+      } else if (w.mode === 'home') {
+        pref = ' → AT HOME (placement="home", no venue, no travel)';
+      } else if (w.mode === 'out') {
+        pref = ' → OUT (find a spot near the route at that time)';
       }
+      parts.push(`${name} ${win}${pref}`);
     }
     if (parts.length) {
       lines.push(
-        `- Meal windows: ${parts.join('; ')}. Schedule each meal to START inside its window (use "window" flexibility). A meal OUT goes to a venue CLOSE to the neighbouring stops; a meal at home needs no venue.`,
+        `- Meals: ${parts.join('; ')}. Schedule each meal to START inside its window (use "window" flexibility) and HONOUR each preference: "AT HOME" → placement="home" with no venue; "OUT" → a venue CLOSE to the neighbouring stops; a meal that NAMES a venue is one of the user's errands, so place THAT errand as the meal and never add a duplicate. Only "no preference" is your call.`,
       );
     }
   }
   if (ctx.windDownTime) {
     lines.push(
-      `- After ${ctx.windDownTime}: ONLY calm, sleep-friendly activities (reading, skincare, stretching, journaling). At-home wind-down tasks belong here, back-to-back.${
+      `- Be HOME and winding down by ${ctx.windDownTime}: every out-and-about block AND the trip home must FINISH before ${ctx.windDownTime}. After it, ONLY calm, sleep-friendly activities AT HOME (reading, skincare, stretching, journaling) — nothing active (work, study, language practice, errands, eating out, workouts). Anything active must END before ${ctx.windDownTime}, not merely start before it.${
         ctx.allowScreenWindDown === false
           ? ' Avoid screen-heavy wind-down (TV, gaming, phone).'
           : ''
@@ -381,7 +392,7 @@ function buildPrompt(args: {
     : '  (none)';
 
   const frameBits = [
-    args.dayStart?.time ? `heads out ~${args.dayStart.time}` : '',
+    args.dayStart?.time ? `starts the day ~${args.dayStart.time}` : '',
     args.dayStart?.label ? `from ${args.dayStart.label}` : '',
     args.dayEnd?.time ? `finishes by ~${args.dayEnd.time}` : '',
     args.dayEnd?.label ? `at ${args.dayEnd.label}` : '',
@@ -417,7 +428,7 @@ YOUR JOB — emit "blocks", a SINGLE ORDERED list covering the whole day from st
 4. CO-LOCATE compatible activities onto a stop that ALREADY exists: if "deep work" or "content prep" can happen at a café anchor, set placement="colocate" and anchorId=<that anchor's id> (no findQuery).
 5. AT-HOME / ONLINE blocks → placement="home", no query. This covers self-care (skincare, reading, a nap, journaling, stretching) AND anything online/remote (a video/phone call, telehealth/online therapy, remote work, a virtual class). If a task is marked AT-HOME, or its words say online/virtual/remote/zoom/meet/teams/video call/phone, it has NO venue — ALWAYS placement="home", even if it has a clock time.
 6. A venue the USER NAMED verbatim (in a task hint or the free text, e.g. "hostinec U Mišků") → placement="venue", userQuery=<their EXACT words>.
-7. ROUTINE: ${includeMorning ? 'OPEN the day at home with wake → get ready → breakfast (placement="home") BEFORE the head-out time, then ' : ''}order the out-and-about stops to MINIMISE travel (no zig-zagging across town), and ${args.context?.bedTime ? 'CLOSE with a calm wind-down then a single fixed "Sleep" block near ' + args.context.bedTime : 'end at a sensible time'}. Do NOT invent errands the user didn't mention. Give any genuine open stretch of 20+ minutes its own placement="home", kind="gap" block (a friendly title) rather than padding activities.
+7. ROUTINE: ${includeMorning ? 'OPEN the day at home with wake → get ready → breakfast (placement="home") STARTING at the day\'s start time — schedule nothing earlier — then ' : ''}order the out-and-about stops to MINIMISE travel (no zig-zagging across town), and ${args.context?.bedTime ? 'CLOSE with a calm wind-down then a single fixed "Sleep" block near ' + args.context.bedTime : 'end at a sensible time'}. Do NOT invent errands the user didn't mention. Give any genuine open stretch of 20+ minutes its own placement="home", kind="gap" block (a friendly title) rather than padding activities.
 8. PINNED TIMES ARE LAW: copy any PINNED startTime/endTime verbatim onto that block. Leave startTime/endTime null for everything else — a downstream router lays the real clock + travel down. durationMin: convert explicit lengths ("2 hours"→120, "1.5h"→90) else leave null.
 9. flexibility: "fixed" ONLY for a user-pinned clock time or a hard external commitment (reservation, appointment, class, transport) AND the single closing sleep block. EVERYTHING else (gym, deep work, self-care, meals at home, walks, gaps) is "flexible". "window" for things bound to a range (a meal window, opening hours).
 10. kind: best-fit ("work","meal","activity","errand","break","gap","sightseeing","drinks","meetup","event","travel","other"). section: a short catchy headline to group consecutive blocks ("Morning Reset","Gym & Recovery","Wind Down"). period: Morning/Afternoon/Evening. description: 1 short sentence.
@@ -425,6 +436,10 @@ YOUR JOB — emit "blocks", a SINGLE ORDERED list covering the whole day from st
 RULES:
 - placement="find" REQUIRES findQuery. placement="colocate" REQUIRES anchorId pointing at a real located id above. placement="venue" REQUIRES userQuery. placement="anchor" REQUIRES anchorId. placement="home" has none of these.
 - NEVER emit coordinates and NEVER emit a "travel" block for a short hop — travel is computed for you. Keep block titles short and human ("Deep work","Gym session","Skincare"), no times/areas baked into the title.
+- Don't pile several flexible blocks (a meal + a study session + …) into a short slot right before a PINNED stop — there won't be time and they get crushed to slivers. Give a meal its own realistic slot and place extra flexible work where the day has real room (a café block, a free stretch), not crammed before an appointment. Don't list the same flexible activity twice unless each gets a sensible length.
+- Prefer a meal AT HOME (placement="home") over a short meal OUT when eating out adds a real commute and nearby flexible time could be used instead.
+- OBEY the per-meal preference in the Meals context line: "AT HOME" → placement="home", no venue; "OUT" → a venue near the route; a meal that NAMES a venue is the user's own errand — schedule THAT errand as the meal and add NO duplicate meal block. Only override toward home/out when the meal says "no preference".
+- BEDTIME is the day's hard end: fill the evening from the last activity up to bedtime with calm wind-down (kind="gap"), then the single fixed "Sleep" block AT bedtime — never an early sleep that leaves the evening empty.
 - Blocks must be in clock order (earliest first).`;
 }
 

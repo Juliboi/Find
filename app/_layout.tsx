@@ -20,11 +20,20 @@ import { WaveLoader } from '@/components/WaveLoader';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
 import {
+  activePlanForDate,
+  useSavedItineraries,
+  type SavedItinerary,
+} from '@/store/useSavedItineraries';
+import {
   configureNotifications,
   isDailyReviewResponse,
   isPlanReadyResponse,
+  isPlanReminderResponse,
   planReadySavedId,
+  planReminderSavedId,
+  schedulePlanReminders,
 } from '@/lib/notifications';
+import { todayISO, tomorrowISO } from '@/utils/time';
 import { InAppNotification } from '@/components/InAppNotification';
 
 // Hold the native splash until React has painted our themed splash overlay, so
@@ -95,6 +104,8 @@ function useAuthGate(): boolean {
 function useNotificationsBootstrap(): void {
   const router = useRouter();
   const notifHydrated = useNotificationStore((s) => s.hydrated);
+  const planRemindersMode = useNotificationStore((s) => s.planRemindersMode);
+  const savedItems = useSavedItineraries((s) => s.items);
 
   useEffect(() => {
     void configureNotifications();
@@ -104,11 +115,39 @@ function useNotificationsBootstrap(): void {
     if (notifHydrated) void useNotificationStore.getState().reconcile();
   }, [notifHydrated]);
 
+  // Keep per-plan reminders in sync with the user's choice AND the active plans
+  // for today/tomorrow. `schedulePlanReminders` is idempotent (it clears the
+  // old set first) and silently no-ops without permission or when off, so we
+  // can safely re-run it on every relevant change. Debounced so a burst of
+  // store updates (e.g. the initial remote sync) only reschedules once.
+  useEffect(() => {
+    if (!notifHydrated) return;
+    const handle = setTimeout(() => {
+      const plans = [
+        activePlanForDate(savedItems, todayISO()),
+        activePlanForDate(savedItems, tomorrowISO()),
+      ].filter((p): p is SavedItinerary => p != null);
+      void schedulePlanReminders(plans, planRemindersMode);
+    }, 800);
+    return () => clearTimeout(handle);
+  }, [notifHydrated, planRemindersMode, savedItems]);
+
   useEffect(() => {
     const sub = Notifications.addNotificationResponseReceivedListener(
       (response) => {
         if (isDailyReviewResponse(response)) {
           router.navigate('/');
+          return;
+        }
+        // A per-plan reminder: open the plan it belongs to when we know its id,
+        // else fall back to home.
+        if (isPlanReminderResponse(response)) {
+          const savedId = planReminderSavedId(response);
+          if (savedId) {
+            router.navigate({ pathname: '/itinerary', params: { id: savedId } });
+          } else {
+            router.navigate('/');
+          }
           return;
         }
         // A finished-plan push: open straight to the built day when we know
@@ -184,6 +223,8 @@ export default function RootLayout() {
             />
             <Stack.Screen name="index" />
             <Stack.Screen name="settings" />
+            <Stack.Screen name="people" />
+            <Stack.Screen name="recurring-errands" />
             <Stack.Screen
               name="add"
               options={{

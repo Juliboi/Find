@@ -20,12 +20,19 @@ import { Button } from '@/components/Button';
 import { Card } from '@/components/Card';
 import { Input } from '@/components/Input';
 import { HomePicker } from '@/components/HomePicker';
+import { PeopleManager } from '@/components/PeopleManager';
+import { RecurringErrandManager } from '@/components/RecurringErrandManager';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
+import { useNotificationStore } from '@/store/useNotificationStore';
+import {
+  ensureNotificationPermission,
+  type PlanRemindersMode,
+} from '@/lib/notifications';
 import { formatTime } from '@/utils/time';
 
-const STEP_COUNT = 7;
+const STEP_COUNT = 10;
 
 /**
  * Maps a settings "edit" deep-link to the onboarding step that owns that
@@ -42,6 +49,8 @@ const EDIT_STEPS: Record<string, number> = {
   winddown: 4,
   car: 5,
   diet: 6,
+  people: 7,
+  recurring: 8,
 };
 
 /** Dietary tags offered as chips in onboarding (kept short + recognisable). */
@@ -122,6 +131,10 @@ export default function OnboardingScreen() {
   const home = useHomeStore((s) => s.home);
   const saveOnboarding = useAuthStore((s) => s.saveOnboarding);
   const user = useAuthStore((s) => s.user);
+  const planRemindersMode = useNotificationStore((s) => s.planRemindersMode);
+  const setPlanRemindersMode = useNotificationStore(
+    (s) => s.setPlanRemindersMode,
+  );
   const storedName = useProfileStore((s) => s.fullName);
   const storedWake = useProfileStore((s) => s.wakeTime);
   const storedBed = useProfileStore((s) => s.bedTime);
@@ -226,6 +239,16 @@ export default function OnboardingScreen() {
     );
   };
 
+  // Plan reminders live in the (local-first) notification store, not the synced
+  // profile, so we write the choice straight through on tap. Picking a notifying
+  // mode prompts for permission; the root effect schedules the reminders once a
+  // plan exists. Permission being refused is fine here — the choice still sticks
+  // and starts working the moment notifications are enabled.
+  const choosePlanReminders = (mode: PlanRemindersMode) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    void setPlanRemindersMode(mode);
+  };
+
   const goNext = () => {
     if (!canContinue) return;
     Haptics.selectionAsync().catch(() => undefined);
@@ -284,6 +307,13 @@ export default function OnboardingScreen() {
 
   // First-run: the auth gate sees needsOnboarding flip to false and routes home.
   const finish = () => {
+    // The reminders step defaults to a notifying mode, so a user can finish
+    // without ever tapping it. Ask for permission as we wrap up (best-effort,
+    // non-blocking, and a no-op once already decided) so the default actually
+    // fires — the root effect schedules reminders once a plan exists.
+    if (planRemindersMode !== 'none') {
+      void ensureNotificationPermission();
+    }
     void persist();
   };
 
@@ -400,6 +430,24 @@ export default function OnboardingScreen() {
           <StepIntro
             title="How do you eat?"
             subtitle="So every food and drink stop fits you. Pick any that apply, or skip it."
+          />
+        ) : null}
+        {step === 7 ? (
+          <StepIntro
+            title="Anyone with a usual spot?"
+            subtitle="Save people and their place, so “chill at Ondra’s” lands at the right address — while “call Ondra” stays put. Optional."
+          />
+        ) : null}
+        {step === 8 ? (
+          <StepIntro
+            title="Anything that repeats?"
+            subtitle="Add weekly things like “Ping pong every Monday at 18:00”. They show on the day and come preselected when you plan. Optional."
+          />
+        ) : null}
+        {step === 9 ? (
+          <StepIntro
+            title="Stay on track"
+            subtitle="Want a heads-up before what's next? Diem can nudge you ahead of each stop — timed around travel so you leave right when you need to."
           />
         ) : null}
 
@@ -619,6 +667,46 @@ export default function OnboardingScreen() {
               autoCapitalize="sentences"
               returnKeyType="done"
             />
+          </View>
+        ) : null}
+
+        {step === 7 ? <PeopleManager /> : null}
+
+        {step === 8 ? <RecurringErrandManager /> : null}
+
+        {step === 9 ? (
+          <View style={{ gap: t.spacing.md }}>
+            <ChoiceCard
+              icon="notifications"
+              label="Before everything"
+              hint="A smart heads-up before every upcoming stop"
+              selected={planRemindersMode === 'smart'}
+              onPress={() => choosePlanReminders('smart')}
+            />
+            <ChoiceCard
+              icon="lock-closed"
+              label="Only fixed plans"
+              hint="Just set commitments — meetings, events, reservations"
+              selected={planRemindersMode === 'fixed'}
+              onPress={() => choosePlanReminders('fixed')}
+            />
+            <ChoiceCard
+              icon="notifications-off"
+              label="No reminders"
+              hint="Skip per-plan nudges — you can change this anytime"
+              selected={planRemindersMode === 'none'}
+              onPress={() => choosePlanReminders('none')}
+            />
+            {planRemindersMode !== 'none' ? (
+              <NoteBanner
+                icon="sparkles-outline"
+                iconColor={t.colors.accent}
+                backgroundColor={t.colors.accentSoft}
+              >
+                Reminders are timed for you — when a stop needs travel, Diem
+                nudges you to head out, not just when it starts.
+              </NoteBanner>
+            ) : null}
           </View>
         ) : null}
 

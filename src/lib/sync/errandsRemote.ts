@@ -40,6 +40,7 @@ interface ErrandRow {
   notes: string | null;
   raw_text: string;
   planned_date: string | null;
+  recurring_id: string | null;
   done: boolean;
   created_at: string;
   updated_at: string;
@@ -67,6 +68,7 @@ function rowToErrand(r: ErrandRow): Errand {
     notes: r.notes ?? undefined,
     rawText: r.raw_text ?? '',
     plannedDate: r.planned_date ?? undefined,
+    recurringId: r.recurring_id ?? undefined,
     done: !!r.done,
     createdAt: r.created_at ? Date.parse(r.created_at) : Date.now(),
     updatedAt: r.updated_at ? Date.parse(r.updated_at) : Date.now(),
@@ -96,6 +98,7 @@ function errandToRow(e: Errand, userId: string): ErrandRow {
     notes: e.notes ?? null,
     raw_text: e.rawText ?? '',
     planned_date: e.plannedDate ?? null,
+    recurring_id: e.recurringId ?? null,
     done: e.done,
     created_at: new Date(e.createdAt).toISOString(),
     updated_at: new Date(e.updatedAt).toISOString(),

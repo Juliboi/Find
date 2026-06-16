@@ -149,17 +149,31 @@ export function buildContextPayload(
     out.wakeUpDurationMin = ctx.wakeUpDurationMin;
   }
   // Comfortable meal windows, grouped so the planner can schedule each meal
-  // inside its range. Each window omits ends it doesn't have.
-  const meals: Record<string, { start?: string; end?: string }> = {};
+  // inside its range. Each carries the user's per-day dining preference (home /
+  // out / no-preference) and, when a dining errand covers the meal, that venue —
+  // so the brain places (or doesn't duplicate) each meal accordingly.
+  const meals: Record<
+    string,
+    { start?: string; end?: string; mode?: 'home' | 'out'; venue?: string }
+  > = {};
   const addMeal = (
     name: 'breakfast' | 'lunch' | 'dinner',
     start?: string | null,
     end?: string | null,
   ) => {
-    const window: { start?: string; end?: string } = {};
+    const window: { start?: string; end?: string; mode?: 'home' | 'out'; venue?: string } = {};
     if (start) window.start = start;
     if (end) window.end = end;
-    if (window.start || window.end) meals[name] = window;
+    const venue = ctx.mealVenues?.[name];
+    const mode = ctx.mealModes?.[name];
+    if (venue) {
+      // A user errand IS this meal: eat out at that exact place.
+      window.mode = 'out';
+      window.venue = venue;
+    } else if (mode === 'home' || mode === 'out') {
+      window.mode = mode;
+    }
+    if (window.start || window.end || window.mode) meals[name] = window;
   };
   addMeal('breakfast', ctx.breakfastStart, ctx.breakfastEnd);
   addMeal('lunch', ctx.lunchStart, ctx.lunchEnd);
@@ -368,6 +382,7 @@ function sanitizeTravelLeg(raw: any): TravelLeg | undefined {
     summary: asString(raw.summary),
     steps: steps && steps.length > 0 ? steps : undefined,
     estimated: typeof raw.estimated === 'boolean' ? raw.estimated : undefined,
+    modeLocked: raw.modeLocked === true ? true : undefined,
     polyline: asString(raw.polyline),
   };
 }

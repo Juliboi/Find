@@ -28,6 +28,25 @@ export interface Context {
   work?: LocationPin;
   endOfDay?: LocationPin;
   currentLocation?: { latitude: number; longitude: number; label?: string };
+  /**
+   * Whether the user can be routed by car today: `owns` a car AND `useToday`
+   * (the per-day switch). When present and not drivable, an explicit "drive"
+   * leg is downgraded to the distance auto-pick. Omitted ⇒ mode untouched.
+   */
+  car?: { owns: boolean; useToday: boolean };
+  /**
+   * "HH:MM" the day is planned to BEGIN. Seeds the clock cascade when the first
+   * block has no time of its own (a fresh compose's morning block), so the day
+   * opens at the user's chosen hour instead of the 08:00 fallback.
+   */
+  dayStart?: string;
+  /**
+   * "HH:MM" the user sleeps — the day's HARD end (onboarding's "Sleep — the hard
+   * end of your day"). When the plan finishes early, the closing "Sleep" block
+   * is pushed to here so the evening before it reads as elastic wind-down/free
+   * time instead of an hours-early bedtime. Only ever pushes Sleep LATER.
+   */
+  bedTime?: string;
 }
 
 export function haversineMeters(a: Coords, b: Coords): number {
@@ -278,6 +297,30 @@ function routeArrivalMs(route: any, departureTime?: Date): number | null {
 }
 
 /**
+ * Real wall-clock LEAVE time for one returned route: the first transit board
+ * MINUS the walk that precedes it (door → first stop). The mirror of
+ * routeArrivalMs, used for arrive-by (arrivalTime) transit routing so we can
+ * reserve the TRUE span from leaving the origin to the appointment — and so the
+ * cascade's departure lines up with the trip Google actually picked. Returns
+ * null for walk-only routes (no board to anchor to).
+ */
+function routeDepartureMs(route: any): number | null {
+  const legs = Array.isArray(route?.legs) ? route.legs : [];
+  let leadingWalkSecs = 0;
+  for (const lg of legs) {
+    for (const st of Array.isArray(lg?.steps) ? lg.steps : []) {
+      if (st?.travelMode === 'TRANSIT' && st?.transitDetails) {
+        const ms = Date.parse(st.transitDetails?.stopDetails?.departureTime ?? '');
+        if (Number.isFinite(ms)) return ms - leadingWalkSecs * 1000;
+      } else if (st?.travelMode === 'WALK') {
+        leadingWalkSecs += rawSecondsOf(st?.staticDuration);
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Real door-to-door route via Google Routes (computeRoutes): total minutes
  * plus the transit step breakdown. Returns null on any failure so the
  * caller can fall back to the haversine estimate.
@@ -290,6 +333,7 @@ async function computeRoute(
   departureTime?: Date,
   tz?: string,
   dbg?: { label: string; planned: string; tz?: string; sink?: string[] },
+  arrivalTime?: Date,
 ): Promise<RouteResult | null> {
   try {
     const body: Record<string, unknown> = {
@@ -297,11 +341,19 @@ async function computeRoute(
       destination: { location: { latLng: { latitude: dest.latitude, longitude: dest.longitude } } },
       travelMode: ROUTES_TRAVEL_MODE[mode],
     };
-    // Only TRANSIT and DRIVE are time-dependent (schedules / traffic). Google
-    // rejects a departureTime in the past, so callers only ever pass a future
-    // instant; walk/bike ignore time entirely. DRIVE additionally needs an
-    // explicit routing preference to actually use live/predicted traffic.
-    if (departureTime && (mode === 'transit' || mode === 'drive')) {
+    // For a leg that must land at a FIXED appointment, route TRANSIT by arrival:
+    // Google then returns trips that arrive BY the pin (picking an earlier
+    // vehicle if needed) instead of "leave at X, arrive whenever" — which is
+    // what made the user 3 min late to a 14:00 booking. Only TRANSIT supports
+    // arrivalTime; it's mutually exclusive with departureTime.
+    const useArriveBy = !!arrivalTime && mode === 'transit';
+    if (useArriveBy) {
+      body.arrivalTime = arrivalTime!.toISOString();
+    } else if (departureTime && (mode === 'transit' || mode === 'drive')) {
+      // Only TRANSIT and DRIVE are time-dependent (schedules / traffic). Google
+      // rejects a departureTime in the past, so callers only ever pass a future
+      // instant; walk/bike ignore time entirely. DRIVE additionally needs an
+      // explicit routing preference to actually use live/predicted traffic.
       body.departureTime = departureTime.toISOString();
       if (mode === 'drive') body.routingPreference = 'TRAFFIC_AWARE';
     }
@@ -325,15 +377,39 @@ async function computeRoute(
     const routes = Array.isArray(data?.routes) ? data.routes : [];
     if (routes.length === 0) return null;
     // Pick the route that ARRIVES soonest (matches how Maps ranks), not just
-    // routes[0]. Google's default single route isn't always the earliest.
+    // routes[0]. Google's default single route isn't always the earliest. For an
+    // arrive-by query, prefer the trip arriving as LATE as possible without
+    // passing the deadline (least dead time at the venue), falling back to the
+    // earliest-arriving option.
     let route = routes[0];
     if (routes.length > 1) {
-      let bestMs = routeArrivalMs(route, departureTime);
-      for (let i = 1; i < routes.length; i++) {
-        const ms = routeArrivalMs(routes[i], departureTime);
-        if (ms != null && (bestMs == null || ms < bestMs)) {
-          bestMs = ms;
-          route = routes[i];
+      if (useArriveBy) {
+        const targetMs = arrivalTime!.getTime();
+        let bestLate: number | null = null;
+        let bestAny: number | null = null;
+        let pickLate: any = null;
+        let pickAny: any = route;
+        for (let i = 0; i < routes.length; i++) {
+          const ms = routeArrivalMs(routes[i]);
+          if (ms == null) continue;
+          if (bestAny == null || ms < bestAny) {
+            bestAny = ms;
+            pickAny = routes[i];
+          }
+          if (ms <= targetMs && (bestLate == null || ms > bestLate)) {
+            bestLate = ms;
+            pickLate = routes[i];
+          }
+        }
+        route = pickLate ?? pickAny;
+      } else {
+        let bestMs = routeArrivalMs(route, departureTime);
+        for (let i = 1; i < routes.length; i++) {
+          const ms = routeArrivalMs(routes[i], departureTime);
+          if (ms != null && (bestMs == null || ms < bestMs)) {
+            bestMs = ms;
+            route = routes[i];
+          }
         }
       }
     }
@@ -357,7 +433,15 @@ async function computeRoute(
     // that TRUE door-to-door span so every following item cascades off the real
     // time you're back, not Google's slack-trimmed figure.
     let minutes = googleMin;
-    if (mode === 'transit' && departureTime) {
+    if (useArriveBy) {
+      // Span from leaving the origin to the appointment, so the cascade departs
+      // exactly when this trip boards and arrives by the pin (never after).
+      const leaveMs = routeDepartureMs(route);
+      if (leaveMs != null) {
+        const span = Math.round((arrivalTime!.getTime() - leaveMs) / 60000);
+        if (span >= 1) minutes = span;
+      }
+    } else if (mode === 'transit' && departureTime) {
       const arrivalMs = routeArrivalMs(route, departureTime);
       if (arrivalMs != null) {
         const spanMin = Math.round((arrivalMs - departureTime.getTime()) / 60000);
@@ -397,7 +481,7 @@ async function computeRoute(
       const d = `${dest.latitude.toFixed(5)},${dest.longitude.toFixed(5)}`;
       const line =
         `[route] ${dbg.label} | planned ${dbg.planned} | sent ` +
-        `${departureTime ? departureTime.toISOString() : 'NOW (no time-aware)'} | ` +
+        `${useArriveBy ? 'arrive-by ' + arrivalTime!.toISOString() : departureTime ? departureTime.toISOString() : 'NOW (no time-aware)'} | ` +
         `from ${o} → ${d} | ` +
         `${mode} google=${googleMin}m${minutes !== googleMin ? ` →span ${minutes}m (incl. pre-board slack)` : ''} | ` +
         `real ${fmtClock(firstDep, dbg.tz)}→${fmtClock(lastArr, dbg.tz)} | ` +
@@ -590,6 +674,135 @@ function itemDuration(item: any): number {
   return 30;
 }
 
+/** Smallest length a flexible/window block may be shrunk to when the day is
+ *  tight — keeps a token sliver visible instead of collapsing it to nothing. */
+const MIN_FLEX_MIN = 5;
+
+/**
+ * THE day-scheduling algorithm, shared by the provisional pre-route clock and
+ * the final post-route cascade so the two ALWAYS agree on every start time.
+ *
+ * Why that matters: each transit leg is routed for its PROVISIONAL departure,
+ * which bakes Google's real board/alight times into the leg. If the final
+ * cascade then lands that stop at a DIFFERENT minute (e.g. because it shrank a
+ * flexible block to protect a downstream appointment but the provisional clock
+ * didn't), the baked-in board times no longer line up with the card clock and
+ * the commute reads "not synced". Running one algorithm for both — differing
+ * only in the per-leg minutes (haversine estimate up front, real routed minutes
+ * after) — keeps them locked together.
+ *
+ * Given ordered `items` and `legMinOf(item, idx)` → that item's lead-in travel
+ * minutes, it returns each item's chosen { start, dur } in minutes-of-day:
+ *   1. propagate every downstream FIXED/WINDOW pin's deadline BACKWARDS,
+ *      reserving the travel + intended gap that sit before it, then
+ *   2. walk FORWARD snapping pins and shrinking flexible/window blocks (never
+ *      below MIN_FLEX_MIN) so those deadlines — and the commutes they protect —
+ *      are still met.
+ */
+function scheduleDay(
+  items: any[],
+  legMinOf: (item: any, idx: number) => number,
+  fallbackStartMin: number | null = null,
+): { start: number; dur: number }[] {
+  const n = items.length;
+  const out: { start: number; dur: number }[] = new Array(n);
+  if (n === 0) return out;
+
+  const anchorTimeOf = (it: any): number | null =>
+    it?.flexibility === 'fixed'
+      ? parseHHMM(it?.startTime)
+      : it?.flexibility === 'window'
+        ? parseHHMM(it?.windowStart)
+        : null;
+  const durOf = (it: any): number => (it?.arrival === true ? 0 : itemDuration(it));
+  // Travel into items[idx] + any intended free gap before it. Mirrors the
+  // forward cursor advance: no lead-in on the first item, no gap on a gap block.
+  const leadIn = (idx: number): number => {
+    if (idx <= 0 || idx >= n) return 0;
+    const it = items[idx];
+    const t = legMinOf(it, idx);
+    const travel = Number.isFinite(t) && t > 0 ? t : 0;
+    const g = Number(it?.gapBeforeMin);
+    const gap = it?.kind !== 'gap' && Number.isFinite(g) && g > 0 ? g : 0;
+    return travel + gap;
+  };
+
+  // 1) Backward: the latest start each item may take without slipping a
+  //    downstream pin (reserving the lead-in that precedes that pin).
+  const latestStart: (number | null)[] = new Array(n).fill(null);
+  let nextLS: number | null = null;
+  for (let i = n - 1; i >= 0; i--) {
+    const pin = anchorTimeOf(items[i]);
+    let ls: number | null;
+    if (pin != null) ls = pin;
+    else if (nextLS == null) ls = null;
+    else ls = nextLS - leadIn(i + 1) - durOf(items[i]);
+    latestStart[i] = ls;
+    nextLS = ls != null ? ls : nextLS;
+  }
+
+  // 2) Forward: place each item, snapping pins and shrinking flexible time.
+  // Seed from the first block's own time; if it has none (a fresh compose's
+  // morning), open at the day's planned start, and only then the 08:00 default.
+  let cursor = parseHHMM(items[0]?.startTime);
+  if (cursor == null) cursor = fallbackStartMin != null ? fallbackStartMin : 8 * 60;
+  for (let i = 0; i < n; i++) {
+    const it = items[i];
+    cursor += leadIn(i);
+    let start = cursor;
+    if (it?.flexibility === 'fixed') {
+      const f = parseHHMM(it?.startTime);
+      if (f != null && f >= start) start = f;
+    } else if (it?.flexibility === 'window') {
+      const ws = parseHHMM(it?.windowStart);
+      if (ws != null && ws > start) start = ws;
+    }
+    const isArrival = it?.arrival === true;
+    let dur = isArrival ? 0 : itemDuration(it);
+    if (
+      !isArrival &&
+      (it?.flexibility === 'flexible' || it?.flexibility === 'window') &&
+      i + 1 < n &&
+      latestStart[i + 1] != null
+    ) {
+      const maxEnd = (latestStart[i + 1] as number) - leadIn(i + 1);
+      if (maxEnd - start < dur) dur = Math.max(MIN_FLEX_MIN, maxEnd - start);
+    }
+    out[i] = { start, dur };
+    cursor = start + dur;
+  }
+  return out;
+}
+
+/**
+ * A lightweight forward clock used ONLY to pick sane (daytime) transit
+ * departure slots BEFORE the real legs are routed. In the v3 compose path the
+ * items carry no start times yet at routing time (the real cascade runs
+ * afterwards), so without this every transit hop would route with no departure
+ * → Google falls back to "now", which at night returns night buses (the "905
+ * instead of 145" bug). Delegates to `scheduleDay` with the per-leg HAVERSINE
+ * estimates (the real minutes don't exist yet), so the departures it picks
+ * match what the final cascade will choose. Returns a map of item →
+ * provisional minutes-of-day start.
+ */
+function provisionalStarts(
+  items: any[],
+  estLegMinByItem: Map<any, number>,
+  fallbackStartMin: number | null = null,
+): Map<any, number> {
+  const sched = scheduleDay(
+    items,
+    (item) => {
+      const est = estLegMinByItem.get(item);
+      return est != null ? est : Number(item?.travelFromPrev?.minutes);
+    },
+    fallbackStartMin,
+  );
+  const out = new Map<any, number>();
+  for (let i = 0; i < items.length; i++) out.set(items[i], sched[i].start);
+  return out;
+}
+
 export function flattenItems(parsed: any): any[] {
   if (!parsed || !Array.isArray(parsed.sections)) return [];
   return parsed.sections.flatMap((s: any) => (s && Array.isArray(s.items) ? s.items : []));
@@ -698,6 +911,49 @@ function fillIdleGaps(parsed: any): void {
   }
 }
 
+/**
+ * Bedtime guard. The day's HARD end is the user's sleep time (onboarding's
+ * "Sleep — the hard end of your day"), NOT the earlier wind-down hour. If the
+ * plan ran short and the closing "Sleep" block landed before bedtime, push it
+ * to bedtime so the evening before it reads as elastic wind-down / free time —
+ * instead of the user "going to sleep at 21:00" when their routine is 23:00.
+ *
+ * Only ever moves Sleep LATER: a genuinely long day keeps its later bedtime,
+ * and we never crush the day to force an early one. Runs AFTER the cascade and
+ * BEFORE fillIdleGaps, so the freed evening becomes a visible gap.
+ */
+function anchorSleepToBedtime(parsed: any, bedMin: number | null): void {
+  if (bedMin == null) return;
+  const items = flattenItems(parsed);
+  if (items.length === 0) return;
+  // Only the day's CLOSING block counts — a "sleep" mention mid-day (e.g. a nap)
+  // must not be dragged to bedtime.
+  const last = items[items.length - 1];
+  const title = String(last?.title ?? '').toLowerCase();
+  if (!/\bsleep\b|lights out|go to bed|bedtime/.test(title)) return;
+  const start = parseHHMM(last?.startTime);
+  if (start == null || start >= bedMin) return;
+
+  const dur = itemDuration(last);
+  last.startTime = fmtHHMM(bedMin);
+  last.endTime = fmtHHMM(bedMin + dur);
+  last.durationMinutes = dur;
+  // Make it a hard pin so fillIdleGaps treats the evening hole as fill-worthy.
+  last.flexibility = 'fixed';
+
+  // If the block right before Sleep is already elastic wind-down/gap time,
+  // stretch it to bedtime for ONE clean evening block; otherwise leave the hole
+  // for fillIdleGaps to drop a "Free time" gap into.
+  const prev = items[items.length - 2];
+  if (prev && prev.kind === 'gap') {
+    const ps = parseHHMM(prev.startTime);
+    if (ps != null && bedMin > ps) {
+      prev.endTime = fmtHHMM(bedMin);
+      prev.durationMinutes = bedMin - ps;
+    }
+  }
+}
+
 /** Routes one hop, attaching the transit step breakdown, with a fallback. */
 async function computeLeg(
   origin: Coords,
@@ -707,11 +963,17 @@ async function computeLeg(
   departureTime?: Date,
   tz?: string,
   dbg?: { label: string; planned: string; tz?: string; sink?: string[] },
+  preferredMode?: TravelMode,
+  carAvailable?: boolean,
+  arrivalTime?: Date,
 ): Promise<any> {
   const straight = haversineMeters(origin, dest);
   const distanceM = Math.round(straight * DETOUR_FACTOR);
-  const mode = pickMode(distanceM);
-  const routed = await computeRoute(origin, dest, mode, apiKey, departureTime, tz, dbg);
+  // Honour a user-locked mode; otherwise auto-pick by distance. Never route by
+  // car when the user has no car / isn't driving today.
+  let mode = preferredMode ?? pickMode(distanceM);
+  if (mode === 'drive' && carAvailable === false) mode = pickMode(distanceM);
+  const routed = await computeRoute(origin, dest, mode, apiKey, departureTime, tz, dbg, arrivalTime);
   if (dbg && !routed) {
     const line =
       `[route] ${dbg.label} | planned ${dbg.planned} | real route UNAVAILABLE → ` +
@@ -788,8 +1050,18 @@ export async function routeAndSchedule(
       origin: Coords;
       dest: Coords;
       fromLabel?: string;
+      /** Haversine estimate for THIS leg — seeds the provisional clock below. */
+      estMin: number;
+      /** A user-locked transport mode to honour over the distance auto-pick. */
+      preferredMode?: TravelMode;
       /** Provisional minutes-of-day this hop departs, for time-aware routing. */
       departureMin?: number | null;
+      /**
+       * Minutes-of-day this hop must ARRIVE by — set only when the destination is
+       * a FIXED appointment, so transit is routed "arrive by the pin" and never
+       * lands the user late.
+       */
+      arrivalMin?: number | null;
     }[] = [];
 
     // The day's chain starts wherever the user actually begins: the explicit
@@ -807,16 +1079,26 @@ export async function routeAndSchedule(
       ? { item: null, coords: startCoords, isHome: startIsHome }
       : null;
     let isFirstHop = true;
+    // Estimated minutes per located leg, keyed by the destination item — feeds
+    // the provisional clock so every hop gets a daytime departure to query.
+    const estLegMinByItem = new Map<any, number>();
     for (const node of seq) {
       if (prev && haversineMeters(prev.coords, node.coords) > 25) {
-        // The client already cascaded provisional start times onto the day, so
-        // "depart the previous stop" ≈ this block's start minus its current
-        // leg. Good enough to pick the right transit run; the final cascade
-        // below re-times everything against the freshly routed minutes.
-        const startMin = parseHHMM(node.item?.startTime);
-        const legMin = Number(node.item?.travelFromPrev?.minutes);
-        const departureMin =
-          startMin != null ? startMin - (Number.isFinite(legMin) ? legMin : 0) : null;
+        const distM = Math.round(haversineMeters(prev.coords, node.coords) * DETOUR_FACTOR);
+        const estMin = estimateMinutes(distM, pickMode(distM));
+        estLegMinByItem.set(node.item, estMin);
+        // Honour a transport mode the user explicitly locked on this leg
+        // (LegModeSheet); otherwise the distance auto-pick wins.
+        const tp = node.item?.travelFromPrev;
+        const preferredMode: TravelMode | undefined =
+          tp && tp.modeLocked === true && typeof tp.mode === 'string'
+            ? (tp.mode as TravelMode)
+            : undefined;
+        // A FIXED appointment with a pinned start is an arrive-BY deadline:
+        // route transit to land by then (Google picks an earlier vehicle if
+        // the next one would be late), instead of departing on a guess.
+        const arrivalMin =
+          node.item?.flexibility === 'fixed' ? parseHHMM(node.item?.startTime) : null;
         hops.push({
           item: node.item,
           origin: prev.coords,
@@ -824,7 +1106,9 @@ export async function routeAndSchedule(
           // Label the first hop with the day's start (home or the picked start
           // location); later hops carry no fromLabel (they read the prev stop).
           fromLabel: isFirstHop ? startLabel : undefined,
-          departureMin,
+          estMin,
+          preferredMode,
+          arrivalMin,
         });
         isFirstHop = false;
       } else {
@@ -851,19 +1135,40 @@ export async function routeAndSchedule(
         arrival: true,
         travelFromPrev: null,
       };
-      // The trip home departs when the last real stop ends.
-      const lastEnd =
-        parseHHMM(prev.item?.endTime) ??
-        (parseHHMM(prev.item?.startTime) != null
-          ? (parseHHMM(prev.item?.startTime) as number) + itemDuration(prev.item)
-          : null);
+      const distHome = Math.round(haversineMeters(prev.coords, homeCoords) * DETOUR_FACTOR);
       hops.push({
         item: backHomeItem,
         origin: prev.coords,
         dest: homeCoords,
-        departureMin: lastEnd,
+        estMin: estimateMinutes(distHome, pickMode(distHome)),
       });
     }
+
+    // Run a provisional clock from the estimated leg minutes so every transit
+    // hop gets a sane DAYTIME departure to query Google with. Without this, a v3
+    // plan (items have no start times until the real cascade below) would route
+    // with no departure → Google falls back to "now", which at night returns
+    // night buses. The real cascade afterwards still re-times everything against
+    // the freshly routed minutes.
+    const seedFallback = parseHHMM(context?.dayStart);
+    const provStart = provisionalStarts(flattenItems(parsed), estLegMinByItem, seedFallback);
+    const lastNode = prev;
+    for (const h of hops) {
+      if (h.item === backHomeItem) {
+        const lastItem = lastNode?.item;
+        const ls = lastItem ? provStart.get(lastItem) : undefined;
+        h.departureMin = ls != null ? ls + itemDuration(lastItem) : null;
+      } else {
+        const s = provStart.get(h.item);
+        h.departureMin = s != null ? s - h.estMin : null;
+      }
+    }
+
+    // Whether car routing is allowed today (owns AND using it). Undefined when
+    // the caller didn't say — then mode selection is left untouched.
+    const carAvailable = context.car
+      ? context.car.owns === true && context.car.useToday !== false
+      : undefined;
 
     // Enable with the ROUTE_DEBUG=1 secret and read via the dashboard or
     // `supabase functions logs recompute-itinerary`. Each leg prints the exact
@@ -874,16 +1179,24 @@ export async function routeAndSchedule(
     await Promise.all(
       hops.map(async (h) => {
         const departureTime = buildDeparture(parsed?.date, h.departureMin, timing);
+        // For an arrive-by hop (transit into a fixed appointment) build the pin
+        // instant; computeRoute uses it instead of the departure guess.
+        const arrivalTime =
+          h.arrivalMin != null ? buildDeparture(parsed?.date, h.arrivalMin, timing) : undefined;
         const dbg = routeDebug
           ? {
               label: h.item?.title ?? 'Back home',
               planned:
-                h.departureMin != null && h.departureMin >= 0 ? fmtHHMM(h.departureMin) : '--:--',
+                arrivalTime && h.arrivalMin != null
+                  ? `by ${fmtHHMM(h.arrivalMin)}`
+                  : h.departureMin != null && h.departureMin >= 0
+                    ? fmtHHMM(h.departureMin)
+                    : '--:--',
               tz: timing.timezone,
               sink: timing.debugSink,
             }
           : undefined;
-        h.item.travelFromPrev = await computeLeg(
+        const leg = await computeLeg(
           h.origin,
           h.dest,
           apiKey,
@@ -891,34 +1204,45 @@ export async function routeAndSchedule(
           departureTime,
           timing.timezone,
           dbg,
+          h.preferredMode,
+          carAvailable,
+          arrivalTime,
         );
+        // Preserve the user's lock so the next recompute keeps honouring it.
+        if (h.preferredMode && leg) leg.modeLocked = true;
+        h.item.travelFromPrev = leg;
       }),
     );
 
     if (backHomeItem) {
-      // Insert "Head Home" immediately AFTER the section containing the
-      // last located stop, NOT at the end of the day. A day like
-      //   [Pharmacy 18:47] → [Dinner / Relax / Sleep at home (ends 06:30+)]
-      // would otherwise schedule the homeward trip after Sleep ends, so the
-      // user appears to teleport home and then leave for home at 07:11 the
-      // NEXT morning. Splicing the section in the right place lets the
-      // cascade time it as "after Pharmacy → arrive home → dinner".
+      // Splice "Back home" in immediately AFTER the last LOCATED stop — i.e.
+      // right BEFORE the trailing run of at-home blocks (language practice,
+      // wind-down, sleep), not after the whole section. When dinner-out and
+      // the evening's at-home blocks share one "Evening" section, inserting
+      // after the SECTION put the homeward trip after Sleep, so the at-home
+      // blocks rendered as if they happened at the restaurant and the user
+      // only "went home" at midnight. Inserting right after the stop lets the
+      // cascade read it as "leave the restaurant → arrive home → wind down".
       const lastStop = prev?.item ?? null;
-      let insertAt = parsed.sections.length;
+      let placed = false;
       if (lastStop) {
-        for (let i = 0; i < parsed.sections.length; i++) {
-          const sec = parsed.sections[i];
-          if (Array.isArray(sec?.items) && sec.items.includes(lastStop)) {
-            insertAt = i + 1;
+        for (const sec of parsed.sections) {
+          if (!Array.isArray(sec?.items)) continue;
+          const idx = sec.items.indexOf(lastStop);
+          if (idx >= 0) {
+            sec.items.splice(idx + 1, 0, backHomeItem);
+            placed = true;
             break;
           }
         }
       }
-      parsed.sections.splice(insertAt, 0, {
-        title: 'Head Home',
-        period: 'Evening',
-        items: [backHomeItem],
-      });
+      if (!placed) {
+        parsed.sections.push({
+          title: 'Head Home',
+          period: 'Evening',
+          items: [backHomeItem],
+        });
+      }
     }
   }
 
@@ -926,62 +1250,19 @@ export async function routeAndSchedule(
   const items = flattenItems(parsed);
   if (items.length === 0) return;
 
-  // Pre-walk backwards to find, for each index, the earliest upcoming
-  // fixed/window anchor STRICTLY AFTER it. Flexible items use this as
-  // their ceiling: if running at full duration would push the next fixed
-  // anchor later, shrink the flexible block to fit instead. Keeps things
-  // like Skincare-22:00 / Sleep-22:30 honoured even when a 110-min Relax
-  // block sits in front of them.
-  const nextAnchor: (number | null)[] = new Array(items.length).fill(null);
-  let upcoming: number | null = null;
-  for (let i = items.length - 1; i >= 0; i--) {
-    nextAnchor[i] = upcoming;
-    const it = items[i];
-    if (it?.flexibility === 'fixed') {
-      const t = parseHHMM(it.startTime);
-      if (t != null && (upcoming == null || t < upcoming)) upcoming = t;
-    } else if (it?.flexibility === 'window') {
-      const t = parseHHMM(it.windowStart);
-      if (t != null && (upcoming == null || t < upcoming)) upcoming = t;
-    }
-  }
-
-  let cursor = parseHHMM(items[0]?.startTime);
-  if (cursor == null) cursor = 8 * 60;
+  // Schedule the day with the SAME algorithm the provisional clock used (now on
+  // the REAL routed leg minutes). Because both passes share `scheduleDay`, the
+  // start times the cards show line up with the departures the transit legs were
+  // routed for — no "commute not synced" drift — while still reserving each
+  // commute and shrinking flexible blocks to protect downstream fixed pins.
+  const sched = scheduleDay(
+    items,
+    (item) => Number(item?.travelFromPrev?.minutes),
+    parseHHMM(context?.dayStart),
+  );
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const legMin = Number(item?.travelFromPrev?.minutes);
-    if (Number.isFinite(legMin) && legMin > 0) cursor += legMin;
-    // Honour intended free time captured before this block (the client's
-    // `gapBeforeMin`), mirroring src/lib/itinerary/edits.ts, so a recompute
-    // preserves the day's breathing room instead of compacting it back to
-    // back. A fixed anchor's snap (below) still overrides this. Gap blocks
-    // never carry their own "gap before" (that would double-count free time).
-    if (i > 0 && item?.kind !== 'gap') {
-      const gapBefore = Number(item?.gapBeforeMin);
-      if (Number.isFinite(gapBefore) && gapBefore > 0) cursor += gapBefore;
-    }
-    let start = cursor;
-    if (item?.flexibility === 'fixed') {
-      const fixed = parseHHMM(item.startTime);
-      if (fixed != null && fixed >= start) start = fixed;
-    } else if (item?.flexibility === 'window') {
-      const ws = parseHHMM(item.windowStart);
-      if (ws != null && ws > start) start = ws;
-    }
-    const isArrival = item?.arrival === true;
-    let dur = isArrival ? 0 : itemDuration(item);
-    // Shrink flexible/window items so a later fixed anchor doesn't drift.
-    // Skipped when there's no room (the fixed item ahead of us would have
-    // to be pushed regardless) or no upcoming anchor.
-    if (
-      !isArrival &&
-      (item?.flexibility === 'flexible' || item?.flexibility === 'window') &&
-      nextAnchor[i] != null
-    ) {
-      const room = (nextAnchor[i] as number) - start;
-      if (room > 0 && room < dur) dur = room;
-    }
+    const { start, dur } = sched[i];
     item.startTime = fmtHHMM(start);
     if (dur > 0) {
       item.endTime = fmtHHMM(start + dur);
@@ -990,8 +1271,13 @@ export async function routeAndSchedule(
       item.endTime = null;
       item.durationMinutes = null;
     }
-    cursor = start + dur;
   }
+
+  // 2b) The day's hard end is bedtime, not the wind-down hour. If the plan ran
+  //     short and the closing Sleep block landed early, push it to bedtime so
+  //     the evening reads as elastic wind-down/free time instead of an
+  //     hours-early "going to sleep at 21:00".
+  anchorSleepToBedtime(parsed, parseHHMM(context?.bedTime));
 
   // 3) Turn any unfilled idle before a fixed/window anchor into a visible
   //    free-time block, so the day never shows an invisible hole between two

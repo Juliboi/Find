@@ -30,5 +30,8 @@ verify_jwt = false
 [functions.compose-itinerary]
 verify_jwt = false
 
+[functions.refine-itinerary]
+verify_jwt = false
+
 [functions.weather]
 verify_jwt = false

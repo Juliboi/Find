@@ -1,5 +1,8 @@
 import { useErrandsStore, type ErrandInput } from '@/store/useErrandsStore';
-import { usePlanSetupStore } from '@/store/usePlanSetupStore';
+import {
+  usePlanSetupStore,
+  DEFAULT_MEAL_MODES,
+} from '@/store/usePlanSetupStore';
 import { useHomeStore } from '@/store/useHomeStore';
 import { tomorrowISO } from '@/utils/time';
 import type { VenueOpeningHours } from '@/types/itinerary';
@@ -109,6 +112,19 @@ const TEST_ERRANDS: TestErrand[] = [
       openingHours: weeklyHours(10, 22),
     },
   },
+  {
+    // GOLDEN closed-venue case: a verbatim bakery open only 07:00–10:00, so any
+    // afternoon slot is CLOSED. Exercises (a) the card's opening-hours warning
+    // and (b) the refine pass RETIMING it into the morning (a user-named venue's
+    // identity is kept — only its time should move).
+    title: 'Pick up sourdough',
+    place: {
+      name: 'Morning Bakery (closes 10:00)',
+      latitude: 50.1045,
+      longitude: 14.4378,
+      openingHours: weeklyHours(7, 10),
+    },
+  },
 ];
 
 export interface SeedTestPlanResult {
@@ -187,6 +203,8 @@ export function seedTestPlan(): SeedTestPlanResult {
     startLocation: home,
     endTime: TEST_END_TIME,
     endLocation: home,
+    mealModes: { ...DEFAULT_MEAL_MODES },
+    mealLinks: { breakfast: null, lunch: null, dinner: null },
   });
 
   if (__DEV__) {

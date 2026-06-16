@@ -132,6 +132,12 @@ export interface TravelLeg {
   /** True when this is the local haversine fallback, not real Routes data. */
   estimated?: boolean;
   /**
+   * Set when the user explicitly chose this leg's mode (LegModeSheet) so the
+   * backend recompute honours it instead of re-picking by distance. Cleared by
+   * a venue swap, which resets the leg to the distance auto-pick.
+   */
+  modeLocked?: boolean;
+  /**
    * Google-encoded polyline of the real route geometry between the two
    * stops, so the map can trace the actual path (train tracks, bus route)
    * instead of a straight line. Absent for the haversine fallback.

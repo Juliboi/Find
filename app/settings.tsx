@@ -27,7 +27,10 @@ import { HomePicker, type AnchorSlot } from '@/components/HomePicker';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useProfileStore } from '@/store/useProfileStore';
 import { useHomeStore } from '@/store/useHomeStore';
+import { usePeopleStore } from '@/store/usePeopleStore';
+import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
 import { useNotificationStore } from '@/store/useNotificationStore';
+import { type PlanRemindersMode } from '@/lib/notifications';
 import { formatTime } from '@/utils/time';
 import { useDevClockStore } from '@/store/useDevClockStore';
 import { seedTestPlan } from '@/lib/dev/seedTestPlan';
@@ -128,6 +131,72 @@ function Row({
   return <View style={wrapStyle}>{content}</View>;
 }
 
+/**
+ * A single-select option row (radio-style) used for the plan-reminders mode.
+ * Mirrors `Row`'s layout but trails a check instead of a chevron, since these
+ * pick between mutually-exclusive choices rather than drilling in.
+ */
+function PlanReminderOption({
+  icon,
+  title,
+  subtitle,
+  selected,
+  onPress,
+  first,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  title: string;
+  subtitle: string;
+  selected: boolean;
+  onPress: () => void;
+  first?: boolean;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="radio"
+      accessibilityState={{ selected }}
+      style={({ pressed }) => [
+        styles.rowWrap,
+        !first && {
+          borderTopWidth: StyleSheet.hairlineWidth,
+          borderTopColor: t.colors.separator,
+        },
+        pressed && { opacity: 0.8 },
+      ]}
+    >
+      <View style={styles.row}>
+        <View
+          style={[
+            styles.rowIcon,
+            { backgroundColor: selected ? t.colors.accentSoft : t.colors.fill1 },
+          ]}
+        >
+          <Ionicons
+            name={icon}
+            size={16}
+            color={selected ? t.colors.accentText : t.colors.textPrimary}
+          />
+        </View>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text variant="body" weight="semibold">
+            {title}
+          </Text>
+          <Text variant="caption" tone="secondary">
+            {subtitle}
+          </Text>
+        </View>
+        <Ionicons
+          name={selected ? 'checkmark-circle' : 'ellipse-outline'}
+          size={22}
+          color={selected ? t.colors.accent : t.colors.textTertiary}
+        />
+      </View>
+    </Pressable>
+  );
+}
+
 export default function SettingsScreen() {
   const router = useRouter();
   const t = useTheme();
@@ -149,6 +218,8 @@ export default function SettingsScreen() {
   const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
   const home = useHomeStore((s) => s.home);
   const work = useHomeStore((s) => s.work);
+  const peopleCount = usePeopleStore((s) => s.items.length);
+  const recurringCount = useRecurringErrandsStore((s) => s.items.length);
 
   const dailyReviewEnabled = useNotificationStore((s) => s.dailyReviewEnabled);
   const dailyReviewTime = useNotificationStore((s) => s.dailyReviewTime);
@@ -156,6 +227,10 @@ export default function SettingsScreen() {
     (s) => s.setDailyReviewEnabled,
   );
   const setDailyReviewTime = useNotificationStore((s) => s.setDailyReviewTime);
+  const planRemindersMode = useNotificationStore((s) => s.planRemindersMode);
+  const setPlanRemindersMode = useNotificationStore(
+    (s) => s.setPlanRemindersMode,
+  );
 
   // Which anchor the location-picker sheet is editing (null = closed).
   const [anchorSlot, setAnchorSlot] = useState<AnchorSlot | null>(null);
@@ -194,6 +269,32 @@ export default function SettingsScreen() {
       Haptics.selectionAsync().catch(() => undefined);
       void setDailyReviewTime(dateToHHMM(picked));
     }
+  };
+
+  const onChoosePlanReminders = (mode: PlanRemindersMode) => {
+    if (mode === planRemindersMode) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    void setPlanRemindersMode(mode).then((ok) => {
+      if (mode !== 'none' && ok) {
+        Haptics.notificationAsync(
+          Haptics.NotificationFeedbackType.Success,
+        ).catch(() => undefined);
+      } else if (mode !== 'none' && !ok) {
+        // The choice still sticks; it just can't fire until permission is
+        // granted, so point the user at system settings.
+        Alert.alert(
+          'Turn on notifications',
+          'Diem needs notification permission to remind you before your plans. You can enable it in Settings.',
+          [
+            { text: 'Not now', style: 'cancel' },
+            {
+              text: 'Open Settings',
+              onPress: () => void Linking.openSettings(),
+            },
+          ],
+        );
+      }
+    });
   };
 
   // DEV-only fake clock ("time machine"). Lets us rehearse a plan as if it were
@@ -555,6 +656,36 @@ export default function SettingsScreen() {
         <Card padded style={{ padding: 0 }}>
           <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
             <Text variant="caption" tone="secondary" uppercase weight="semibold">
+              Plan reminders
+            </Text>
+          </View>
+          <PlanReminderOption
+            first
+            icon="notifications"
+            title="Before everything"
+            subtitle="A smart heads-up before every upcoming stop"
+            selected={planRemindersMode === 'smart'}
+            onPress={() => onChoosePlanReminders('smart')}
+          />
+          <PlanReminderOption
+            icon="lock-closed"
+            title="Only fixed plans"
+            subtitle="Just commitments — meetings, events, reservations"
+            selected={planRemindersMode === 'fixed'}
+            onPress={() => onChoosePlanReminders('fixed')}
+          />
+          <PlanReminderOption
+            icon="notifications-off"
+            title="No reminders"
+            subtitle="Don't send per-plan nudges"
+            selected={planRemindersMode === 'none'}
+            onPress={() => onChoosePlanReminders('none')}
+          />
+        </Card>
+
+        <Card padded style={{ padding: 0 }}>
+          <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+            <Text variant="caption" tone="secondary" uppercase weight="semibold">
               Appearance
             </Text>
           </View>
@@ -614,6 +745,44 @@ export default function SettingsScreen() {
             onPress={() => {
               Haptics.selectionAsync().catch(() => undefined);
               setAnchorSlot('work');
+            }}
+          />
+        </Card>
+
+        <Card padded style={{ padding: 0 }}>
+          <View style={{ padding: t.spacing.lg, paddingBottom: t.spacing.sm }}>
+            <Text variant="caption" tone="secondary" uppercase weight="semibold">
+              People & routines
+            </Text>
+          </View>
+          <Row
+            first
+            icon="people-outline"
+            iconBg={t.colors.accentSoft}
+            iconColor={t.colors.accentText}
+            title="People"
+            subtitle={
+              peopleCount > 0
+                ? `${peopleCount} saved · used for “at their place”`
+                : 'Save contacts and their fixed place'
+            }
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              router.push('/people');
+            }}
+          />
+          <Row
+            icon="repeat"
+            iconBg={t.colors.fill1}
+            title="Recurring errands"
+            subtitle={
+              recurringCount > 0
+                ? `${recurringCount} repeating`
+                : 'Things that repeat on a weekday'
+            }
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              router.push('/recurring-errands');
             }}
           />
         </Card>

@@ -63,6 +63,8 @@ const ERRAND_SCHEMA: Record<string, unknown> = {
     'endTime',
     'address',
     'notes',
+    'personId',
+    'usePersonPlace',
     'discovery',
   ],
   properties: {
@@ -73,6 +75,11 @@ const ERRAND_SCHEMA: Record<string, unknown> = {
     endTime: { type: 'string', nullable: true },
     address: { type: 'string', nullable: true },
     notes: { type: 'string', nullable: true },
+    // A saved person referenced in the line (matched against SAVED PEOPLE), and
+    // whether the line means we should use THAT PERSON'S fixed place. Both null/
+    // false when no saved person is referenced. See PEOPLE RULES in the prompt.
+    personId: { type: 'string', nullable: true },
+    usePersonPlace: { type: 'boolean', nullable: true },
     // Present (and required) only when intent="discover": the venue search shape.
     discovery: {
       type: 'object',
@@ -149,11 +156,33 @@ function extractJsonObject(text: string): any | null {
 
 // ----------------------------------------------------------- prompt
 
-function buildPrompt(text: string, today: string): string {
+interface PromptPerson {
+  id: string;
+  names: string[];
+}
+
+function buildPeopleBlock(people: PromptPerson[]): string {
+  if (!people.length) return '';
+  const list = people
+    .map((p) => `- id "${p.id}": ${p.names.filter(Boolean).join(', ')}`)
+    .join('\n');
+  return `
+
+SAVED PEOPLE (the user's contacts — match a name in the line against any alias below, case-insensitive; tolerate a trailing possessive "'s"/"s"):
+${list}
+
+PEOPLE RULES (fill "personId" + "usePersonPlace"):
+- GOING TO a saved person's home/place — a POSSESSIVE or "at <name>'s" ("chill at Ondra's place", "at Ondra's", "Ondra's place", "round Maty's", "at Maty's flat", "movie night at Ondra's") → set "personId" to that person's id and "usePersonPlace" true. The app fills in their saved address itself, so set "address" to null. This is intent "plan".
+- A saved person who is only a COMPANION, or the target of a communication/task ("cinema with Ondra", "call Ondra", "lunch with Maty", "meet Maty", "drinks with Ondra") → set "personId" to that person's id and "usePersonPlace" FALSE. Do NOT use their place; classify the intent by the normal rules.
+- If the line names no saved person, set "personId" null and "usePersonPlace" false.
+- A place CATEGORY or named venue mentioned alongside a person wins for the venue — "padel with Maty at sport centrum" keeps that address (usePersonPlace false).`;
+}
+
+function buildPrompt(text: string, today: string, people: PromptPerson[]): string {
   const weekday = weekdayOf(today);
   return `You are the planning ORCHESTRATOR. From ONE short line the user typed, do two things: (1) classify the INTENT, and (2) extract structured fields. Output ONLY a JSON object matching the schema. Set a field to null when the user did NOT clearly state it — never invent a date, time, or place.
 
-TODAY is ${today}${weekday ? ` (${weekday})` : ''}.
+TODAY is ${today}${weekday ? ` (${weekday})` : ''}.${buildPeopleBlock(people)}
 
 INTENT — choose exactly one:
 - "discover": the user wants to FIND or CHOOSE a place by CATEGORY, so we should show venue suggestions to pick from. Signals:
@@ -179,6 +208,7 @@ Fields (fill for BOTH intents):
 - endTime: "HH:MM" 24h. If there is a startTime but no explicit end, estimate a realistic end by activity (phone call ~15 min, coffee ~45 min, dentist/doctor/haircut/meeting ~60 min, errands ~30 min). If there is NO startTime, endTime is null.
 - address: for "plan", the named place/address EXACTLY as the user wrote it so it can be geocoded ("Pirktova Gemini A","Kolkovna Pankrác"). For a communication/task "plan" with no real venue ("call the pharmacy","buy milk"), address is null. For "discover", ALWAYS null (the venue is chosen later). Distinguish place from time: "at 18:00" is a time, "at Pirktova" is a place.
 - notes: any leftover detail worth keeping ("bring documents"), else null.
+- personId / usePersonPlace: see PEOPLE RULES above. Default personId null and usePersonPlace false when no saved person is referenced (or when there are no saved people).
 - discovery: REQUIRED object when intent="discover", null when intent="plan":
     - query: the place CATEGORY to search, cleaned — NO verbs, NO area, NO "near me", NO quality adjective ("pharmacy","coffee","ramen","coworking or cafe","tennis court").
     - area: the place to search AROUND when the user named one — EITHER a neighbourhood/district ("Karlín","Žižkov","Vinohrady") OR a SPECIFIC landmark, hotel, business, station, mall, or venue used as a reference point ("Hilton Prague","Charles Bridge","Anděl","Náměstí Míru"). Copy it EXACTLY as the user wrote it: keep the FULL name, and NEVER shorten a specific place to its city or district (NOT "Hilton Prague" → "Prague", NOT "Anděl mall" → "Smíchov"). null only if the user named no place to search around.
@@ -204,6 +234,13 @@ Examples:
 "any karlin coworking or cafe" → {"intent":"discover","title":"Coworking or cafe","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"coworking or cafe","area":"Karlín","nearby":false}}
 "gym tomorrow 18:00" → {"intent":"discover","title":"Gym","date":"<tomorrow's date>","startTime":"18:00","endTime":"19:00","address":null,"notes":null,"discovery":{"query":"gym","area":null,"nearby":false}}
 "dinner at 8" → {"intent":"discover","title":"Dinner","date":null,"startTime":"20:00","endTime":"21:00","address":null,"notes":null,"discovery":{"query":"restaurant","area":null,"nearby":false}}
+
+People examples (assume "Ondra" and "Maty" are SAVED PEOPLE):
+"chill at ondras place" → {"intent":"plan","title":"Chill at Ondra's","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"personId":"<Ondra's id>","usePersonPlace":true,"discovery":null}
+"movie night at ondra's" → {"intent":"plan","title":"Movie night at Ondra's","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"personId":"<Ondra's id>","usePersonPlace":true,"discovery":null}
+"cinema with ondra" → {"intent":"plan","title":"Cinema with Ondra","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"personId":"<Ondra's id>","usePersonPlace":false,"discovery":null}
+"call ondra" → {"intent":"plan","title":"Call Ondra","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"personId":"<Ondra's id>","usePersonPlace":false,"discovery":null}
+"ping pong with maty at 18:00" → {"intent":"plan","title":"Ping pong with Maty","date":null,"startTime":"18:00","endTime":"19:00","address":null,"notes":null,"personId":"<Maty's id>","usePersonPlace":false,"discovery":null}
 
 USER LINE (between triple quotes):
 """
@@ -301,6 +338,15 @@ function shapeResult(parsed: any, rawText: string) {
   let intent: 'plan' | 'discover' = parsed?.intent === 'discover' ? 'discover' : 'plan';
   let discovery: { query: string; area: string | null; nearby: boolean } | null = null;
 
+  // A saved person the line referenced, and whether to use THEIR place. The
+  // client resolves the actual coordinates from its local people store — the
+  // model only decides WHO and WHETHER, never emits a location.
+  const personId =
+    typeof parsed?.personId === 'string' && parsed.personId.trim()
+      ? parsed.personId.trim()
+      : null;
+  const usePersonPlace = personId != null && parsed?.usePersonPlace === true;
+
   if (intent === 'discover') {
     const d = parsed?.discovery ?? {};
     const query =
@@ -324,6 +370,8 @@ function shapeResult(parsed: any, rawText: string) {
     address: intent === 'discover' ? null : draft.address,
     intent,
     discovery,
+    personId,
+    usePersonPlace,
   };
 }
 
@@ -349,7 +397,11 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  let payload: { text?: string; date?: string };
+  let payload: {
+    text?: string;
+    date?: string;
+    people?: { id?: unknown; names?: unknown }[];
+  };
   try {
     payload = await req.json();
   } catch {
@@ -361,7 +413,24 @@ Deno.serve(async (req: Request) => {
   }
   const today = isISODate(payload.date) ? (payload.date as string) : todayISO();
 
-  const prompt = buildPrompt(text, today);
+  // Sanitize the saved people the client sent (id + a few aliases each). Capped
+  // so a huge contact list can't blow up the prompt.
+  const people: PromptPerson[] = Array.isArray(payload.people)
+    ? payload.people
+        .map((p) => ({
+          id: typeof p?.id === 'string' ? p.id.trim() : '',
+          names: Array.isArray(p?.names)
+            ? (p.names as unknown[])
+                .filter((n): n is string => typeof n === 'string' && n.trim().length > 0)
+                .map((n) => n.trim().slice(0, 60))
+                .slice(0, 8)
+            : [],
+        }))
+        .filter((p) => p.id && p.names.length > 0)
+        .slice(0, 60)
+    : [];
+
+  const prompt = buildPrompt(text, today, people);
 
   let modelUsed = CONFIGURED_ERRAND_MODEL;
   let gem = await callGemini({ prompt, apiKey: geminiKey, model: CONFIGURED_ERRAND_MODEL });

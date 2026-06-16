@@ -84,6 +84,15 @@ export interface Errand {
    * Freestyle errands are visible now for testing and trivially hideable later.
    */
   source?: 'user' | 'freestyle' | 'test';
+  /**
+   * Set on an errand that was MATERIALIZED from a recurring template (see
+   * `useRecurringErrandsStore` + `src/lib/recurring.ts`): the id of the template
+   * it came from. Such an errand is a normal, editable, plannable instance for
+   * its `date`, but the home screen surfaces it in its own "Repeats today"
+   * section (not the regular groups), and the generator uses this + `date` to
+   * find / prune occurrences. Absent on ordinary user errands.
+   */
+  recurringId?: string;
   /** The raw text the user typed, kept so we can re-parse / show provenance. */
   rawText: string;
   /**
@@ -132,6 +141,17 @@ interface ErrandsState {
   ownerId: string | null;
   /** Create an errand from the drawer's collected fields. Returns its id. */
   add: (input: ErrandInput) => string;
+  /**
+   * Insert a recurring occurrence as a real errand with a CALLER-OWNED,
+   * deterministic id (so the same occurrence never duplicates across devices /
+   * passes). Idempotent: if an errand with `id` already exists it is left
+   * untouched (it may carry the user's edits / done / planned state). See
+   * `src/lib/recurring.ts`.
+   */
+  materializeInstance: (
+    id: string,
+    input: ErrandInput & { recurringId: string },
+  ) => void;
   /** Patch an existing errand in place (used by the edit drawer). */
   update: (id: string, patch: Partial<ErrandInput>) => void;
   /** Flip the done flag — the home list uses this for quick triage. */
@@ -250,6 +270,23 @@ export const useErrandsStore = create<ErrandsState>()(
         const owner = get().ownerId;
         if (owner) pushErrand(entry, owner);
         return id;
+      },
+      materializeInstance: (id, input) => {
+        // Idempotent — never clobber an occurrence the user already edited,
+        // completed, planned, or that another device created.
+        if (get().items.some((e) => e.id === id)) return;
+        const now = Date.now();
+        const entry: Errand = {
+          id,
+          ...normalizeInput(input),
+          recurringId: input.recurringId,
+          done: false,
+          createdAt: now,
+          updatedAt: now,
+        };
+        set((state) => ({ items: [entry, ...state.items].slice(0, MAX_ERRANDS) }));
+        const owner = get().ownerId;
+        if (owner) pushErrand(entry, owner);
       },
       update: (id, patch) => {
         set((state) => ({

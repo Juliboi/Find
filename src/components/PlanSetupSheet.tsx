@@ -7,6 +7,7 @@ import React, {
 } from 'react';
 import {
   ActivityIndicator,
+  Image,
   Platform,
   Pressable,
   StyleSheet,
@@ -41,9 +42,15 @@ import { upcomingWeek, roundedNowHHMM } from '@/utils/days';
 import {
   usePlanSetupStore,
   DEFAULT_DAY_END_TIME,
+  DEFAULT_MEAL_MODES,
+  MEAL_KEYS,
   type DayPlanSelection,
+  type MealKey,
+  type MealMode,
 } from '@/store/usePlanSetupStore';
 import { useProfileStore } from '@/store/useProfileStore';
+import { useErrandsStore, type Errand } from '@/store/useErrandsStore';
+import { detectMealErrands, type MealWindow } from '@/lib/meals';
 import { useHomeStore, type LocationPin } from '@/store/useHomeStore';
 import { getCurrentCoords } from '@/lib/places';
 import {
@@ -54,7 +61,16 @@ import {
 } from '@/lib/geocoding';
 import { formatTime, minutesOfDay } from '@/utils/time';
 
-type Step = 0 | 1;
+type Step = 0 | 1 | 2;
+
+const MEAL_META: Record<
+  MealKey,
+  { label: string; icon: keyof typeof Ionicons.glyphMap }
+> = {
+  breakfast: { label: 'Breakfast', icon: 'cafe-outline' },
+  lunch: { label: 'Lunch', icon: 'fast-food-outline' },
+  dinner: { label: 'Dinner', icon: 'restaurant-outline' },
+};
 
 interface Props {
   open: boolean;
@@ -67,6 +83,12 @@ interface Props {
   initialTime?: string;
   /** Which step to open on. 0 = pick the day, 1 = start & end. Defaults to 0. */
   initialStep?: Step;
+  /**
+   * The errands the user has ticked to fold into this plan. When provided, only
+   * these errands can auto-fill a meal — unticking one drops it from its meal
+   * here too. Omit (the home planner) to leave every errand eligible.
+   */
+  selectedErrandIds?: Set<string> | null;
 }
 
 const DAY_COUNT = 7;
@@ -122,15 +144,24 @@ export function PlanSetupSheet({
   initialDate,
   initialTime,
   initialStep = 0,
+  selectedErrandIds = null,
 }: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const dayStartTime = usePlanSetupStore((s) => s.dayStartTime);
   const hasCar = useProfileStore((s) => s.hasCar);
   const bedTime = useProfileStore((s) => s.bedTime);
+  const windDownTime = useProfileStore((s) => s.windDownTime);
+  const breakfastStart = useProfileStore((s) => s.breakfastStart);
+  const breakfastEnd = useProfileStore((s) => s.breakfastEnd);
+  const lunchStart = useProfileStore((s) => s.lunchStart);
+  const lunchEnd = useProfileStore((s) => s.lunchEnd);
+  const dinnerStart = useProfileStore((s) => s.dinnerStart);
+  const dinnerEnd = useProfileStore((s) => s.dinnerEnd);
   const useCarToday = usePlanSetupStore((s) => s.useCarToday);
   const setUseCarToday = usePlanSetupStore((s) => s.setUseCarToday);
   const home = useHomeStore((s) => s.home);
+  const errands = useErrandsStore((s) => s.items);
 
   // The week is held in state and refreshed each time the sheet opens, so
   // "today" stays correct across a midnight rollover while the app sits
@@ -141,7 +172,7 @@ export function PlanSetupSheet({
     hhmmToDate(roundedNowHHMM()),
   );
   const [endTimeD, setEndTimeD] = useState<Date>(() =>
-    hhmmToDate(bedTime ?? DEFAULT_DAY_END_TIME),
+    hhmmToDate(bedTime ?? windDownTime ?? DEFAULT_DAY_END_TIME),
   );
   const [androidPicker, setAndroidPicker] = useState<false | 'start' | 'end'>(
     false,
@@ -162,6 +193,44 @@ export function PlanSetupSheet({
   const [locLoading, setLocLoading] = useState(false);
   const [startLoc, setStartLoc] = useState<LocationPin | null>(null);
   const [endLoc, setEndLoc] = useState<LocationPin | null>(null);
+
+  // Per-meal dining preference + any auto-linked dining errand, re-seeded each
+  // open (per-day, never sticky) and refreshed when the chosen day changes.
+  const [mealModes, setMealModes] = useState<Record<MealKey, MealMode>>(() => ({
+    ...DEFAULT_MEAL_MODES,
+  }));
+  const [mealLinks, setMealLinks] = useState<Record<MealKey, string | null>>({
+    breakfast: null,
+    lunch: null,
+    dinner: null,
+  });
+
+  const mealWindows = useMemo<Partial<Record<MealKey, MealWindow>>>(
+    () => ({
+      breakfast: { start: breakfastStart, end: breakfastEnd },
+      lunch: { start: lunchStart, end: lunchEnd },
+      dinner: { start: dinnerStart, end: dinnerEnd },
+    }),
+    [breakfastStart, breakfastEnd, lunchStart, lunchEnd, dinnerStart, dinnerEnd],
+  );
+
+  const detectLinks = useCallback(
+    (dateISO: string): Record<MealKey, string | null> => {
+      // Only errands the user is actually folding into the plan may auto-fill a
+      // meal. Unticking one in the errand list drops it from its meal here too.
+      // No selection (the home planner) means every errand stays eligible.
+      const pool = selectedErrandIds
+        ? errands.filter((e) => selectedErrandIds.has(e.id))
+        : errands;
+      const found = detectMealErrands(pool, mealWindows, dateISO);
+      return {
+        breakfast: found.breakfast?.id ?? null,
+        lunch: found.lunch?.id ?? null,
+        dinner: found.dinner?.id ?? null,
+      };
+    },
+    [errands, mealWindows, selectedErrandIds],
+  );
 
   const defaultTimeForDay = (i: number): string =>
     days[i]?.isToday ? roundedNowHHMM() : dayStartTime;
@@ -188,10 +257,15 @@ export function PlanSetupSheet({
     const seedTime =
       initialTime ?? (fresh[idx]?.isToday ? roundedNowHHMM() : dayStartTime);
     setStartTimeD(hhmmToDate(seedTime));
-    setEndTimeD(hhmmToDate(bedTime ?? DEFAULT_DAY_END_TIME));
+    setEndTimeD(hhmmToDate(bedTime ?? windDownTime ?? DEFAULT_DAY_END_TIME));
     setStep(initialStep);
     setAndroidPicker(false);
     setActiveRow(null);
+
+    // Meals reset to per-day defaults, then auto-link any dining errands found
+    // for the chosen day (breakfast stays Home unless an errand covers it).
+    setMealModes({ ...DEFAULT_MEAL_MODES });
+    setMealLinks(detectLinks(fresh[idx]?.iso ?? ''));
 
     // End defaults to home; start defaults to the live location (home as a
     // fallback only if GPS is unavailable).
@@ -215,6 +289,17 @@ export function PlanSetupSheet({
   const onDayChange = (i: number) => {
     setDayIndex(i);
     setStartTimeD(hhmmToDate(defaultTimeForDay(i)));
+    const iso = days[i]?.iso;
+    if (iso) setMealLinks(detectLinks(iso));
+  };
+
+  const setMealMode = (meal: MealKey, mode: MealMode) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setMealModes((m) => ({ ...m, [meal]: mode }));
+  };
+  const unlinkMeal = (meal: MealKey) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setMealLinks((l) => ({ ...l, [meal]: null }));
   };
 
   const onStartTimeChange = (_: DateTimePickerEvent, picked?: Date) => {
@@ -267,6 +352,8 @@ export function PlanSetupSheet({
       startLocation: startLoc,
       endTime,
       endLocation: endLoc,
+      mealModes,
+      mealLinks,
     });
   };
 
@@ -412,7 +499,7 @@ export function PlanSetupSheet({
                 />
               </Animated.View>
             </>
-          ) : (
+          ) : step === 1 ? (
             // ---- STEP 1 — start & end -------------------------------------
             <>
               <Animated.View
@@ -436,8 +523,8 @@ export function PlanSetupSheet({
                 <View style={{ flex: 1 }}>
                   <Text variant="micro" tone="tertiary" uppercase weight="bold">
                     {selected
-                      ? `${selected.title}, ${selected.dateLabel} · 2 of 2`
-                      : '2 of 2'}
+                      ? `${selected.title}, ${selected.dateLabel} · 2 of 3`
+                      : '2 of 3'}
                   </Text>
                   <Text variant="title3" weight="bold" tight>
                     Start &amp; end
@@ -494,7 +581,7 @@ export function PlanSetupSheet({
                 onActivate={setActiveRow}
                 icon="flag-outline"
                 title="End time"
-                hint="Defaults to your usual wind-down"
+                hint="Defaults to your usual bedtime"
                 value={endTimeD}
                 display={formatTime(endTime)}
                 onChange={onEndTimeChange}
@@ -527,6 +614,93 @@ export function PlanSetupSheet({
                 key="s1-footer"
                 entering={ENTER(5)}
                 exiting={EXIT(5)}
+                style={styles.footer}
+              >
+                <Button
+                  title="Continue"
+                  onPress={() => goToStep(2)}
+                  fullWidth
+                  size="lg"
+                  rightIcon={
+                    <Ionicons
+                      name="arrow-forward"
+                      size={18}
+                      color={t.colors.textOnAccent}
+                    />
+                  }
+                />
+              </Animated.View>
+            </>
+          ) : (
+            // ---- STEP 2 — meals ------------------------------------------
+            <>
+              <Animated.View
+                key="s2-header"
+                entering={ENTER(0)}
+                exiting={EXIT(0)}
+                style={styles.header}
+              >
+                <Pressable
+                  onPress={() => goToStep(1)}
+                  hitSlop={10}
+                  style={[styles.iconBtn, { backgroundColor: t.colors.fill1 }]}
+                  accessibilityLabel="Back"
+                >
+                  <Ionicons
+                    name="chevron-back"
+                    size={18}
+                    color={t.colors.textSecondary}
+                  />
+                </Pressable>
+                <View style={{ flex: 1 }}>
+                  <Text variant="micro" tone="tertiary" uppercase weight="bold">
+                    {selected
+                      ? `${selected.title}, ${selected.dateLabel} · 3 of 3`
+                      : '3 of 3'}
+                  </Text>
+                  <Text variant="title3" weight="bold" tight>
+                    Meals
+                  </Text>
+                </View>
+                {closeButton}
+              </Animated.View>
+
+              <View key="s2-spaceTop" style={{ flex: 1 }} />
+
+              <Animated.View key="s2-intro" entering={ENTER(1)} exiting={EXIT(1)}>
+                <Text variant="caption" tone="tertiary">
+                  Where you&apos;ll eat. Leave a meal on{' '}
+                  <Text variant="caption" tone="secondary" weight="semibold">
+                    No preference
+                  </Text>{' '}
+                  and the planner decides; pick Home or Out to steer it. A dining
+                  errand you&apos;ve added fills its meal automatically.
+                </Text>
+              </Animated.View>
+
+              {MEAL_KEYS.map((meal, i) => (
+                <MealRow
+                  key={`s2-${meal}`}
+                  index={i + 2}
+                  meal={meal}
+                  mode={mealModes[meal]}
+                  window={mealWindows[meal]}
+                  linkedErrand={
+                    mealLinks[meal]
+                      ? errands.find((e) => e.id === mealLinks[meal]) ?? null
+                      : null
+                  }
+                  onSetMode={(m) => setMealMode(meal, m)}
+                  onUnlink={() => unlinkMeal(meal)}
+                />
+              ))}
+
+              <View key="s2-spaceBottom" style={{ flex: 1 }} />
+
+              <Animated.View
+                key="s2-footer"
+                entering={ENTER(MEAL_KEYS.length + 2)}
+                exiting={EXIT(MEAL_KEYS.length + 2)}
                 style={styles.footer}
               >
                 <Button title="Confirm" onPress={confirm} fullWidth size="lg" />
@@ -1029,6 +1203,150 @@ function LocChip({
   );
 }
 
+/** Time · place line shown under a linked dining errand's title. */
+function linkedErrandMeta(e: Errand): string {
+  const parts: string[] = [];
+  if (e.startTime) {
+    parts.push(
+      e.endTime
+        ? `${formatTime(e.startTime)} – ${formatTime(e.endTime)}`
+        : formatTime(e.startTime),
+    );
+  }
+  if (e.address && e.address.trim()) parts.push(e.address.trim());
+  else if (e.autoPlace) parts.push(e.placeQuery?.trim() || 'Diem picks the spot');
+  return parts.join(' · ');
+}
+
+/**
+ * One meal's preference row: a label + window, then EITHER the dining errand
+ * that covers it (with an unlink "×") OR a three-way No preference / Home / Out
+ * segmented control. Re-seeded per day, so it never carries stale picks.
+ */
+function MealRow({
+  index,
+  meal,
+  mode,
+  window,
+  linkedErrand,
+  onSetMode,
+  onUnlink,
+}: {
+  index: number;
+  meal: MealKey;
+  mode: MealMode;
+  window?: MealWindow;
+  linkedErrand: Errand | null;
+  onSetMode: (mode: MealMode) => void;
+  onUnlink: () => void;
+}) {
+  const t = useTheme();
+  const meta = MEAL_META[meal];
+  const windowText =
+    window?.start && window?.end
+      ? `${formatTime(window.start)} – ${formatTime(window.end)}`
+      : window?.start
+        ? `around ${formatTime(window.start)}`
+        : 'Anytime';
+  const linkedMeta = linkedErrand ? linkedErrandMeta(linkedErrand) : '';
+
+  const options: { value: MealMode; label: string }[] = [
+    { value: 'auto', label: 'No preference' },
+    { value: 'home', label: 'Home' },
+    { value: 'out', label: 'Out' },
+  ];
+
+  return (
+    <Animated.View
+      entering={ENTER(index)}
+      exiting={EXIT(index)}
+      layout={LinearTransition.duration(220)}
+      style={[styles.rowOuter, { borderTopColor: t.colors.separator }]}
+    >
+      <View style={styles.mealHead}>
+        <Ionicons name={meta.icon} size={18} color={t.colors.textSecondary} />
+        <View style={{ flex: 1 }}>
+          <Text variant="body" weight="semibold">
+            {meta.label}
+          </Text>
+          <Text variant="caption" tone="tertiary">
+            {linkedErrand ? 'From your errand' : windowText}
+          </Text>
+        </View>
+      </View>
+
+      {linkedErrand ? (
+        <Pressable
+          onPress={onUnlink}
+          style={[styles.linkedCard, { backgroundColor: t.colors.fill1 }]}
+          accessibilityRole="button"
+          accessibilityLabel={`${meta.label} from your errand ${linkedErrand.title}. Tap to remove and choose instead.`}
+        >
+          {linkedErrand.photoUrl ? (
+            <Image
+              source={{ uri: linkedErrand.photoUrl }}
+              style={[styles.linkedThumb, { backgroundColor: t.colors.fill2 }]}
+            />
+          ) : (
+            <View
+              style={[
+                styles.linkedThumb,
+                styles.linkedThumbFallback,
+                { backgroundColor: t.colors.fill2 },
+              ]}
+            >
+              <Ionicons name="restaurant" size={18} color={t.colors.accent} />
+            </View>
+          )}
+          <View style={styles.linkedText}>
+            <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+              {linkedErrand.title}
+            </Text>
+            {linkedMeta ? (
+              <Text variant="caption" tone="tertiary" numberOfLines={1}>
+                {linkedMeta}
+              </Text>
+            ) : null}
+          </View>
+          <Ionicons name="close-circle" size={20} color={t.colors.textTertiary} />
+        </Pressable>
+      ) : (
+        <View style={styles.segment}>
+          {options.map((o) => {
+            const active = mode === o.value;
+            return (
+              <Pressable
+                key={o.value}
+                onPress={() => onSetMode(o.value)}
+                style={[
+                  styles.segChip,
+                  { backgroundColor: active ? t.colors.accent : t.colors.fill1 },
+                ]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+                accessibilityLabel={`${meta.label}: ${o.label}`}
+              >
+                <Text
+                  variant="caption"
+                  weight="bold"
+                  numberOfLines={1}
+                  style={{
+                    color: active
+                      ? t.colors.textOnAccent
+                      : t.colors.textSecondary,
+                  }}
+                >
+                  {o.label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      )}
+    </Animated.View>
+  );
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -1168,6 +1486,48 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     borderRadius: 999,
+  },
+  mealHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingTop: 14,
+  },
+  segment: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingTop: 10,
+    paddingBottom: 14,
+  },
+  segChip: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  linkedCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    padding: 10,
+    borderRadius: 14,
+    marginTop: 10,
+    marginBottom: 14,
+  },
+  linkedThumb: {
+    width: 44,
+    height: 44,
+    borderRadius: 10,
+  },
+  linkedThumbFallback: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  linkedText: {
+    flex: 1,
+    gap: 1,
   },
   footer: {
     paddingTop: 6,

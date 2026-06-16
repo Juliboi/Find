@@ -21,6 +21,12 @@ export interface SchedulerContext {
   work?: LocationPin | null;
   endOfDay?: LocationPin | null;
   currentLocation?: { latitude: number; longitude: number; label?: string | null } | null;
+  /**
+   * "HH:MM" the day is planned to BEGIN (the drawer's Start time). Seeds the
+   * routing clock when the first block carries no time of its own, so the day
+   * opens at the user's chosen hour instead of the cascade's 08:00 default.
+   */
+  dayStartTime?: string | null;
 
   // ----- Profile-derived personalisation (optional; planner-only) -----
   /** The user's name, so the planner can address them in the summary. */
@@ -38,6 +44,18 @@ export interface SchedulerContext {
   lunchEnd?: string | null;
   dinnerStart?: string | null;
   dinnerEnd?: string | null;
+  /**
+   * Per-meal dining preference for THIS day (from the planner drawer):
+   *   'home' = eat at home, 'out' = eat out (find a spot near the route),
+   *   'auto'/omitted = no preference (planner decides). Drives meal placement.
+   */
+  mealModes?: Partial<Record<'breakfast' | 'lunch' | 'dinner', 'auto' | 'home' | 'out'>> | null;
+  /**
+   * Per-meal venue label when that meal is covered by one of the user's own
+   * dining errands — the planner uses THAT place as the meal instead of finding
+   * one (and must not add a duplicate meal block).
+   */
+  mealVenues?: Partial<Record<'breakfast' | 'lunch' | 'dinner', string>> | null;
   /** "HH:MM" after which only calm, sleep-friendly activities are scheduled. */
   windDownTime?: string | null;
   /** Whether screen-heavy wind-down activities are OK near bedtime. */

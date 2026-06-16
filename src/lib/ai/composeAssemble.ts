@@ -68,6 +68,30 @@ function coordKey(lat: number, lng: number): string {
   return `${lat.toFixed(5)},${lng.toFixed(5)}`;
 }
 
+/**
+ * Normalize a title for fuzzy dedup: trim, lowercase, collapse whitespace, drop
+ * trailing punctuation. Lets the safety net recognise an errand the brain DID
+ * schedule but linked with a missing/wrong id — the source of the duplicate
+ * "Also today: online therapy" block.
+ */
+function normTitle(s: string | undefined | null): string {
+  return (s ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[.!?,;:]+$/, '');
+}
+
+/**
+ * Buffer-like blocks the user treats as ELASTIC GAPS rather than rigid
+ * activities — wind-down, calm time, decompression, leftover free time. These
+ * are exactly the stretches the user expands/shrinks/fills when other blocks
+ * change, so they render as gap cards (named, resizable). A block that resolved
+ * to a real venue is a genuine stop and is never reclassified.
+ */
+const BUFFER_TITLE_RE =
+  /\b(wind[\s-]*down|winddown|calm(?:\s*time)?|unwind|decompress|down[\s-]*time|chill|relax(?:ation)?|leisure|me[\s-]*time|free[\s-]*time|buffer)\b/i;
+
 function centroid(points: Coords[]): Coords | null {
   if (points.length === 0) return null;
   const sum = points.reduce(
@@ -136,6 +160,10 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
   // 3) Build an ordered item per block, attaching the resolved venue + pinned time.
   const referencedAnchors = new Set<string>();
   const referencedTasks = new Set<string>();
+  // Normalized titles already emitted into the main plan, so the safety net can
+  // skip re-adding an errand the brain scheduled but linked with a wrong/missing
+  // id (the duplicate "Also today" block the user hit).
+  const emittedTitles = new Set<string>();
   type RawItem = Record<string, unknown> & { __section: string; __period: string | null };
   const rawItems: RawItem[] = [];
 
@@ -151,10 +179,14 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       place?: ItineraryPlace;
     },
   ) => {
+    // Surface wind-down / calm / leftover-buffer blocks as elastic gaps (unless
+    // they pin to a real venue) so the day's "soft" time is resizable, not a
+    // fixed activity the cascade defends. A gap is always flexible.
+    const asGap = !opts.place && b.kind !== 'gap' && BUFFER_TITLE_RE.test(b.title ?? '');
     rawItems.push({
       title: b.title,
-      kind: b.kind,
-      flexibility: b.flexibility,
+      kind: asGap ? 'gap' : b.kind,
+      flexibility: asGap ? 'flexible' : b.flexibility,
       startTime: opts.startTime ?? undefined,
       endTime: opts.endTime ?? undefined,
       durationMinutes: opts.durationMin ?? undefined,
@@ -163,7 +195,23 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       __section: (b.section || b.period || 'Your day').toString(),
       __period: b.period ?? null,
     });
+    if (b.title) emittedTitles.add(normTitle(b.title));
   };
+
+  // How many blocks reference each source errand. More than one ⇒ refine SPLIT
+  // that errand into multiple sessions (e.g. "language 1.5h" → two 45-min
+  // blocks sharing the taskId), which changes how we apply its duration + pin.
+  const taskRefCount = new Map<string, number>();
+  const anchorRefCount = new Map<string, number>();
+  for (const b of blocks) {
+    if (b.taskId) taskRefCount.set(b.taskId, (taskRefCount.get(b.taskId) ?? 0) + 1);
+    if (b.placement === 'anchor' && b.anchorId) {
+      anchorRefCount.set(b.anchorId, (anchorRefCount.get(b.anchorId) ?? 0) + 1);
+    }
+  }
+  // Which split errands have already consumed their single hard pin (only the
+  // first session may inherit it — two sessions can't pin to the same instant).
+  const splitPinConsumed = new Set<string>();
 
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
@@ -174,9 +222,37 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
     const anchorSrc = b.anchorId ? args.anchorsById.get(b.anchorId) : undefined;
     const taskSrc = b.taskId ? args.tasksById.get(b.taskId) : undefined;
     const inherit = b.placement === 'anchor' ? anchorSrc : undefined;
-    const pinnedStart = inherit?.startTime ?? taskSrc?.startTime ?? b.startTime ?? null;
-    const pinnedEnd = pinnedStart ? inherit?.endTime ?? taskSrc?.endTime ?? b.endTime ?? null : null;
-    const duration = inherit?.durationMin ?? taskSrc?.durationMin ?? b.durationMin ?? null;
+    const srcStart = inherit?.startTime ?? taskSrc?.startTime ?? null;
+    const srcEnd = inherit?.endTime ?? taskSrc?.endTime ?? null;
+    const srcDur = inherit?.durationMin ?? taskSrc?.durationMin ?? null;
+
+    // Is this block one SESSION of a split errand?
+    const sessionCount =
+      taskSrc && (taskRefCount.get(b.taskId as string) ?? 0) > 1
+        ? (taskRefCount.get(b.taskId as string) as number)
+        : inherit && (anchorRefCount.get(b.anchorId as string) ?? 0) > 1
+          ? (anchorRefCount.get(b.anchorId as string) as number)
+          : 1;
+    const isSplit = sessionCount > 1;
+    const splitKey = isSplit ? (taskSrc ? `t:${b.taskId}` : `a:${b.anchorId}`) : null;
+    const firstSession = isSplit && splitKey != null && !splitPinConsumed.has(splitKey);
+    if (splitKey) splitPinConsumed.add(splitKey);
+
+    let pinnedStart: string | null;
+    let duration: number | null;
+    if (isSplit) {
+      // Sessions take their OWN (shorter) length; the source pin only lands on
+      // the first one, the router times the rest.
+      pinnedStart = firstSession ? srcStart ?? b.startTime ?? null : b.startTime ?? null;
+      duration =
+        b.durationMin ?? (srcDur != null ? Math.max(15, Math.round(srcDur / sessionCount)) : null);
+    } else {
+      pinnedStart = srcStart ?? b.startTime ?? null;
+      duration = srcDur ?? b.durationMin ?? null;
+    }
+    const pinnedEnd = pinnedStart
+      ? (firstSession || !isSplit ? srcEnd ?? b.endTime ?? null : b.endTime ?? null)
+      : null;
     if (b.anchorId && anchorSrc) referencedAnchors.add(b.anchorId);
     if (b.taskId && taskSrc) referencedTasks.add(b.taskId);
 
@@ -204,9 +280,12 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
 
   // 3b) Safety net — never silently drop a user errand the brain forgot to
   // reference. Append any unreferenced located/unplaced errand at the end so it
-  // still lands in the day (the user can reorder it).
+  // still lands in the day (the user can reorder it). Skip ones whose title is
+  // already in the plan: the brain DID schedule them but linked a wrong/missing
+  // id, so re-adding would duplicate (e.g. the "Also today: online therapy" bug).
   for (const [id, a] of args.anchorsById) {
     if (referencedAnchors.has(id)) continue;
+    if (emittedTitles.has(normTitle(a.title))) continue;
     pushItem(
       { title: a.title, kind: 'other', flexibility: a.startTime ? 'fixed' : 'flexible', section: 'Also today', period: null, description: null },
       { startTime: a.startTime ?? null, endTime: a.endTime ?? null, durationMin: a.durationMin ?? null, place: { ...a.place, userNamed: true } },
@@ -214,6 +293,7 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
   }
   for (const [id, t] of args.tasksById) {
     if (referencedTasks.has(id)) continue;
+    if (emittedTitles.has(normTitle(t.title))) continue;
     pushItem(
       { title: t.title, kind: 'other', flexibility: t.startTime ? 'fixed' : 'flexible', section: 'Also today', period: null, description: null },
       { startTime: t.startTime ?? null, endTime: t.endTime ?? null, durationMin: t.durationMin ?? null },

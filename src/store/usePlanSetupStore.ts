@@ -16,6 +16,31 @@ export const DEFAULT_DAY_START_TIME = '09:00';
 /** Sensible fallback day-end when the profile has no bedtime yet. */
 export const DEFAULT_DAY_END_TIME = '21:00';
 
+/** The three meals the planner can place + reason about. */
+export type MealKey = 'breakfast' | 'lunch' | 'dinner';
+
+/**
+ * Per-meal dining preference the user sets in the planner drawer:
+ *   - 'auto' — no preference; let the planner decide (home or a spot out).
+ *   - 'home' — eat at home (no venue, no travel).
+ *   - 'out'  — eat out; the planner finds a place near the route at that time.
+ * A meal can instead be LINKED to one of the user's own errands (see mealLinks),
+ * in which case that errand's place IS the meal and the mode is ignored.
+ */
+export type MealMode = 'auto' | 'home' | 'out';
+
+/**
+ * Sensible per-meal defaults: breakfast is almost always at home, while lunch
+ * and dinner are left open for the planner (or the day's errands) to decide.
+ */
+export const DEFAULT_MEAL_MODES: Record<MealKey, MealMode> = {
+  breakfast: 'home',
+  lunch: 'auto',
+  dinner: 'auto',
+};
+
+export const MEAL_KEYS: MealKey[] = ['breakfast', 'lunch', 'dinner'];
+
 /**
  * The full "how does this day look?" selection produced by the planner setup
  * drawer: the day itself, the start/end times, and the start/end locations.
@@ -26,6 +51,14 @@ export interface DayPlanSelection {
   startLocation: LocationPin | null;
   endTime: string;
   endLocation: LocationPin | null;
+  /** Per-meal dining preference for this day (breakfast/lunch/dinner). */
+  mealModes: Record<MealKey, MealMode>;
+  /**
+   * Per-meal link to one of the user's errands (its id) when a dining errand
+   * covers that meal — the errand's place becomes the meal. `null` ⇒ unlinked
+   * (the mealModes preference applies instead).
+   */
+  mealLinks: Record<MealKey, string | null>;
 }
 
 interface PlanSetupState {
@@ -42,18 +75,36 @@ interface PlanSetupState {
   /** Configurable default start-of-day, used to seed non-today days. */
   dayStartTime: string;
   /**
+   * Configurable default end-of-day, seeded from the profile's wind-down (else
+   * bed) time so the planner's "finish by" reflects the user's evening instead
+   * of a hardcoded 21:00.
+   */
+  dayEndTime: string;
+  /**
    * Whether the user's car is available for THIS day's plan. Only meaningful
    * when the profile says they have a car. Defaults to true so the planner may
    * use it when helpful; the user can switch it off per day (e.g. a night out).
    */
   useCarToday: boolean;
+  /** Per-meal dining preference for the day being planned. */
+  mealModes: Record<MealKey, MealMode>;
+  /** Per-meal link to a covering dining errand (its id), or null when unlinked. */
+  mealLinks: Record<MealKey, string | null>;
 
   /** Persist a confirmed day + start time from the planner setup drawer. */
   setSelection: (date: string, startTime: string) => void;
   /** Persist the full day plan (day, start/end times, start/end locations). */
   setDayPlan: (selection: DayPlanSelection) => void;
+  /**
+   * Drop a confirmed meal link to a specific errand (any meal it covers). Called
+   * when the user unticks that errand from the plan, so it stops standing in for
+   * its meal once it's no longer folded in.
+   */
+  clearMealLinksForErrand: (errandId: string) => void;
   /** Update the default day-start time (used for future days). */
   setDayStartTime: (hhmm: string) => void;
+  /** Update the default day-end time (synced from the profile). */
+  setDayEndTime: (hhmm: string) => void;
   /** Toggle whether the car is in play for the day being planned. */
   setUseCarToday: (useCar: boolean) => void;
 }
@@ -73,7 +124,10 @@ export const usePlanSetupStore = create<PlanSetupState>()(
       endTime: DEFAULT_DAY_END_TIME,
       endLocation: null,
       dayStartTime: DEFAULT_DAY_START_TIME,
+      dayEndTime: DEFAULT_DAY_END_TIME,
       useCarToday: true,
+      mealModes: { ...DEFAULT_MEAL_MODES },
+      mealLinks: { breakfast: null, lunch: null, dinner: null },
       setSelection: (date, startTime) => set({ date, startTime }),
       setDayPlan: (selection) =>
         set({
@@ -82,8 +136,28 @@ export const usePlanSetupStore = create<PlanSetupState>()(
           startLocation: selection.startLocation,
           endTime: selection.endTime,
           endLocation: selection.endLocation,
+          mealModes: selection.mealModes,
+          mealLinks: selection.mealLinks,
+        }),
+      clearMealLinksForErrand: (errandId) =>
+        set((s) => {
+          // No-op (and a stable reference) when this errand covered no meal, so
+          // unticking ordinary errands never churns the meal links.
+          if (!MEAL_KEYS.some((meal) => s.mealLinks[meal] === errandId)) return {};
+          const cleared = { ...s.mealLinks };
+          for (const meal of MEAL_KEYS) {
+            if (cleared[meal] === errandId) cleared[meal] = null;
+          }
+          return { mealLinks: cleared };
         }),
       setDayStartTime: (dayStartTime) => set({ dayStartTime }),
+      setDayEndTime: (dayEndTime) =>
+        set((s) => ({
+          dayEndTime,
+          // Upgrade the live selection too, but only while it's still the
+          // factory default — never clobber an end the user explicitly picked.
+          endTime: s.endTime === DEFAULT_DAY_END_TIME ? dayEndTime : s.endTime,
+        })),
       setUseCarToday: (useCarToday) => set({ useCarToday }),
     }),
     {

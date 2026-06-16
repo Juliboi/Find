@@ -41,6 +41,12 @@ import {
   type Errand,
   type ErrandInput,
 } from '@/store/useErrandsStore';
+import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
+import {
+  materializeRecurringForDate,
+  recurringInstancesForDate,
+  skipRecurringOccurrence,
+} from '@/lib/recurring';
 import { useProfileStore } from '@/store/useProfileStore';
 import { useHomeStore } from '@/store/useHomeStore';
 import { useWeatherStore } from '@/store/useWeatherStore';
@@ -256,11 +262,34 @@ export default function HomeScreen() {
     }
   }, [errands, today]);
 
-  // The home list focuses on today: today's dated errands lead the Scheduled
-  // group, then "Anytime" (capped), then a collapsible "Completed" section.
-  const errandGroups = useMemo(
-    () => groupErrands(errands, { focusDate: today, today }),
+  // Recurring templates → today's editable occurrences. Materialize whenever the
+  // day rolls over or a template changes (add/edit/skip in Settings), then read
+  // the still-open occurrences back out of the errands store. Idempotent, so a
+  // re-run never duplicates or clobbers an edited/done occurrence.
+  const recurringTemplates = useRecurringErrandsStore((s) => s.items);
+  useEffect(() => {
+    materializeRecurringForDate(today);
+  }, [today, recurringTemplates]);
+  const recurringToday = useMemo(
+    () => recurringInstancesForDate(errands, today),
     [errands, today],
+  );
+  const recurringTodayIds = useMemo(
+    () => new Set(recurringToday.map((e) => e.id)),
+    [recurringToday],
+  );
+
+  // The home list focuses on today: a "Repeats today" section (the recurring
+  // occurrences) leads, then today's dated errands in Scheduled, then "Anytime"
+  // (capped), then a collapsible "Completed" section. Recurring occurrences are
+  // rendered in their own section, so exclude them from the normal groups.
+  const errandGroups = useMemo(
+    () =>
+      groupErrands(
+        errands.filter((e) => !recurringTodayIds.has(e.id)),
+        { focusDate: today, today },
+      ),
+    [errands, recurringTodayIds, today],
   );
   const [showAllAnytime, setShowAllAnytime] = useState(false);
   const [showCompleted, setShowCompleted] = useState(false);
@@ -363,8 +392,36 @@ export default function HomeScreen() {
   };
 
   const onDeleteErrand = () => {
-    if (editId) removeErrand(editId);
+    if (editId) {
+      // Deleting a recurring occurrence means "skip this one" — record it on the
+      // template so the generator doesn't just recreate it on the next pass.
+      const e = errands.find((x) => x.id === editId);
+      if (e?.recurringId && e.date) skipRecurringOccurrence(e.recurringId, e.date);
+      else removeErrand(editId);
+    }
     setDrawerOpen(false);
+  };
+
+  // Recurring occurrence "..." menu: edit this one (tap the row), skip just this
+  // week, or jump to Settings to edit the whole series.
+  const openRecurringOptions = (errand: Errand) => {
+    if (!errand.recurringId || !errand.date) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    Alert.alert(errand.title, 'This repeats on a schedule.', [
+      {
+        text: 'Skip this week',
+        onPress: () => skipRecurringOccurrence(errand.recurringId!, errand.date!),
+      },
+      {
+        text: 'Edit series',
+        onPress: () =>
+          router.push({
+            pathname: '/recurring-errands',
+            params: { edit: errand.recurringId },
+          }),
+      },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
   };
 
   const gradientHeight = Math.round(height * 0.8);
@@ -618,6 +675,22 @@ export default function HomeScreen() {
           {/* Errands / reminders */}
           {errands.length > 0 ? (
             <View style={styles.errands}>
+              {recurringToday.length > 0 ? (
+                <ErrandSection title="Repeats today" count={recurringToday.length}>
+                  {recurringToday.map((errand, i) => (
+                    <ErrandRow
+                      key={errand.id}
+                      errand={errand}
+                      repeats
+                      onPress={() => onEditErrand(errand)}
+                      onToggleDone={() => toggleErrandDone(errand.id)}
+                      onOptions={() => openRecurringOptions(errand)}
+                      showSeparator={i < recurringToday.length - 1}
+                    />
+                  ))}
+                </ErrandSection>
+              ) : null}
+
               {errandGroups.scheduled.length > 0 ? (
                 <ErrandSection title="Scheduled" count={errandGroups.scheduled.length}>
                   {errandGroups.scheduled.map((errand, i) => (
