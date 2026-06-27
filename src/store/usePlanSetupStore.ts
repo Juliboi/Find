@@ -42,6 +42,16 @@ export const DEFAULT_MEAL_MODES: Record<MealKey, MealMode> = {
 export const MEAL_KEYS: MealKey[] = ['breakfast', 'lunch', 'dinner'];
 
 /**
+ * DEV/TESTING planner pipeline selector:
+ *   - 'v2' — the default unified compose brain (compose-itinerary).
+ *   - 'v3' — the experimental multi-phase pipeline (order → locate → commute →
+ *            gap-fill → re-route).
+ *   - 'v4' — the isolated single grounded call (plan-day-v4) that returns the
+ *            whole day (order + times + gaps + initial venue picks) in one shot.
+ */
+export type PlannerMode = 'v2' | 'v3' | 'v4';
+
+/**
  * The full "how does this day look?" selection produced by the planner setup
  * drawer: the day itself, the start/end times, and the start/end locations.
  */
@@ -86,6 +96,12 @@ interface PlanSetupState {
    * use it when helpful; the user can switch it off per day (e.g. a night out).
    */
   useCarToday: boolean;
+  /**
+   * DEV/TESTING: which planning pipeline to run from the planner drawer.
+   * Selected by a small segmented control; persisted so a tester keeps their
+   * choice across runs. Default 'v2' (the shipping unified compose brain).
+   */
+  plannerMode: PlannerMode;
   /** Per-meal dining preference for the day being planned. */
   mealModes: Record<MealKey, MealMode>;
   /** Per-meal link to a covering dining errand (its id), or null when unlinked. */
@@ -107,6 +123,8 @@ interface PlanSetupState {
   setDayEndTime: (hhmm: string) => void;
   /** Toggle whether the car is in play for the day being planned. */
   setUseCarToday: (useCar: boolean) => void;
+  /** Pick which planning pipeline to run (dev/testing selector). */
+  setPlannerMode: (mode: PlannerMode) => void;
 }
 
 /**
@@ -126,6 +144,7 @@ export const usePlanSetupStore = create<PlanSetupState>()(
       dayStartTime: DEFAULT_DAY_START_TIME,
       dayEndTime: DEFAULT_DAY_END_TIME,
       useCarToday: true,
+      plannerMode: 'v2',
       mealModes: { ...DEFAULT_MEAL_MODES },
       mealLinks: { breakfast: null, lunch: null, dinner: null },
       setSelection: (date, startTime) => set({ date, startTime }),
@@ -159,6 +178,7 @@ export const usePlanSetupStore = create<PlanSetupState>()(
           endTime: s.endTime === DEFAULT_DAY_END_TIME ? dayEndTime : s.endTime,
         })),
       setUseCarToday: (useCarToday) => set({ useCarToday }),
+      setPlannerMode: (plannerMode) => set({ plannerMode }),
     }),
     {
       name: 'dayflow.plan-setup.v1',

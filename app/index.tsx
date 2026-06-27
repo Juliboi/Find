@@ -56,6 +56,9 @@ import { Text } from '@/components/Text';
 import { GlassSurface } from '@/components/Glass';
 import { GradientWave } from '@/components/GradientWave';
 import { ChatComposerBar } from '@/components/ChatComposerBar';
+import { CalendarStrip } from '@/components/CalendarStrip';
+import { DayScheduleCard } from '@/components/DayScheduleCard';
+import { DayBalanceCard } from '@/components/DayBalanceCard';
 import { PlanBuildingCard } from '@/components/PlanBuildingCard';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
 import { ErrandDrawer } from '@/components/ErrandDrawer';
@@ -65,7 +68,11 @@ import { PlanPeek } from '@/components/PlanPeek';
 import { parseErrandRemote, type ErrandDraft } from '@/lib/ai/parseErrand';
 import { type DiscoveryIntent } from '@/lib/discover';
 import { isDailyReviewResponse } from '@/lib/notifications';
-import { todayISO, tomorrowISO } from '@/utils/time';
+import { todayISO, tomorrowISO, currentHHMM, minutesOfDay } from '@/utils/time';
+import { scoreDay, errandLoadMin } from '@/lib/planning/mindfulness';
+import { usableDayWindow } from '@/lib/planning/dayWindow';
+import { minToHHMM } from '@/lib/planning/conflicts';
+import { describeDay, dateFromISO } from '@/utils/days';
 import {
   DAYTIME_PALETTES,
   getDayPart,
@@ -117,8 +124,7 @@ function errandToDraft(e: Errand): ErrandDraft {
     ratingCount: e.ratingCount ?? null,
     priceLevel: e.priceLevel ?? null,
     openingHours: e.openingHours ?? null,
-    autoPlace: e.autoPlace ?? null,
-    placeQuery: e.placeQuery ?? null,
+    travelMode: e.travelMode ?? null,
     notes: e.notes ?? null,
   };
 }
@@ -186,28 +192,39 @@ export default function HomeScreen() {
   const firstName = fullName?.trim().split(/\s+/)[0] ?? '';
   const homeHeading = firstName ? `Hey, ${firstName}` : 'Hey there';
 
-  const savedTrips = useSavedItineraries((s) => s.items);
-  // The homepage is strictly "today": the day's active plan (the one the user
-  // pinned, else the first they created that day) is the card, and any other
-  // plans dated today are reachable via the "other plans" link below it.
-  const today = todayISO();
-  const todayPlans = useMemo(
-    () => plansForDate(savedTrips, today),
-    [savedTrips, today],
-  );
-  const activeToday = useMemo(
-    () => activePlanForDate(savedTrips, today),
-    [savedTrips, today],
-  );
-  const otherTodayCount = Math.max(0, todayPlans.length - 1);
+  // Sleep window — the "fit it into your day" bounds the mindfulness score uses.
+  const wakeTime = useProfileStore((s) => s.wakeTime);
+  const bedTime = useProfileStore((s) => s.bedTime);
+  const windDownTime = useProfileStore((s) => s.windDownTime);
+  const wakeUpDurationMin = useProfileStore((s) => s.wakeUpDurationMin);
 
-  // A day still building in the background (the user kicked off a plan and was
-  // sent back here). Takes over the card with a live skeleton until it lands —
-  // see the card branch below. We surface the most recent in-flight build
-  // regardless of its date: the card speaks for itself ("Building your plan")
-  // and a future-day build still deserves visible progress here.
+  // The home screen is day-scoped: a calendar strip under the header moves
+  // `focusDate` between days and everything date-derived below it (the plan
+  // card, the date line, the errand sections, the weather) follows along. It
+  // defaults to — and the strip starts at — today.
+  const today = todayISO();
+  const [focusDate, setFocusDate] = useState(today);
+  const isToday = focusDate === today;
+  const focusDay = useMemo(() => describeDay(focusDate), [focusDate]);
+
+  const savedTrips = useSavedItineraries((s) => s.items);
+  // The focused day's plans: its active plan (the one the user pinned, else the
+  // most recent that day) is the card; any others are reachable via the "other
+  // plans" link below it.
+  const dayPlans = useMemo(
+    () => plansForDate(savedTrips, focusDate),
+    [savedTrips, focusDate],
+  );
+  const activePlan = useMemo(
+    () => activePlanForDate(savedTrips, focusDate),
+    [savedTrips, focusDate],
+  );
+  const otherPlansCount = Math.max(0, dayPlans.length - 1);
+
+  // A plan still building in the background for the focused day takes over the
+  // card with a live skeleton until it lands (see the card branch below).
   const buildingJob = usePlanJobsStore((s) =>
-    s.jobs.find((j) => j.status === 'building'),
+    s.jobs.find((j) => j.status === 'building' && j.date === focusDate),
   );
 
   // ----- Errands -----
@@ -226,7 +243,7 @@ export default function HomeScreen() {
   // dated today" version caused. Shares via the OS sheet (its "Copy" hits the
   // clipboard) and always logs to Metro as a fallback — no native module/rebuild.
   const copyScheduledErrands = useCallback(async () => {
-    const scheduled = groupErrands(errands, { focusDate: today, today }).scheduled;
+    const scheduled = groupErrands(errands, { focusDate, today }).scheduled;
     const payload = scheduled.map((e) => ({
       title: e.title,
       startTime: e.startTime ?? null,
@@ -237,8 +254,6 @@ export default function HomeScreen() {
       latitude: e.latitude ?? null,
       longitude: e.longitude ?? null,
       placeId: e.placeId ?? null,
-      autoPlace: e.autoPlace ?? false,
-      placeQuery: e.placeQuery ?? null,
       rating: e.rating ?? null,
       ratingCount: e.ratingCount ?? null,
       notes: e.notes ?? null,
@@ -260,7 +275,7 @@ export default function HomeScreen() {
     } catch {
       // dismissed / unavailable — the console log above is the fallback.
     }
-  }, [errands, today]);
+  }, [errands, focusDate, today]);
 
   // Recurring templates → today's editable occurrences. Materialize whenever the
   // day rolls over or a template changes (add/edit/skip in Settings), then read
@@ -268,31 +283,74 @@ export default function HomeScreen() {
   // re-run never duplicates or clobbers an edited/done occurrence.
   const recurringTemplates = useRecurringErrandsStore((s) => s.items);
   useEffect(() => {
+    // Always keep today materialized (so it's instant to jump back to), plus
+    // the focused day when it's somewhere else.
     materializeRecurringForDate(today);
-  }, [today, recurringTemplates]);
-  const recurringToday = useMemo(
-    () => recurringInstancesForDate(errands, today),
-    [errands, today],
+    if (focusDate !== today) materializeRecurringForDate(focusDate);
+  }, [today, focusDate, recurringTemplates]);
+  const recurringDay = useMemo(
+    () => recurringInstancesForDate(errands, focusDate),
+    [errands, focusDate],
   );
-  const recurringTodayIds = useMemo(
-    () => new Set(recurringToday.map((e) => e.id)),
-    [recurringToday],
+  const recurringDayIds = useMemo(
+    () => new Set(recurringDay.map((e) => e.id)),
+    [recurringDay],
   );
 
-  // The home list focuses on today: a "Repeats today" section (the recurring
-  // occurrences) leads, then today's dated errands in Scheduled, then "Anytime"
-  // (capped), then a collapsible "Completed" section. Recurring occurrences are
-  // rendered in their own section, so exclude them from the normal groups.
+  // The focused day's list: a "Repeats" section (the recurring occurrences)
+  // leads, then that day's dated errands in "Scheduled". Recurring occurrences
+  // are rendered in their own section, so exclude them from the normal groups.
   const errandGroups = useMemo(
     () =>
       groupErrands(
-        errands.filter((e) => !recurringTodayIds.has(e.id)),
-        { focusDate: today, today },
+        errands.filter((e) => !recurringDayIds.has(e.id)),
+        { focusDate, today },
       ),
-    [errands, recurringTodayIds, today],
+    [errands, recurringDayIds, focusDate, today],
   );
+  // The focused day's dated, still-open errands. On today we also pull in
+  // anything overdue (dated earlier but never closed) so it keeps nagging here
+  // rather than hiding on a past day the strip can't reach; other days show
+  // only what's dated to them.
+  const scheduledForDay = useMemo(
+    () =>
+      errandGroups.scheduled.filter((e) =>
+        isToday ? (e.date ?? '') <= today : e.date === focusDate,
+      ),
+    [errandGroups.scheduled, isToday, today, focusDate],
+  );
+  // Stretch the calendar strip just far enough to always reach the most distant
+  // dated thing the user has (an open errand or a saved plan), so a far-future
+  // item is never orphaned past the strip's end. Two weeks minimum, capped so a
+  // date set far out can't balloon it.
+  const stripDays = useMemo(() => {
+    let furthest = today;
+    for (const e of errands) {
+      if (e.date && errandStatus(e, today) === 'open' && e.date > furthest) {
+        furthest = e.date;
+      }
+    }
+    for (const p of savedTrips) {
+      if (p.date && p.date > furthest) furthest = p.date;
+    }
+    const diffDays = Math.round(
+      (dateFromISO(furthest).getTime() - dateFromISO(today).getTime()) / 86_400_000,
+    );
+    return Math.min(90, Math.max(14, diffDays + 1));
+  }, [errands, savedTrips, today]);
+
+  // "Anytime" (undated) and "Completed" are day-agnostic housekeeping — they
+  // belong to the home base (today), not to a specific browsed day.
+  const showAnytime = errandGroups.anytime.length > 0;
+  const showCompleted = errandGroups.completed.length > 0;
+  const hasDayContent =
+    recurringDay.length > 0 ||
+    scheduledForDay.length > 0 ||
+    showAnytime ||
+    showCompleted;
+
   const [showAllAnytime, setShowAllAnytime] = useState(false);
-  const [showCompleted, setShowCompleted] = useState(false);
+  const [showCompletedSection, setShowCompletedSection] = useState(false);
 
   // Drives the full-screen scrim that fades in while the errand composer holds
   // focus. Kept on the UI thread via reanimated so the dim tracks the keyboard's
@@ -328,8 +386,59 @@ export default function HomeScreen() {
     [home],
   );
 
+  // ----- Mindfulness / day balance -----
+  // How well the focused day "breathes": its open errands' hours + estimated
+  // travel (round-tripping from home) measured against the usable window — wake
+  // plus the morning ramp through wind-down (now → wind-down on today, so the
+  // past isn't counted as free). We drop errands that already finished today so
+  // "leftover time" reflects what's actually still ahead. The plan drawer
+  // recomputes the very same score from just the ticked errands, so the user can
+  // untick to see a calmer day.
+  const dayWindow = useMemo(() => {
+    const nowMin = isToday ? minutesOfDay(currentHHMM()) : null;
+    const { startMin, endMin } = usableDayWindow(
+      { wakeTime, bedTime, windDownTime, wakeUpDurationMin },
+      { nowMin },
+    );
+    return { start: minToHHMM(startMin), end: minToHHMM(endMin) };
+    // `now` ticks each minute, sliding today's window start forward.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wakeTime, bedTime, windDownTime, wakeUpDurationMin, isToday, now]);
+
+  const dayBalanceErrands = useMemo(() => {
+    const open = errands.filter(
+      (e) => e.date === focusDate && errandStatus(e, today) === 'open',
+    );
+    if (!isToday) return open;
+    // Today: anything already wrapped up is behind us — only score what's left.
+    const nowMin = minutesOfDay(currentHHMM()) ?? 0;
+    return open.filter((e) => {
+      const startMin = minutesOfDay(e.startTime);
+      if (startMin == null) return true;
+      return startMin + errandLoadMin(e) > nowMin;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [errands, focusDate, today, isToday, now]);
+
+  const dayScore = useMemo(
+    () =>
+      scoreDay({
+        startTime: dayWindow.start,
+        endTime: dayWindow.end,
+        errands: dayBalanceErrands,
+        startAnchor: fallbackCenter,
+        endAnchor: fallbackCenter,
+      }),
+    [dayWindow, dayBalanceErrands, fallbackCenter],
+  );
+
   const onComposerSubmit = (text: string) => {
     const seq = (parseSeq.current += 1);
+    // When viewing a day other than today, a bare errand (one the parser didn't
+    // date itself) defaults to the day you're looking at — so it lands on, and
+    // stays visible under, the focused day instead of dropping into "Anytime".
+    const withDayDefault = (draft: ErrandDraft): ErrandDraft =>
+      !isToday && !draft.date ? { ...draft, date: focusDate } : draft;
     setDrawerMode('create');
     setEditId(null);
     setDrawerRawText(text);
@@ -340,22 +449,24 @@ export default function HomeScreen() {
     // field stays a single line — no area field, no "near me" toggle.
     setDrawerDiscovery(null);
     setDrawerInitialStep('form');
-    setDrawerSeed({ ...EMPTY_DRAFT, title: text });
+    setDrawerSeed(withDayDefault({ ...EMPTY_DRAFT, title: text }));
     setDrawerParsing(true);
     setDrawerSeedKey(`parse-${seq}`);
     setDrawerOpen(true);
     Haptics.selectionAsync().catch(() => undefined);
+    // The parser still resolves relative dates ("tomorrow", "friday") against
+    // the real today, so those words keep meaning what they say.
     parseErrandRemote(text, { date: todayISO() })
       .then((res) => {
         if (seq !== parseSeq.current) return;
         if (res.intent === 'discover' && res.discovery) {
           setDrawerDiscovery(res.discovery);
-          setDrawerSeed(res.draft);
+          setDrawerSeed(withDayDefault(res.draft));
           setDrawerInitialStep('discover');
           setDrawerParsing(false);
           setDrawerSeedKey(`discover-${seq}`);
         } else {
-          setDrawerSeed(res.draft);
+          setDrawerSeed(withDayDefault(res.draft));
           setDrawerInitialStep('form');
           setDrawerParsing(false);
           setDrawerSeedKey(`create-${seq}-done`);
@@ -363,7 +474,7 @@ export default function HomeScreen() {
       })
       .catch(() => {
         if (seq !== parseSeq.current) return;
-        setDrawerSeed({ ...EMPTY_DRAFT, title: text });
+        setDrawerSeed(withDayDefault({ ...EMPTY_DRAFT, title: text }));
         setDrawerParsing(false);
         setDrawerSeedKey(`create-${seq}-done`);
       });
@@ -435,7 +546,9 @@ export default function HomeScreen() {
   );
   const setDayPlan = usePlanSetupStore((s) => s.setDayPlan);
   const openSetup = () => {
-    setSetupInitialDate(undefined);
+    // Plan the day you're looking at: seed the planner to the focused day
+    // (today stays undefined so the sheet keeps its own "default to today").
+    setSetupInitialDate(isToday ? undefined : focusDate);
     setSetupOpen(true);
   };
   const closeSetup = () => {
@@ -480,18 +593,18 @@ export default function HomeScreen() {
     };
     cardA11y = 'Building your plan — tap to watch it come together';
     cardFullBody = <PlanBuildingCard job={buildingJob} />;
-  } else if (activeToday) {
+  } else if (activePlan) {
     cardOnPress = () => {
       Haptics.selectionAsync().catch(() => undefined);
-      router.push({ pathname: '/itinerary', params: { id: activeToday.id } });
+      router.push({ pathname: '/itinerary', params: { id: activePlan.id } });
     };
-    cardA11y = `Open ${activeToday.title}`;
-    cardPeek = <PlanPeek itinerary={activeToday.itinerary} />;
+    cardA11y = `Open ${activePlan.title}`;
+    cardPeek = <PlanPeek itinerary={activePlan.itinerary} />;
     cardBody = (
       <>
         <View style={[styles.thumb, { backgroundColor: t.colors.fill1 }]}>
-          {activeToday.thumbUrl ? (
-            <Image source={{ uri: activeToday.thumbUrl }} style={styles.thumbImg} />
+          {activePlan.thumbUrl ? (
+            <Image source={{ uri: activePlan.thumbUrl }} style={styles.thumbImg} />
           ) : (
             <Ionicons
               name="map-outline"
@@ -502,13 +615,13 @@ export default function HomeScreen() {
         </View>
         <View style={styles.cardText}>
           <Text variant="micro" uppercase weight="bold" tone="accent">
-            Today&apos;s plan
+            {`${focusDay.title}\u2019s plan`}
           </Text>
           <Text variant="body" weight="semibold" numberOfLines={1}>
-            {activeToday.title}
+            {activePlan.title}
           </Text>
           <Text variant="caption" tone="secondary" numberOfLines={1}>
-            {tripSubtitle(activeToday)}
+            {tripSubtitle(activePlan)}
           </Text>
         </View>
         <Ionicons
@@ -598,6 +711,15 @@ export default function HomeScreen() {
             </View>
           </View>
 
+          <CalendarStrip
+            selectedDate={focusDate}
+            onSelectDate={setFocusDate}
+            today={today}
+            days={stripDays}
+            edgePadding={t.spacing.lg}
+            style={styles.calendar}
+          />
+
           <View style={styles.hero}>
             <Text
               variant="caption"
@@ -615,9 +737,33 @@ export default function HomeScreen() {
             >
               {greeting}
             </Text>
-            <Text variant="body" style={{ color: ON_SOFT }}>
-              {formatLongDate(today)}
-            </Text>
+            <View style={styles.dateRow}>
+              <Text variant="body" style={{ color: ON_SOFT }}>
+                {focusDay.isToday || focusDay.isTomorrow
+                  ? `${focusDay.title} \u00B7 ${formatLongDate(focusDate)}`
+                  : formatLongDate(focusDate)}
+              </Text>
+              {!isToday ? (
+                <Pressable
+                  onPress={() => {
+                    Haptics.selectionAsync().catch(() => undefined);
+                    setFocusDate(today);
+                  }}
+                  hitSlop={8}
+                  accessibilityRole="button"
+                  accessibilityLabel="Jump to today"
+                  style={({ pressed }) => [
+                    styles.todayPill,
+                    pressed && { opacity: 0.6 },
+                  ]}
+                >
+                  <Ionicons name="chevron-back" size={12} color={ON} />
+                  <Text variant="micro" weight="bold" style={{ color: ON }}>
+                    Today
+                  </Text>
+                </Pressable>
+              ) : null}
+            </View>
           </View>
 
           <Pressable
@@ -645,21 +791,21 @@ export default function HomeScreen() {
             </GlassSurface>
           </Pressable>
 
-          {otherTodayCount > 0 ? (
+          {otherPlansCount > 0 ? (
             <Pressable
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
-                router.push('/day-plans');
+                router.push({ pathname: '/day-plans', params: { date: focusDate } });
               }}
               accessibilityRole="button"
-              accessibilityLabel={`View all ${todayPlans.length} plans for today`}
+              accessibilityLabel={`View all ${dayPlans.length} plans for ${focusDay.title}`}
               style={({ pressed }) => [
                 styles.otherPlans,
                 pressed && { opacity: 0.6 },
               ]}
             >
               <Text variant="caption" weight="semibold" style={{ color: ON_SOFT }}>
-                {otherTodayCount} other plan{otherTodayCount === 1 ? '' : 's'} today
+                {otherPlansCount} other plan{otherPlansCount === 1 ? '' : 's'}
               </Text>
               <View style={styles.otherPlansCta}>
                 <Text variant="caption" weight="semibold" style={{ color: ON }}>
@@ -670,14 +816,31 @@ export default function HomeScreen() {
             </Pressable>
           ) : null}
 
-          <WeatherCard style={styles.weather} />
+          <DayScheduleCard
+            date={focusDate}
+            today={today}
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              router.push({ pathname: '/day-calendar', params: { date: focusDate } });
+            }}
+            style={styles.schedule}
+          />
 
-          {/* Errands / reminders */}
-          {errands.length > 0 ? (
+          {dayBalanceErrands.length > 0 ? (
+            <DayBalanceCard score={dayScore} style={styles.balance} />
+          ) : null}
+
+          {isToday ? <WeatherCard style={styles.weather} /> : null}
+
+          {/* Errands / reminders — scoped to the focused day */}
+          {hasDayContent ? (
             <View style={styles.errands}>
-              {recurringToday.length > 0 ? (
-                <ErrandSection title="Repeats today" count={recurringToday.length}>
-                  {recurringToday.map((errand, i) => (
+              {recurringDay.length > 0 ? (
+                <ErrandSection
+                  title={isToday ? 'Repeats today' : 'Repeats'}
+                  count={recurringDay.length}
+                >
+                  {recurringDay.map((errand, i) => (
                     <ErrandRow
                       key={errand.id}
                       errand={errand}
@@ -685,27 +848,27 @@ export default function HomeScreen() {
                       onPress={() => onEditErrand(errand)}
                       onToggleDone={() => toggleErrandDone(errand.id)}
                       onOptions={() => openRecurringOptions(errand)}
-                      showSeparator={i < recurringToday.length - 1}
+                      showSeparator={i < recurringDay.length - 1}
                     />
                   ))}
                 </ErrandSection>
               ) : null}
 
-              {errandGroups.scheduled.length > 0 ? (
-                <ErrandSection title="Scheduled" count={errandGroups.scheduled.length}>
-                  {errandGroups.scheduled.map((errand, i) => (
+              {scheduledForDay.length > 0 ? (
+                <ErrandSection title="Scheduled" count={scheduledForDay.length}>
+                  {scheduledForDay.map((errand, i) => (
                     <ErrandRow
                       key={errand.id}
                       errand={errand}
                       onPress={() => onEditErrand(errand)}
                       onToggleDone={() => toggleErrandDone(errand.id)}
-                      showSeparator={i < errandGroups.scheduled.length - 1}
+                      showSeparator={i < scheduledForDay.length - 1}
                     />
                   ))}
                 </ErrandSection>
               ) : null}
 
-              {errandGroups.anytime.length > 0 ? (
+              {showAnytime ? (
                 <ErrandSection title="Anytime" count={errandGroups.anytime.length}>
                   {(showAllAnytime
                     ? errandGroups.anytime
@@ -743,15 +906,15 @@ export default function HomeScreen() {
                 </ErrandSection>
               ) : null}
 
-              {errandGroups.completed.length > 0 ? (
+              {showCompleted ? (
                 <ErrandSection
                   title="Completed"
                   count={errandGroups.completed.length}
                   collapsible
-                  collapsed={!showCompleted}
+                  collapsed={!showCompletedSection}
                   onToggle={() => {
                     Haptics.selectionAsync().catch(() => undefined);
-                    setShowCompleted((v) => !v);
+                    setShowCompletedSection((v) => !v);
                   }}
                 >
                   {errandGroups.completed.map((errand, i) => (
@@ -771,12 +934,16 @@ export default function HomeScreen() {
           ) : (
             <View style={styles.errandsHint}>
               <Ionicons
-                name="checkmark-circle-outline"
+                name={isToday ? 'checkmark-circle-outline' : 'calendar-clear-outline'}
                 size={18}
                 color={t.colors.textTertiary}
               />
               <Text variant="caption" tone="tertiary" style={styles.errandsHintText}>
-                Add a quick smart reminder below — like “call mom” or “dentist at 18:00”.
+                {isToday
+                  ? 'Add a quick smart reminder below — like “call mom” or “dentist at 18:00”.'
+                  : `Nothing planned for ${
+                      focusDay.isTomorrow ? 'tomorrow' : focusDay.weekdayLong
+                    } yet — add a reminder below, or tap + to plan the day.`}
               </Text>
             </View>
           )}
@@ -815,6 +982,7 @@ export default function HomeScreen() {
         parsing={drawerParsing}
         seedKey={drawerSeedKey}
         mode={drawerMode}
+        currentErrandId={editId}
         initialStep={drawerInitialStep}
         discovery={drawerDiscovery}
         fallbackCenter={fallbackCenter}
@@ -924,13 +1092,33 @@ const styles = StyleSheet.create({
   content: {
     flexGrow: 1,
   },
+  calendar: {
+    marginTop: 14,
+  },
   hero: {
-    marginTop: 28,
+    marginTop: 24,
     gap: 8,
   },
   greeting: {
     fontSize: 38,
     lineHeight: 44,
+  },
+  dateRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  todayPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    paddingLeft: 8,
+    paddingRight: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255, 255, 255, 0.16)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255, 255, 255, 0.26)',
   },
   card: {
     marginTop: 28,
@@ -974,6 +1162,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 2,
+  },
+  schedule: {
+    marginTop: 28,
+  },
+  balance: {
+    marginTop: 16,
   },
   weather: {
     marginTop: 28,

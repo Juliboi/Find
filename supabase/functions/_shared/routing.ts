@@ -679,6 +679,138 @@ function itemDuration(item: any): number {
 const MIN_FLEX_MIN = 5;
 
 /**
+ * Whether a PLACE-LESS block happens AT HOME — so the router anchors it to the
+ * home pin instead of leaving it stranded at the previous located venue.
+ *
+ * The errand-first pivot replaced the old explicit `locationStrategy` field
+ * (removed with the place-finder) with the compose brain's `placement:"home"`,
+ * but the router was never re-wired — so every venue-less activity (deep work
+ * at home, a meal at home, language practice, chores, reading) fell through and
+ * the day "stayed" at the last venue (the "deep work / lunch ended up at the
+ * hospital, never brought me home" bug). A venue-less SUBSTANTIVE activity is an
+ * at-home activity; only true connective tissue — a short gap/break, a travel
+ * marker, or the synthetic arrival — stays where it is (so a 20-min breather
+ * between two downtown stops never teleports the user home and back).
+ */
+function placelessHappensAtHome(item: any): boolean {
+  if (!item) return false;
+  if (item.place?.coords) return false; // already located — not a home block
+  // Honour an explicit signal if a producer ever sets one again.
+  if (item.locationStrategy === 'at_home') return true;
+  if (item.arrival === true) return false;
+  const kind = String(item.kind ?? '').toLowerCase();
+  if (kind === 'gap' || kind === 'break' || kind === 'travel') return false;
+  return true;
+}
+
+/**
+ * Scale a set of flexible blocks' durations DOWN so their total fits `available`
+ * minutes, in PROPORTION to each block's length and never below MIN_FLEX_MIN.
+ *
+ * Water-filled: a block that would dip under the floor is pinned AT the floor and
+ * the leftover deficit is re-spread across the rest, so the floor never silently
+ * eats more than its share. Mutates `adj[k]` in place for every k in `idxs`.
+ *
+ * This is the "take a little off everything" rule that replaces the old greedy
+ * "gut the first block to nothing" behaviour.
+ */
+function proportionalShrink(adj: number[], idxs: number[], available: number): void {
+  if (idxs.length === 0) return;
+  const floor = MIN_FLEX_MIN;
+  // Can't beat the sum of floors — below that the day is genuinely over-booked
+  // and the downstream pin will simply slip (handled by the forward clamp).
+  const target = Math.max(available, idxs.length * floor);
+  const pinned = new Set<number>();
+  // At most one block crosses the floor per pass, so idxs.length passes suffice.
+  for (let guard = 0; guard <= idxs.length; guard++) {
+    let freeSum = 0;
+    let pinnedSum = 0;
+    for (const k of idxs) {
+      if (pinned.has(k)) pinnedSum += adj[k];
+      else freeSum += adj[k];
+    }
+    const budget = target - pinnedSum;
+    if (freeSum <= budget || freeSum <= 0) break;
+    const scale = budget / freeSum;
+    let newlyPinned = false;
+    for (const k of idxs) {
+      if (pinned.has(k)) continue;
+      if (adj[k] * scale <= floor) {
+        adj[k] = floor;
+        pinned.add(k);
+        newlyPinned = true;
+      }
+    }
+    if (!newlyPinned) {
+      for (const k of idxs) if (!pinned.has(k)) adj[k] = adj[k] * scale;
+      break;
+    }
+  }
+  for (const k of idxs) adj[k] = Math.max(floor, Math.round(adj[k]));
+}
+
+/**
+ * Pre-compute each item's duration AFTER fairly shrinking over-booked stretches.
+ *
+ * Walks the ordered day as segments delimited by hard anchors (fixed starts /
+ * window starts). Whenever a RUN of flexible blocks can't fit before its next
+ * anchor, the whole run is shrunk PROPORTIONALLY ({@link proportionalShrink}) so
+ * every plan in that stretch gives up a little — instead of the forward cascade's
+ * old behaviour of collapsing the earliest one or two to a 5-minute sliver while
+ * later blocks kept their full length. Anchors, 0-min arrivals, and runs that
+ * already fit are returned unchanged.
+ *
+ * NOTE: this can only rebalance time WITHIN a stretch between two pins — it can't
+ * borrow a later free-time gap to feed the morning, because fixed appointments
+ * wall the two apart and the day's order is fixed here (that's the planner
+ * brain's job, not the clock's).
+ */
+function fairGroupDurations(
+  items: any[],
+  leadIn: (idx: number) => number,
+  anchorTimeOf: (it: any) => number | null,
+  durOf: (it: any) => number,
+  startMin: number,
+): number[] {
+  const n = items.length;
+  const adj = items.map((it) => durOf(it));
+  let cursor = startMin;
+  let i = 0;
+  while (i < n) {
+    const pin = anchorTimeOf(items[i]);
+    if (pin != null) {
+      // An anchor: the clock jumps to its pinned start (if we're early), then
+      // spends its duration. Its own overflow (if any) is the NEXT run's problem.
+      cursor = Math.max(cursor + leadIn(i), pin) + adj[i];
+      i++;
+      continue;
+    }
+    // A maximal run of flexible blocks [i, j); j is the next anchor (or end).
+    let j = i;
+    while (j < n && anchorTimeOf(items[j]) == null) j++;
+    if (j < n) {
+      const deadline = anchorTimeOf(items[j]) as number;
+      // Time the run may occupy = deadline − run-start − every lead-in within it
+      // (including the lead INTO the closing anchor), leaving only block duration.
+      let leads = 0;
+      for (let k = i; k <= j; k++) leads += leadIn(k);
+      const available = deadline - cursor - leads;
+      const idxs: number[] = [];
+      let total = 0;
+      for (let k = i; k < j; k++) {
+        if (items[k]?.arrival === true) continue; // 0-min connectors don't shrink
+        idxs.push(k);
+        total += adj[k];
+      }
+      if (total > available && total > 0) proportionalShrink(adj, idxs, available);
+    }
+    for (let k = i; k < j; k++) cursor += leadIn(k) + adj[k];
+    i = j;
+  }
+  return adj;
+}
+
+/**
  * THE day-scheduling algorithm, shared by the provisional pre-route clock and
  * the final post-route cascade so the two ALWAYS agree on every start time.
  *
@@ -727,6 +859,13 @@ function scheduleDay(
     return travel + gap;
   };
 
+  // 0) Fairly shrink any over-booked stretch FIRST, so a tight run trims a
+  //    little off every block instead of gutting the earliest ones. Both passes
+  //    below read these adjusted durations, keeping the clock self-consistent.
+  const seedStartMin =
+    parseHHMM(items[0]?.startTime) ?? (fallbackStartMin != null ? fallbackStartMin : 8 * 60);
+  const adjDur = fairGroupDurations(items, leadIn, anchorTimeOf, durOf, seedStartMin);
+
   // 1) Backward: the latest start each item may take without slipping a
   //    downstream pin (reserving the lead-in that precedes that pin).
   const latestStart: (number | null)[] = new Array(n).fill(null);
@@ -736,7 +875,7 @@ function scheduleDay(
     let ls: number | null;
     if (pin != null) ls = pin;
     else if (nextLS == null) ls = null;
-    else ls = nextLS - leadIn(i + 1) - durOf(items[i]);
+    else ls = nextLS - leadIn(i + 1) - adjDur[i];
     latestStart[i] = ls;
     nextLS = ls != null ? ls : nextLS;
   }
@@ -758,13 +897,16 @@ function scheduleDay(
       if (ws != null && ws > start) start = ws;
     }
     const isArrival = it?.arrival === true;
-    let dur = isArrival ? 0 : itemDuration(it);
+    let dur = isArrival ? 0 : adjDur[i];
     if (
       !isArrival &&
       (it?.flexibility === 'flexible' || it?.flexibility === 'window') &&
       i + 1 < n &&
       latestStart[i + 1] != null
     ) {
+      // Safety net for any residual (rounding, a window block's own overflow, an
+      // over-booked stretch past the floor): the proportional pass already did
+      // the fair trimming, so this rarely fires now.
       const maxEnd = (latestStart[i + 1] as number) - leadIn(i + 1);
       if (maxEnd - start < dur) dur = Math.max(MIN_FLEX_MIN, maxEnd - start);
     }
@@ -809,16 +951,34 @@ export function flattenItems(parsed: any): any[] {
 }
 
 /**
- * Safety net: the model is told never to emit "travel" items (the app draws
- * all travel as connectors), but it sometimes still does. Drop any travel
- * items (and now-empty sections) so the journey is rendered as the routed,
- * step-by-step leg between the real places instead.
+ * A PLACE-LESS block whose title is an unmistakable commute the router will draw
+ * itself ("Commute home", "Travel to the office", "Head back"). Strict on
+ * purpose so it never eats a genuine at-home activity ("Head to bed", "Walk to
+ * clear my head" don't match) or a located stop (those carry coords).
+ */
+const TRAVEL_TITLE_RE =
+  /\bcommut\w*\b|\ben route\b|\bin transit\b|\bhomeward\b|\bback home\b|^\s*(?:travel|transit|drive|driving)\b|\b(?:head(?:ing)?|walk(?:ing)?|driv(?:e|ing)|cycl(?:e|ing)|bik(?:e|ing)|go(?:ing)?|return(?:ing)?|travel(?:l?ing)?|mak(?:e|ing)\s+(?:my|your|the)\s+way)\s+(?:home|back)\b/i;
+
+/**
+ * Safety net: the model is told never to emit travel items (the app draws all
+ * travel as connectors), but it sometimes still does — either as kind:"travel"
+ * or, sneakier, as a normal-looking block titled "Commute home". Drop both (and
+ * now-empty sections) so the journey is rendered ONLY as the routed leg, never
+ * double-planned next to it.
  */
 function stripAiTravelItems(parsed: any): void {
   if (!parsed || !Array.isArray(parsed.sections)) return;
+  const isAiTravel = (it: any): boolean => {
+    if (!it) return false;
+    if (it.kind === 'travel') return true;
+    // Located stops carry coords and are never travel; only a place-less block
+    // with a clear commute title is.
+    if (it.place?.coords) return false;
+    return typeof it.title === 'string' && TRAVEL_TITLE_RE.test(it.title);
+  };
   for (const s of parsed.sections) {
     if (s && Array.isArray(s.items)) {
-      s.items = s.items.filter((it: any) => it?.kind !== 'travel');
+      s.items = s.items.filter((it: any) => !isAiTravel(it));
     }
   }
   parsed.sections = parsed.sections.filter(
@@ -930,7 +1090,38 @@ function anchorSleepToBedtime(parsed: any, bedMin: number | null): void {
   // must not be dragged to bedtime.
   const last = items[items.length - 1];
   const title = String(last?.title ?? '').toLowerCase();
-  if (!/\bsleep\b|lights out|go to bed|bedtime/.test(title)) return;
+  const isSleepBlock = /\bsleep\b|lights out|go to bed|bedtime/.test(title);
+
+  if (!isSleepBlock) {
+    // The brain dropped the closing Sleep block entirely — the day trails off
+    // and "the wind-down and sleep are ignored, the evening is just empty
+    // waiting" bug. Synthesize a fixed Sleep anchor so the day has a hard end;
+    // fillIdleGaps then turns the run-up to it into visible wind-down free time.
+    const lastEnd = parseHHMM(last?.endTime) ?? parseHHMM(last?.startTime);
+    // Skip if the day ends so far before bedtime (>5h) that a cap would only
+    // create an absurd evening void — that's an incomplete day, not a missing
+    // sleep block.
+    if (lastEnd != null && lastEnd < bedMin - 300) return;
+    const at = lastEnd != null ? Math.max(bedMin, lastEnd) : bedMin;
+    const lastSection = parsed.sections[parsed.sections.length - 1];
+    if (!lastSection || !Array.isArray(lastSection.items)) return;
+    lastSection.items.push({
+      id: `sleep-${at}`,
+      title: 'Sleep',
+      kind: 'break',
+      flexibility: 'fixed',
+      startTime: fmtHHMM(at),
+      endTime: null,
+      durationMinutes: null,
+      place: null,
+      travelFromPrev: null,
+      gapBeforeMin: null,
+      description: null,
+      arrival: false,
+    });
+    return;
+  }
+
   const start = parseHHMM(last?.startTime);
   if (start == null || start >= bedMin) return;
 
@@ -1001,6 +1192,97 @@ async function computeLeg(
 }
 
 /**
+ * Reorder the day so FIXED/WINDOW anchors sit in chronological order, with the
+ * flexible blocks between them kept in their relative order.
+ *
+ * The clock cascade snaps a fixed pin only when the running cursor hasn't
+ * already passed it (it's forward-only), so a fixed item the brain emitted OUT
+ * of order — e.g. a 10:00 appointment listed at the END of the day — gets placed
+ * at the late cursor and its real time is "ignored" (the "Doctor's appointment
+ * at 22:41" bug). A stable sort that slots each pin at its own minute, with each
+ * unpinned block inheriting the NEXT pin (so it stays just before its anchor),
+ * fixes the chronology. It runs BEFORE routing so travel is computed between the
+ * corrected neighbours, and it is a strict NO-OP when the pins are already in
+ * order, so a good plan is never reshuffled.
+ */
+function reorderChronologically(parsed: any): void {
+  if (!parsed || !Array.isArray(parsed.sections)) return;
+  const tagged: { item: any; id: any; section: string; period: any; idx: number }[] = [];
+  let idx = 0;
+  for (const s of parsed.sections) {
+    if (!s || !Array.isArray(s.items)) continue;
+    for (const it of s.items) {
+      tagged.push({
+        item: it,
+        id: s.id,
+        section: String(s.title ?? 'Your day'),
+        period: s.period ?? null,
+        idx: idx++,
+      });
+    }
+  }
+  if (tagged.length < 2) return;
+
+  // A hard anchor minute: a fixed start, or a window's earliest start.
+  const hardOf = (it: any): number | null =>
+    it?.flexibility === 'fixed'
+      ? parseHHMM(it?.startTime)
+      : it?.flexibility === 'window'
+        ? parseHHMM(it?.windowStart)
+        : null;
+
+  // Already chronological (every pin >= the previous pin)? Then do nothing —
+  // never reshuffle a day the brain already ordered correctly.
+  let lastHard = -Infinity;
+  let outOfOrder = false;
+  for (const t of tagged) {
+    const h = hardOf(t.item);
+    if (h == null) continue;
+    if (h < lastHard) {
+      outOfOrder = true;
+      break;
+    }
+    lastHard = h;
+  }
+  if (!outOfOrder) return;
+
+  // Backward-fill each item's sort key: a pinned item uses its own minute; an
+  // unpinned one inherits the NEXT pin (stays just before its anchor). Items
+  // after the last pin get +Infinity and trail the day in their original order.
+  const keys: number[] = new Array(tagged.length);
+  let ceil = Number.POSITIVE_INFINITY;
+  for (let i = tagged.length - 1; i >= 0; i--) {
+    const h = hardOf(tagged[i].item);
+    if (h != null) ceil = h;
+    keys[i] = ceil;
+  }
+
+  const order = tagged
+    .map((t, i) => ({ t, key: keys[i] }))
+    // Guard the all-Infinity case (Inf - Inf = NaN ⇒ unstable sort): equal keys
+    // (incl. two trailing +Inf items) fall back to original order.
+    .sort((a, b) => (a.key !== b.key ? a.key - b.key : a.t.idx - b.t.idx));
+
+  // Regroup consecutive items that share a section label (mirrors the
+  // assembler), so section headers travel with their items. Preserve the
+  // original section id, de-duplicating when a section splits in two.
+  const rebuilt: any[] = [];
+  const usedIds = new Set<string>();
+  for (const { t } of order) {
+    const last = rebuilt[rebuilt.length - 1];
+    if (last && last.title === t.section) {
+      last.items.push(t.item);
+      continue;
+    }
+    let id = t.id != null ? String(t.id) : `section-${rebuilt.length}`;
+    if (usedIds.has(id)) id = `${id}-${rebuilt.length}`;
+    usedIds.add(id);
+    rebuilt.push({ id, title: t.section, period: t.period, items: [t.item] });
+  }
+  parsed.sections = rebuilt;
+}
+
+/**
  * Attaches a real travel leg (with transit steps) to every located stop —
  * from the previous stop, or from HOME for the first one so the day can
  * never "teleport" into another city. Adds a routed trip back home when the
@@ -1028,6 +1310,11 @@ export async function routeAndSchedule(
   // them fresh against the new clock (idempotent across repeated recomputes).
   stripSyntheticGaps(parsed);
 
+  // Put mis-ordered fixed/window anchors back into chronological order BEFORE
+  // routing, so travel is computed between the corrected neighbours and the
+  // forward cascade can actually honour each pin (no-op for an ordered day).
+  reorderChronologically(parsed);
+
   // 1) Travel legs (needs a Google key to route with). Each hop's endpoints
   //    are already known (from the place coords), so the hops don't depend on
   //    each other — we route them ALL IN PARALLEL.
@@ -1041,7 +1328,10 @@ export async function routeAndSchedule(
     for (const item of flattenItems(parsed)) {
       const placeCoords: Coords | undefined = item?.place?.coords;
       if (placeCoords) seq.push({ item, coords: placeCoords, isHome: false });
-      else if (homeCoords && item?.locationStrategy === 'at_home')
+      // A venue-less at-home activity is anchored to the home pin so the day
+      // routes back home for it (and the cascade reserves that commute) instead
+      // of leaving the user stranded at the previous venue.
+      else if (homeCoords && placelessHappensAtHome(item))
         seq.push({ item, coords: homeCoords, isHome: true });
     }
 

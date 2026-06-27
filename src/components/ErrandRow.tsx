@@ -12,7 +12,7 @@ import * as Haptics from 'expo-haptics';
 import { useTheme } from '@/theme/useTheme';
 import { Text } from './Text';
 import type { Errand, ErrandStatus } from '@/store/useErrandsStore';
-import { formatTime, formatDuration } from '@/utils/time';
+import { formatTime, formatDuration, errandTimeMode } from '@/utils/time';
 import { describeDay } from '@/utils/days';
 
 interface Props {
@@ -73,7 +73,15 @@ interface Props {
 function metaParts(errand: Errand): string[] {
   const parts: string[] = [];
   if (errand.date) parts.push(describeDay(errand.date).title);
-  if (errand.startTime) {
+  const mode = errandTimeMode(errand.startTime, errand.endTime, errand.durationMin);
+  if (mode === 'between' && errand.startTime && errand.endTime) {
+    // An availability window — read it as "open between X–Y" plus the length so
+    // it's clear the errand floats inside the range rather than filling it.
+    const dur = errand.durationMin ? ` · ~${formatDuration(errand.durationMin)}` : '';
+    parts.push(
+      `${formatTime(errand.startTime)}–${formatTime(errand.endTime)}${dur}`,
+    );
+  } else if (errand.startTime) {
     parts.push(
       errand.endTime
         ? `${formatTime(errand.startTime)} – ${formatTime(errand.endTime)}`
@@ -85,7 +93,6 @@ function metaParts(errand: Errand): string[] {
     parts.push(`~${formatDuration(errand.durationMin)}`);
   }
   if (errand.address) parts.push(errand.address);
-  else if (errand.autoPlace) parts.push('Diem picks the spot');
   if (parts.length === 0) parts.push('Anytime');
   return parts;
 }
@@ -124,9 +131,6 @@ export function ErrandRow({
   // A resolved place (picked from search) carries coords — flag it so the user
   // can see at a glance which errands are pinned / planner-ready.
   const located = errand.latitude != null && errand.longitude != null;
-  // Auto-place errands have no pin yet — flag them so the user can tell at a
-  // glance the planner will choose the venue.
-  const autoPlace = !located && !!errand.autoPlace;
   const rating = typeof errand.rating === 'number' ? errand.rating : null;
   const photo = !dim && errand.photoUrl ? errand.photoUrl : null;
 
@@ -285,9 +289,6 @@ export function ErrandRow({
       <View style={styles.trailing}>
         {located && !photo && !dim && !completed ? (
           <Ionicons name="location" size={13} color={t.colors.accentText} />
-        ) : null}
-        {autoPlace && !photo && !dim && !completed ? (
-          <Ionicons name="sparkles" size={12} color={t.colors.accentText} />
         ) : null}
         {repeats && !dim && !completed ? (
           <Ionicons name="repeat" size={14} color={t.colors.textTertiary} />

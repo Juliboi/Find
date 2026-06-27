@@ -338,6 +338,51 @@ function resolveCategory(q: string): CategoryMap | null {
   return null;
 }
 
+// ----------------------------------------------------- localized vocabulary
+//
+// Google Text Search keys off the EXACT category word, and the right word is
+// locale-specific. In Czech the English "drugstore"/"household goods" resolves
+// to *lékárna* (a medicine PHARMACY), NOT *drogerie* (dm / Teta / Rossmann) —
+// the shops that actually stock cleaning products (Domestos) + toiletries. A
+// bare "drugstore" search therefore returns far pharmacies and misses the
+// drogerie next door. Rewrite such queries to the variants that surface the
+// right shops; the fan-out + proximity ranking then picks the closest. Mirror
+// of the client `expandPlaceQuery` (src/lib/placeQueryExpand.ts) — keep in sync.
+
+const DROGERIE_RE =
+  /\b(drugstore|drogerie|household\s*(?:goods|cleaning|supplies)?|cleaning\s*(?:supplies|products|stuff)|toiletr(?:y|ies)|cosmetics?)\b/i;
+const HOUSEHOLD_PRODUCT_RE =
+  /\b(domestos|savo|bleach|detergent|washing\s*(?:powder|liquid|tablets|gel)|fabric\s*softener|laundry\s*(?:detergent|gel|pods|powder)|dish(?:washer)?\s*(?:soap|tablets|gel|liquid)|toilet\s*paper|paper\s*towels|shampoo|toothpaste|deodorant|sponges?)\b/i;
+const DROGERIE_VARIANTS = [
+  'drogerie',
+  'dm drogerie',
+  'Teta drogerie',
+  'Rossmann drogerie',
+  'supermarket',
+];
+
+/** Expand each query into locale-aware variants (household/drugstore →
+ *  drogerie), then dedupe (case-insensitive) and cap at 6. */
+function expandLocalizedQueries(queries: string[]): string[] {
+  const out: string[] = [];
+  for (const q of queries) {
+    if (DROGERIE_RE.test(q) || HOUSEHOLD_PRODUCT_RE.test(q)) {
+      out.push(...DROGERIE_VARIANTS);
+    } else {
+      out.push(q);
+    }
+  }
+  const seen = new Set<string>();
+  const res: string[] = [];
+  for (const q of out) {
+    const k = q.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    res.push(q);
+  }
+  return res.slice(0, 6);
+}
+
 // ------------------------------------------------------------- Google Places
 //
 // We use the Text Search endpoint (`places:searchText`) rather than
@@ -951,10 +996,13 @@ function scrubReasoning(s: string | undefined): string | undefined {
   return out;
 }
 
-/** Heuristic: does the intent describe a routine, walk-to-it venue? */
+/** Heuristic: does the intent describe a routine, walk-to-it venue? Includes
+ *  everyday SHOPS (drugstore/drogerie, supermarket, convenience, chemist) — a
+ *  Domestos/toiletries run is a quick local errand, not a destination you'd
+ *  travel 3 km for, so it must get the strict ≤1.5 km proximity rule below. */
 function isEverydayIntent(intent: string, queries: string[]): boolean {
   const haystack = [intent, ...queries].join(' ').toLowerCase();
-  return /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|café|coffee|bar|pub|bistro|grocery|pharmacy|bakery|eat|drink|takeout|takeaway)\b/.test(
+  return /\b(restaurant|food|dinner|lunch|brunch|breakfast|cafe|café|coffee|bar|pub|bistro|grocery|grocer|supermarket|hypermarket|convenience|pharmacy|drugstore|drogerie|chemist|toiletr\w*|household|bakery|eat|drink|takeout|takeaway)\b/.test(
     haystack,
   );
 }
@@ -1553,6 +1601,11 @@ Deno.serve(async (req: Request) => {
     queries[0] ||
     '';
 
+  // Locale-aware rewrite of the queries actually sent to the provider
+  // (household/drugstore → drogerie). `queries` (the original words) is kept for
+  // intent, category detection, and the response so the UI/debug stay truthful.
+  const searchQueries = expandLocalizedQueries(queries);
+
   const lat = Number(payload.latitude);
   const lon = Number(payload.longitude);
   if (
@@ -1659,7 +1712,7 @@ Deno.serve(async (req: Request) => {
     };
     if (googleKey) {
       result = await searchGoogle(
-        queries,
+        searchQueries,
         intent,
         lat,
         lon,

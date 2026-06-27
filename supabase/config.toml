@@ -6,6 +6,9 @@ verify_jwt = false
 [functions.find-places]
 verify_jwt = false
 
+[functions.discover-curate]
+verify_jwt = false
+
 [functions.search-places]
 verify_jwt = false
 
@@ -34,4 +37,13 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.weather]
+verify_jwt = false
+
+[functions.order-day]
+verify_jwt = false
+
+[functions.fill-day]
+verify_jwt = false
+
+[functions.plan-day-v4]
 verify_jwt = false

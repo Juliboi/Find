@@ -60,9 +60,8 @@ export type PlanFixedStop = PlanAnchor;
 
 /**
  * A TASK — an errand the user wants in the day that is NOT yet located (a call,
- * "deep work", a workout with no venue picked). The planner schedules it and
- * decides whether it needs a venue: set {@link wantsVenue} when the client KNOWS
- * it does (e.g. an unresolved auto-place errand).
+ * "deep work" at home). The planner schedules it; remote/at-home tasks never get
+ * a venue. Diem no longer searches venues, so a task is only ever place-less.
  */
 export interface PlanTask {
   title: string;
@@ -70,12 +69,9 @@ export interface PlanTask {
   endTime?: string;
   durationMin?: number;
   notes?: string;
-  wantsVenue?: boolean;
-  /** Hint for the kind of place to find ("quiet café", "gym"). */
-  placeQuery?: string;
   /** This commitment happens at home / online (a video call, telehealth, remote
    * work) — it has NO physical venue. The planner must schedule it at home and
-   * never invent or search a place for it. Outranks {@link wantsVenue}. */
+   * never invent or search a place for it. */
   atHome?: boolean;
 }
 

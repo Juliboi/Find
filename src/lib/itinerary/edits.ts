@@ -572,7 +572,7 @@ export function fitGapsToAnchors(itin: Itinerary): CascadeResult {
  * block it appended (the synthetic "Back home") — but NOT for TIMING. Its
  * internal clock cascade slides fixed anchors to whatever time the day happens
  * to reach and can shrink durations to force a fit, which would erase exactly
- * the "this no longer fits" signal the escalation relies on.
+ * the "this no longer fits" signal the conflict banner relies on.
  *
  * So we keep the server's structure + fresh legs, but restore the client's
  * timing-authority fields (flexibility, the fixed/window anchors, planned
@@ -888,8 +888,8 @@ export function reorderItems(itin: Itinerary, orderedIds: string[]): CascadeResu
 
 /**
  * What committing a sequence change will cost, mirroring the real edit pipeline
- * (optimistic cascade → backend re-route → fixed-anchor escalation). Lets the
- * reorder UI tell the user, BEFORE they drop, whether a move is safe.
+ * (optimistic cascade → backend re-route → fixed-anchor conflict surfaced). Lets
+ * the reorder UI tell the user, BEFORE they drop, whether a move is safe.
  *
  *   - 'free'    : the order of DISTINCT venues is unchanged, so no commute can
  *                 change — times just reflow locally, no backend call.

@@ -19,13 +19,15 @@
  */
 
 import {
+  curateDiscoveryPlaces,
   findPlaces,
   getCurrentCoords,
   type Coords,
   type NearbyPlace,
   type PlacesProvider,
 } from '@/lib/places';
-import { autocompletePlaces, resolvePlace } from '@/lib/geocoding';
+import { autocompletePlaces, resolvePlace, reverseGeocodeCity } from '@/lib/geocoding';
+import { expandPlaceQuery } from '@/lib/placeQueryExpand';
 import type { LlmTokenUsage } from '@/lib/usage';
 
 /**
@@ -51,8 +53,24 @@ export interface DiscoverParams {
   nearby?: boolean;
   /** Center to use when not `nearby` and no `area` — typically the user's home. */
   fallbackCenter?: Coords | null;
+  /**
+   * An explicit, already-resolved search center — e.g. one of the day's errand
+   * locations the user anchored on ("find coffee near the dentist"). When set it
+   * short-circuits center resolution: we search tightly around this point and
+   * ignore `area` / `nearby`.
+   */
+  center?: Coords | null;
+  /** Human label for an explicit {@link center} ("Dentist"), for the UI + curation. */
+  centerLabel?: string | null;
   /** Override the search radius (meters). Defaults depend on the search kind. */
   radiusM?: number;
+  /**
+   * Force (true) or forbid (false) the curated, knowledge-backed discovery path
+   * (the `discover-curate` Gemini+web route). Omitted → auto-detected from the
+   * phrasing via {@link isSmartDiscovery}. Lets the parser/sandbox override the
+   * heuristic when it knows better.
+   */
+  smart?: boolean;
 }
 
 export interface DiscoverResult {
@@ -68,6 +86,12 @@ export interface DiscoverResult {
   /** The actual query variants sent to the provider. */
   queries: string[];
   provider: PlacesProvider;
+  /**
+   * True when these came from the curated, knowledge-backed path
+   * (`discover-curate`: a web-grounded model named the venues) rather than the
+   * plain category Text Search. Lets the UI label them as hand-picked.
+   */
+  curated?: boolean;
   reason?: 'no_supabase' | 'no_location' | 'no_results' | 'error';
   detail?: string;
   /** Token spend the venue re-rank reported for this call; null when none ran. */
@@ -283,8 +307,16 @@ async function resolveCenter(input: {
   area: string | null;
   nearby: boolean;
   fallbackCenter: Coords | null;
+  center?: Coords | null;
+  centerLabel?: string | null;
 }): Promise<ResolvedCenter> {
-  const { area, nearby, fallbackCenter } = input;
+  const { area, nearby, fallbackCenter, center, centerLabel } = input;
+
+  // An explicit, caller-resolved center (a day errand the user anchored on) wins
+  // over everything — it's a deliberate "search around HERE" the user tapped.
+  if (center) {
+    return { center, label: centerLabel ?? null, source: 'place' };
+  }
 
   if (nearby) {
     const gps = await getCurrentCoords();
@@ -336,6 +368,64 @@ function defaultRadiusM(params: DiscoverParams): number {
   return 5000;
 }
 
+// ----------------------------------------------------------- curated discovery
+//
+// Some discovery requests can't be answered by a literal Text Search of the
+// words — they need WORLD KNOWLEDGE or a curated opinion: superlatives ("best",
+// "most popular"), distinctions ("michelin", "rooftop"), subjective qualities
+// ("interesting", "romantic"), or an occasion with no category at all ("where to
+// take my gf for our anniversary"). For those we route through `discover-curate`
+// (a Google Search–grounded model that names the real venues, then grounds each
+// into a card). Everyday category lookups ("pharmacy near me", "max fitness near
+// Krakov") skip it — they're already well served by the plain path, and curation
+// would only add cost and latency.
+
+// Curation cues: superlatives, awards/distinctions, and subjective qualities that
+// imply "pick the good ones", not "list the nearest ones".
+const CURATION_RE =
+  /\b(?:best|top|finest|greatest|nicest|coolest|hottest|trendiest|most\s+\w+|popular|famous|renowned|acclaimed|iconic|legendary|award[\s-]*winning|michelin|fine\s+dining|gourmet|hidden\s+gems?|underrated|must[\s-]*(?:try|visit|see|eat|go)|unique|interesting|special|charming|authentic|romantic|fancy|upscale|high[\s-]*end|luxur(?:y|ious)|scenic|rooftop|with\s+a\s+view|instagram\w*|aesthetic|vibe[sy]?)\b/i;
+
+// Occasion cues: a celebration/intent with no explicit category to search for.
+const OCCASION_RE =
+  /\b(?:anniversary|date\s*night|first\s+date|propose|proposal|honeymoon|birthday|celebrat(?:e|ion|ing)|special\s+occasion|impress)\b/i;
+
+// Open-intent phrasing: "where to take …", "somewhere romantic", "ideas for …".
+const OPEN_INTENT_RE =
+  /\b(?:where\s+(?:to|can\s+i|should\s+i)\s+(?:take|go|eat|drink|bring|have)|what\s+to\s+do|things\s+to\s+do|somewhere\s+(?:to|nice|special|romantic|fun|cool)|ideas?\s+for|suggestions?\s+for)\b/i;
+
+/**
+ * True when a discovery request reads as knowledge/curation-heavy and should go
+ * through the web-grounded `discover-curate` path rather than a plain category
+ * search. Tested against the "what" plus any named area so "interesting" in
+ * "interesting restaurants" and "anniversary" in a bare occasion line both
+ * trigger. Conservative by design: ordinary category lookups never match.
+ */
+export function isSmartDiscovery(query: string, area?: string | null): boolean {
+  const text = `${query ?? ''} ${area ?? ''}`.trim();
+  if (text.length < 3) return false;
+  return CURATION_RE.test(text) || OCCASION_RE.test(text) || OPEN_INTENT_RE.test(text);
+}
+
+/**
+ * Builds the natural-language phrase handed to the curation concierge from the
+ * split (what / where) shape, so "interesting restaurants" + "Prague" reads as
+ * "interesting restaurants in Prague" and the model anchors on the right city.
+ */
+function curatePhrase(
+  query: string,
+  area: string | null,
+  nearby: boolean,
+  nearLabel: string | null,
+): string {
+  const q = query.trim();
+  if (area && area.trim()) return `${q} in ${area.trim()}`;
+  if (nearLabel && nearLabel.trim() && !/current location|^home$/i.test(nearLabel.trim())) {
+    return `${q} in ${nearLabel.trim()}`;
+  }
+  if (nearby) return `${q} near me`;
+  return q;
+}
+
 /**
  * Resolves the search center from the phrasing, then fetches ranked candidates
  * (with "what to expect" blurbs) via `find-places`. Never throws — failures
@@ -349,12 +439,20 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
     area: params.area ?? null,
     nearby: !!params.nearby,
     fallbackCenter,
+    center: params.center ?? null,
+    centerLabel: params.centerLabel ?? null,
   });
 
-  const variants =
+  // Expand the "what" into locale-aware variants so a household/drugstore need
+  // ("buy domestos", "drugstore") actually searches *drogerie* (dm / Teta /
+  // Rossmann) — Google maps the bare English "drugstore" to medicine pharmacies
+  // (lékárna) and misses the drogerie next door. Ordinary queries pass through
+  // unchanged. Explicit orchestrator variants are each expanded then merged.
+  const baseVariants =
     params.queries && params.queries.length > 0
-      ? dedupe(params.queries.map((q) => q.trim()).filter(Boolean))
+      ? params.queries.map((q) => q.trim()).filter(Boolean)
       : [baseQuery];
+  const variants = dedupe(baseVariants.flatMap((q) => expandPlaceQuery(q)));
   // When the area couldn't be pinned to a coordinate, fold its name into each
   // query so the provider still searches the right neighbourhood.
   const queries = resolved.areaInQuery
@@ -373,6 +471,48 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
       reason: 'no_location',
       detail: "Couldn't decide where to search — set a home address or enable location.",
     };
+  }
+
+  // Knowledge/curation-heavy requests go through the web-grounded concierge
+  // first. On any miss (not configured, model error, nothing grounded) we fall
+  // straight through to the plain category search below — curated discovery is
+  // strictly an upgrade, never a dead end.
+  const smart = params.smart ?? isSmartDiscovery(baseQuery, params.area ?? null);
+  if (smart) {
+    // Anchor on a real city name. A named area already is one; otherwise turn the
+    // bare GPS/home center into a locality ("Current location" tells the model
+    // nothing) so its picks and grounding land in the right place.
+    let nearLabel = resolved.label;
+    const hasArea = !!(params.area && params.area.trim());
+    if (!hasArea && (resolved.source === 'gps' || resolved.source === 'home')) {
+      const city = await reverseGeocodeCity(
+        resolved.center.latitude,
+        resolved.center.longitude,
+      ).catch(() => null);
+      if (city) nearLabel = city;
+    }
+    const phrase = curatePhrase(baseQuery, params.area ?? null, !!params.nearby, nearLabel);
+    const curated = await curateDiscoveryPlaces({
+      query: phrase,
+      area: params.area ?? null,
+      nearLabel,
+      center: resolved.center,
+      radiusM: params.radiusM,
+    });
+    if (curated.places.length > 0) {
+      return {
+        places: curated.places,
+        center: resolved.center,
+        centerLabel: resolved.label,
+        centerSource: resolved.source,
+        query: baseQuery,
+        queries,
+        provider: curated.provider,
+        curated: true,
+        usage: curated.usage ?? null,
+        debug: curated.debug,
+      };
+    }
   }
 
   // A specific venue/landmark anchor ("near Hilton Prague") searches TIGHTLY

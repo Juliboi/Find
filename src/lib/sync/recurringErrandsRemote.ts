@@ -8,6 +8,7 @@
  */
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import type { RecurringErrand } from '@/store/useRecurringErrandsStore';
+import type { TravelPref } from '@/store/useErrandsStore';
 
 const TABLE = 'recurring_errands';
 
@@ -17,13 +18,13 @@ interface RecurringErrandRow {
   title: string;
   weekdays: number[] | null;
   start_time: string | null;
+  end_time: string | null;
   duration_min: number | null;
   address: string | null;
   latitude: number | null;
   longitude: number | null;
   place_id: string | null;
-  auto_place: boolean | null;
-  place_query: string | null;
+  travel_mode: string | null;
   notes: string | null;
   skipped_dates: string[] | null;
   created_at: string;
@@ -36,13 +37,16 @@ function rowToRecurring(r: RecurringErrandRow): RecurringErrand {
     title: r.title,
     weekdays: Array.isArray(r.weekdays) ? r.weekdays : [],
     startTime: r.start_time ?? undefined,
+    endTime: r.end_time ?? undefined,
     durationMin: r.duration_min ?? undefined,
     address: r.address ?? undefined,
     latitude: r.latitude ?? undefined,
     longitude: r.longitude ?? undefined,
     placeId: r.place_id ?? undefined,
-    autoPlace: r.auto_place ?? undefined,
-    placeQuery: r.place_query ?? undefined,
+    travelMode:
+      r.travel_mode === 'commute' || r.travel_mode === 'car'
+        ? (r.travel_mode as TravelPref)
+        : undefined,
     notes: r.notes ?? undefined,
     skippedDates: Array.isArray(r.skipped_dates) ? r.skipped_dates : [],
     createdAt: r.created_at ? Date.parse(r.created_at) : Date.now(),
@@ -57,13 +61,13 @@ function recurringToRow(e: RecurringErrand, userId: string): RecurringErrandRow 
     title: e.title,
     weekdays: e.weekdays ?? [],
     start_time: e.startTime ?? null,
+    end_time: e.endTime ?? null,
     duration_min: e.durationMin ?? null,
     address: e.address ?? null,
     latitude: e.latitude ?? null,
     longitude: e.longitude ?? null,
     place_id: e.placeId ?? null,
-    auto_place: e.autoPlace ?? null,
-    place_query: e.placeQuery ?? null,
+    travel_mode: e.travelMode ?? null,
     notes: e.notes ?? null,
     skipped_dates: e.skippedDates ?? [],
     created_at: new Date(e.createdAt).toISOString(),
@@ -88,15 +92,41 @@ export async function pullRecurringErrands(
   return (data as RecurringErrandRow[]).map(rowToRecurring);
 }
 
+/**
+ * Upsert recurring rows, tolerating a server that predates the `travel_mode`
+ * column (migration 0013): on a missing-column rejection, strip it and retry
+ * ONCE so the rest of the row still syncs. Fire-and-forget; never throws.
+ */
+function upsertRecurringRows(rows: RecurringErrandRow[]): void {
+  if (!supabase || rows.length === 0) return;
+  void supabase
+    .from(TABLE)
+    .upsert(rows)
+    .then(({ error }) => {
+      if (!error) return;
+      const msg = `${error.message ?? ''} ${(error as { details?: string }).details ?? ''}`;
+      if (msg.toLowerCase().includes('travel_mode')) {
+        const stripped = rows.map((r) => {
+          const rest = { ...r } as Partial<RecurringErrandRow>;
+          delete rest.travel_mode;
+          return rest;
+        });
+        void supabase!
+          .from(TABLE)
+          .upsert(stripped)
+          .then(({ error: retryError }) => {
+            if (retryError) console.warn('[recurring-sync] push failed', retryError.message);
+          });
+        return;
+      }
+      console.warn('[recurring-sync] push failed', error.message);
+    });
+}
+
 /** Upsert one recurring errand. Fire-and-forget — never throws. */
 export function pushRecurringErrand(errand: RecurringErrand, userId: string): void {
   if (!isSupabaseConfigured || !supabase) return;
-  void supabase
-    .from(TABLE)
-    .upsert(recurringToRow(errand, userId))
-    .then(({ error }) => {
-      if (error) console.warn('[recurring-sync] push failed', error.message);
-    });
+  upsertRecurringRows([recurringToRow(errand, userId)]);
 }
 
 /** Upsert many recurring errands in one round-trip (flush local-only rows). */
@@ -105,12 +135,7 @@ export function pushRecurringErrands(
   userId: string,
 ): void {
   if (!isSupabaseConfigured || !supabase || errands.length === 0) return;
-  void supabase
-    .from(TABLE)
-    .upsert(errands.map((e) => recurringToRow(e, userId)))
-    .then(({ error }) => {
-      if (error) console.warn('[recurring-sync] bulk push failed', error.message);
-    });
+  upsertRecurringRows(errands.map((e) => recurringToRow(e, userId)));
 }
 
 /** Delete one recurring errand by id. Fire-and-forget — never throws. */

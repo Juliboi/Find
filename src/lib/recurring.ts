@@ -81,8 +81,15 @@ function templateToErrandInput(
 ): ErrandInput & { recurringId: string } {
   const startTime = template.startTime;
   const durationMin = template.durationMin;
-  const endTime =
-    startTime && durationMin ? addMinutes(startTime, durationMin) : undefined;
+  // A template with an explicit end carries a Between availability window
+  // (start…end) through verbatim, so the occurrence reads as 'between' and the
+  // planner schedules inside it. Without one, the end is just start+duration
+  // (a fixed-time block).
+  const endTime = template.endTime
+    ? template.endTime
+    : startTime && durationMin
+    ? addMinutes(startTime, durationMin)
+    : undefined;
   return {
     title: template.title,
     startTime,
@@ -93,8 +100,7 @@ function templateToErrandInput(
     latitude: template.latitude,
     longitude: template.longitude,
     placeId: template.placeId,
-    autoPlace: template.autoPlace,
-    placeQuery: template.placeQuery,
+    travelMode: template.travelMode,
     notes: template.notes,
     source: 'user',
     rawText: template.title,
@@ -103,9 +109,17 @@ function templateToErrandInput(
 }
 
 /**
- * Generate the errand instances due on `date`, and prune occurrences that
- * shouldn't be shown. Safe to call often (idempotent): re-materializing an
- * existing occurrence is a no-op that preserves the user's edits.
+ * Generate the errand instances due on `date`, refresh ones whose template was
+ * edited, and prune occurrences that shouldn't be shown. Safe to call often.
+ *
+ * Edit propagation: the materializer never *creates* over an existing instance
+ * (so a freshly-built occurrence keeps its identity), but when the RULE has
+ * changed since an OPEN occurrence was last touched (`template.updatedAt >
+ * instance.updatedAt`) we push the new title/time/place/duration onto it — that
+ * way editing a recurring template updates the days already on screen instead
+ * of leaving stale copies. A genuine per-occurrence edit (the instance is newer
+ * than the template) wins and is left alone; done / planned occurrences stay
+ * frozen as history.
  *
  * Pruning rules (only ever touches OPEN recurring instances — done/planned ones
  * stay as history, like ordinary errands):
@@ -121,11 +135,17 @@ export function materializeRecurringForDate(date: string): void {
   const today = todayISO();
 
   for (const template of templates) {
-    if (recurringDueOn(template, date)) {
-      store.materializeInstance(
-        recurringInstanceId(template.id, date),
-        templateToErrandInput(template, date),
-      );
+    if (!recurringDueOn(template, date)) continue;
+    const id = recurringInstanceId(template.id, date);
+    const input = templateToErrandInput(template, date);
+    const existing = store.items.find((e) => e.id === id);
+    if (!existing) {
+      store.materializeInstance(id, input);
+    } else if (
+      errandStatus(existing, today) === 'open' &&
+      template.updatedAt > existing.updatedAt
+    ) {
+      store.update(id, input);
     }
   }
 
@@ -138,6 +158,35 @@ export function materializeRecurringForDate(date: string): void {
     } else if (e.date === date) {
       const template = byId.get(e.recurringId);
       if (!template || !recurringDueOn(template, e.date)) store.remove(e.id);
+    }
+  }
+}
+
+/**
+ * Apply a just-saved template edit to every already-materialized occurrence of
+ * it at once — across all days, not only the one a screen is showing. The
+ * per-date materializer heals visible days on its own, but calling this on save
+ * makes distant days, the planner's preselect, and the conflict / mindfulness
+ * engines pick up the new title/time/place immediately. OPEN, today-or-later
+ * occurrences are refreshed (or removed when the edit dropped their weekday /
+ * skipped them); done and planned occurrences stay frozen as history, and
+ * past-dated ones are left for the regular prune.
+ */
+export function propagateRecurringEdit(templateId: string): void {
+  const template = useRecurringErrandsStore
+    .getState()
+    .items.find((t) => t.id === templateId);
+  if (!template) return;
+  const store = useErrandsStore.getState();
+  const today = todayISO();
+  for (const e of store.items) {
+    if (e.recurringId !== templateId || !e.date) continue;
+    if (e.date < today) continue;
+    if (errandStatus(e, today) !== 'open') continue;
+    if (recurringDueOn(template, e.date)) {
+      store.update(e.id, templateToErrandInput(template, e.date));
+    } else {
+      store.remove(e.id);
     }
   }
 }

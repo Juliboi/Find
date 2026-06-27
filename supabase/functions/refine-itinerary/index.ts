@@ -217,7 +217,6 @@ interface TaskInput {
   durationMin?: number;
   notes?: string;
   atHome?: boolean;
-  placeQuery?: string;
 }
 interface GroundedItem {
   index?: number;
@@ -374,9 +373,8 @@ function buildPrompt(args: {
         .map((t, i) => {
           const id = t.id ?? `task-${i}`;
           const atHome = t.atHome ? ' — AT-HOME / ONLINE (no venue)' : '';
-          const hint = !t.atHome && t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
           const note = t.notes ? ` — ${t.notes}` : '';
-          return `  - id="${id}": "${t.title ?? ''}"${fmtWhen(t.startTime, t.endTime, t.durationMin)}${atHome}${hint}${note}`;
+          return `  - id="${id}": "${t.title ?? ''}"${fmtWhen(t.startTime, t.endTime, t.durationMin)}${atHome}${note}`;
         })
         .join('\n')
     : '  (none)';

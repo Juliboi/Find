@@ -45,6 +45,12 @@ export interface ItineraryDebugRow {
   gap: number;
   /** "walk 12m" / "transit 25m~" (~ = optimistic estimate), or null. */
   travel: string | null;
+  /** Resolved venue name, when the block has a place. */
+  place?: string | null;
+  /** "lat,lon" rounded — to eyeball WHERE a block resolved. */
+  coords?: string | null;
+  /** true = user-named/located errand (verbatim); false/absent = Diem found it. */
+  userNamed?: boolean;
 }
 
 function timeLabel(item: ItineraryItem): string {
@@ -68,6 +74,13 @@ function travelLabel(item: ItineraryItem): string | null {
   return `${t.mode} ${min}${t.estimated ? '~' : ''}`;
 }
 
+/** Rounds a coord to ~10m so it's readable and grep-stable in the trace. */
+function coordsLabel(it: ItineraryItem): string | null {
+  const c = it.place?.coords;
+  if (!c) return null;
+  return `${c.latitude.toFixed(4)},${c.longitude.toFixed(4)}`;
+}
+
 /** Compact, ordered rows for the whole day — the heart of the edit trace. */
 export function compactItinerary(itin: Itinerary): ItineraryDebugRow[] {
   return flatten(itin).map((it, i) => ({
@@ -80,6 +93,9 @@ export function compactItinerary(itin: Itinerary): ItineraryDebugRow[] {
     title: it.title,
     gap: it.gapBeforeMin ?? 0,
     travel: travelLabel(it),
+    place: it.place?.name ?? null,
+    coords: coordsLabel(it),
+    userNamed: it.place?.userNamed ?? false,
   }));
 }
 

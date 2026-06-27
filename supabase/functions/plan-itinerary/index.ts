@@ -343,15 +343,9 @@ interface Task {
   endTime?: string;
   durationMin?: number;
   notes?: string;
-  /** The client KNOWS this needs a place (e.g. an unresolved auto-place errand);
-   * the planner must attach a suitable venue. When false/omitted the planner
-   * decides for itself based on what the task is. */
-  wantsVenue?: boolean;
-  /** Hint for the KIND of place to find ("quiet café", "gym"), when known. */
-  placeQuery?: string;
   /** This commitment happens at home / online (a video call, telehealth, remote
    * work). It has NO physical venue: schedule it at home and NEVER invent or
-   * search a place for it. Outranks wantsVenue. */
+   * search a place for it. */
   atHome?: boolean;
 }
 
@@ -413,6 +407,37 @@ function visitEndHHMM(startTime: string, endTime: string, durationMinutes: numbe
     return addMinutesHHMM(startTime, durationMinutes);
   }
   return '';
+}
+
+/** Minutes since midnight for "HH:MM", or null if unparseable. */
+function hhmmToMin(hhmm?: string): number | null {
+  if (!hhmm) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/**
+ * A "between" availability WINDOW: the user is open across [start, end] and the
+ * actual work (`durationMin`) is SHORTER than that span — so the planner should
+ * fit the block ANYWHERE inside the window, not pin it to `start`. A fixed block
+ * has end == start + duration (no slack) and is NOT a window.
+ */
+function isBetweenWindow(
+  startTime?: string,
+  endTime?: string,
+  durationMin?: number | null,
+): boolean {
+  const s = hhmmToMin(startTime);
+  const e = hhmmToMin(endTime);
+  return (
+    s != null &&
+    e != null &&
+    e > s &&
+    durationMin != null &&
+    durationMin > 0 &&
+    e - s - durationMin > 0
+  );
 }
 
 function normaliseName(s: string): string {
@@ -598,15 +623,6 @@ function normalizeTasks(input: any): Task[] {
     if (Number.isFinite(dur) && dur > 0 && dur <= 1440) task.durationMin = Math.round(dur);
     if (typeof raw.notes === 'string' && raw.notes.trim()) task.notes = raw.notes.trim().slice(0, 300);
     if (raw.atHome === true) task.atHome = true;
-    // An at-home/online commitment never has a venue — drop any conflicting hints.
-    if (task.atHome) {
-      task.wantsVenue = false;
-    } else {
-      if (raw.wantsVenue === true) task.wantsVenue = true;
-      if (typeof raw.placeQuery === 'string' && raw.placeQuery.trim()) {
-        task.placeQuery = raw.placeQuery.trim().slice(0, 120);
-      }
-    }
     out.push(task);
     if (out.length >= 25) break;
   }
@@ -795,7 +811,9 @@ function buildPlannerPrompt(args: {
   // ANCHORS — already-located errands the user picked. The model places each
   // verbatim (never re-discover, rename, or move) and builds the day around them.
   const fmtAnchor = (s: FixedStop): string => {
-    const when = s.startTime
+    const when = isBetweenWindow(s.startTime, s.endTime, s.durationMin)
+      ? ` — OPEN BETWEEN ${s.startTime}–${s.endTime}: reserve ~${s.durationMin} min ANYWHERE inside this window (use "window" flexibility with windowStart=${s.startTime}, windowEnd=${s.endTime}; do NOT pin it to ${s.startTime})`
+      : s.startTime
       ? s.endTime
         ? ` — PINNED ${s.startTime}–${s.endTime} (START exactly at ${s.startTime}, do NOT move)`
         : ` — PINNED to START exactly at ${s.startTime} (do NOT move)`
@@ -807,13 +825,15 @@ function buildPlannerPrompt(args: {
     return `- "${s.title}" → ${s.name}${lt} [${s.latitude.toFixed(5)}, ${s.longitude.toFixed(5)}]${when}${note}`;
   };
   const anchorsBlock = anchors.length
-    ? `\n\nANCHORS — stops the user has ALREADY chosen and located. These are the BACKBONE of the day. Include EVERY one as an item placed EXACTLY here: copy the venue name verbatim into place.name, set place.userQuery to that same name, set place.coords to the EXACT latitude/longitude given, and set place.locationType. NEVER rename, move, swap, drop, or re-search them — they are fixed. When an anchor shows a PINNED time, schedule it to START at EXACTLY that clock time and reserve EXACTLY its stated length — never nudge it earlier/later or stretch it to absorb travel, a meal, or the morning routine. Only an anchor with NO given time may be placed sensibly. Order, time, and route everything else AROUND these pinned times:\n${anchors.map(fmtAnchor).join('\n')}`
+    ? `\n\nANCHORS — stops the user has ALREADY chosen and located. These are the BACKBONE of the day. Include EVERY one as an item placed EXACTLY here: copy the venue name verbatim into place.name, set place.userQuery to that same name, set place.coords to the EXACT latitude/longitude given, and set place.locationType. NEVER rename, move, swap, drop, or re-search them — they are fixed. When an anchor shows a PINNED time, schedule it to START at EXACTLY that clock time and reserve EXACTLY its stated length — never nudge it earlier/later or stretch it to absorb travel, a meal, or the morning routine. When an anchor shows an OPEN BETWEEN window, place its block ANYWHERE inside that window — it can flex to fit travel and flow, but must stay fully WITHIN the window. Only an anchor with NO given time may be placed freely. Order, time, and route everything else AROUND these pinned times:\n${anchors.map(fmtAnchor).join('\n')}`
     : '';
 
   // TASKS — unplaced errands. The model schedules each; venue rule (#4) decides
   // whether it gets a model-named place or stays place-less (a call, admin).
   const fmtTask = (t: Task): string => {
-    const when = t.startTime
+    const when = isBetweenWindow(t.startTime, t.endTime, t.durationMin)
+      ? ` — OPEN BETWEEN ${t.startTime}–${t.endTime}: fit its ~${t.durationMin} min ANYWHERE inside this window (use "window" flexibility with windowStart=${t.startTime}, windowEnd=${t.endTime}; do NOT pin it to ${t.startTime})`
+      : t.startTime
       ? t.endTime
         ? ` — PINNED ${t.startTime}–${t.endTime} (START exactly at ${t.startTime}, do NOT move)`
         : ` — PINNED to START exactly at ${t.startTime} (do NOT move)`
@@ -822,15 +842,12 @@ function buildPlannerPrompt(args: {
         : '';
     const need = t.atHome
       ? ' — AT-HOME / ONLINE: this has NO physical venue. Schedule it at home and OMIT the place field entirely — do NOT search for, invent, or attach a venue.'
-      : t.wantsVenue
-        ? ' — needs a place; find a suitable venue close to the stops scheduled right BEFORE/AFTER it (least detour), not across town'
-        : '';
-    const hint = !t.atHome && t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
+      : '';
     const note = t.notes ? ` — ${t.notes}` : '';
-    return `- "${t.title}"${when}${need}${hint}${note}`;
+    return `- "${t.title}"${when}${need}${note}`;
   };
   const tasksBlock = tasks.length
-    ? `\n\nTASKS — things the user wants in the day that are NOT yet located. A task showing a PINNED time MUST start at EXACTLY that clock time and reserve EXACTLY its stated length — do not move it; one with no time you place sensibly:\n${tasks.map(fmtTask).join('\n')}`
+    ? `\n\nTASKS — things the user wants in the day that are NOT yet located. A task showing a PINNED time MUST start at EXACTLY that clock time and reserve EXACTLY its stated length — do not move it; a task showing an OPEN BETWEEN window must be scheduled to fit ENTIRELY inside that window (flex within it, never outside); one with no time you place sensibly:\n${tasks.map(fmtTask).join('\n')}`
     : '';
 
   // The free-text box: STYLE/NOTES that colour an errand day, or the whole
@@ -1922,8 +1939,9 @@ Deno.serve(async (req: Request) => {
   // soon as a task needs a model-named venue we use the reliable default for
   // better picks. Grounded discovery needs a Flash-class model (lite drifts
   // empty when grounding); a fast replan uses the cheaper grounded model.
-  const anyTaskWantsVenue = tasks.some((t) => t.wantsVenue || !!t.placeQuery);
-  const arrangeOnly = errandDriven && !anyTaskWantsVenue;
+  // No task can request a model-found venue any more (Diem never searches), so
+  // an errand-driven day is always arrange-only — the cheap compose model.
+  const arrangeOnly = errandDriven;
   const primaryModel = grounded
     ? fast
       ? CONFIGURED_FAST_GEMINI_MODEL

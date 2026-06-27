@@ -354,6 +354,119 @@ export async function findPlaces(
 }
 
 /**
+ * Curated discovery — the knowledge/web-backed sibling of {@link findPlaces}.
+ *
+ * For requests a literal Text Search can't answer ("michelin restaurant near
+ * Olomouc", "most popular clubs in Prague", "where to take my gf for our
+ * anniversary"), this calls the `discover-curate` edge function: a Google
+ * Search–grounded model names the specific real venues that fit, then each is
+ * grounded into a normal place card via Google Places. The result shape matches
+ * `findPlaces`, so callers render curated and ordinary discovery identically.
+ *
+ * Never throws. When curation isn't configured or finds nothing, it returns an
+ * empty `places` list with a `reason`, and the caller falls back to `findPlaces`.
+ */
+export async function curateDiscoveryPlaces(args: {
+  /** The full discovery phrase, e.g. "michelin restaurant in Olomouc". */
+  query: string;
+  /** A named area/city to anchor on, when the user gave one. */
+  area?: string | null;
+  /** Human label of the resolved center ("Olomouc", "Prague"), for the brain. */
+  nearLabel?: string | null;
+  /** Where the user is searching from — drives grounding bias + distances. */
+  center: Coords;
+  /** Soft city-bias radius for grounding named venues (meters). */
+  radiusM?: number;
+  /** Max curated cards to return (default 8). */
+  limit?: number;
+}): Promise<FindPlacesResult> {
+  const query = args.query.trim();
+  if (!query) {
+    return { places: [], category: null, provider: 'none', reason: 'no_results' };
+  }
+  if (!isSupabaseConfigured || !supabase) {
+    return { places: [], category: null, provider: 'none', reason: 'no_supabase' };
+  }
+  const limit = Math.min(10, Math.max(1, Math.round(args.limit ?? 8)));
+  const area = args.area?.trim() || null;
+  const key =
+    'curate:' +
+    cacheKey(
+      `${query}${area ? `@${area}` : ''}|n=${limit}`,
+      args.center,
+    );
+  const cached = readCache(key);
+  if (cached) return cached;
+
+  try {
+    const { data, error } = await supabase.functions.invoke('discover-curate', {
+      body: {
+        query,
+        area,
+        nearLabel: args.nearLabel ?? null,
+        latitude: args.center.latitude,
+        longitude: args.center.longitude,
+        ...(args.radiusM ? { radiusM: args.radiusM } : {}),
+        limit,
+      },
+    });
+    if (error) {
+      const detail = await extractFunctionError(error);
+      return {
+        places: [],
+        category: null,
+        provider: 'none',
+        reason: 'error',
+        detail,
+        debug: { error: detail, name: (error as any)?.name },
+      };
+    }
+    if (!data || (typeof data === 'object' && 'error' in (data as any))) {
+      const detail =
+        data && typeof (data as any).error === 'string'
+          ? (data as any).error
+          : 'Curated discovery returned an empty response.';
+      return {
+        places: [],
+        category: null,
+        provider: 'none',
+        reason: 'error',
+        detail,
+        debug: data,
+      };
+    }
+    const places = Array.isArray(data.places) ? (data.places as NearbyPlace[]) : [];
+    const usage = shapeUsage((data as any).usage);
+    const result: FindPlacesResult = {
+      places,
+      category: null,
+      provider: data.provider === 'google' ? 'google' : 'none',
+      reason:
+        places.length === 0
+          ? typeof (data as any).reason === 'string'
+            ? ((data as any).reason as FindPlacesResult['reason'])
+            : 'no_results'
+          : undefined,
+      usage,
+      debug: data,
+    };
+    logTokenUsage('discover-curate', usage);
+    // Cache without usage so a later hit serves places but re-attributes no spend.
+    if (places.length > 0) writeCache(key, { ...result, usage: null });
+    return result;
+  } catch (e: any) {
+    return {
+      places: [],
+      category: null,
+      provider: 'none',
+      reason: 'error',
+      detail: String(e?.message ?? e),
+      debug: { thrown: String(e?.message ?? e) },
+    };
+  }
+}
+
+/**
  * Tries hard to extract a useful message from a Supabase Functions error.
  *
  * `supabase.functions.invoke` returns one of:

@@ -32,13 +32,12 @@ const DINING_SIGNAL =
   /\b(eat|eating|meal|food|grab\s+(a\s+)?(bite|food|lunch|dinner|coffee)|brunch|breakfast|lunch|dinner|supper|restaurant|caf[eé]|coffee|bistro|brasserie|trattoria|osteria|pizza|pizzeria|sushi|burger|ramen|noodles?|pho|tapas|dim\s?sum|bbq|barbecue|steak(house)?|kebab|tacos?|taqueria|bakery|patisserie|deli|diner|eatery|canteen|food\s?court|pub|brewery|wine\s?bar|gastro)\b/i;
 
 function errandText(e: Errand): string {
-  return [e.title, e.notes, e.placeQuery, e.address].filter(Boolean).join(' ');
+  return [e.title, e.notes, e.address].filter(Boolean).join(' ');
 }
 
 /** An errand can stand in for a meal only if it has a place to show/route to. */
 function hasUsablePlace(e: Errand): boolean {
-  if (typeof e.latitude === 'number' && typeof e.longitude === 'number') return true;
-  return e.autoPlace === true && !!e.placeQuery;
+  return typeof e.latitude === 'number' && typeof e.longitude === 'number';
 }
 
 function inWindow(hhmm: string | undefined, w?: MealWindow): boolean {
@@ -55,8 +54,20 @@ function inWindow(hhmm: string | undefined, w?: MealWindow): boolean {
 /** A short human label for what the errand's meal place is. */
 export function mealErrandLabel(e: Errand): string {
   if (e.address && e.address.trim()) return e.address.trim();
-  if (e.autoPlace && e.placeQuery) return e.placeQuery;
   return e.title;
+}
+
+/**
+ * Per-meal Home/Out default the planner drawer seeds for a fresh day: every meal
+ * starts at **Home**. We deliberately never guess a meal "out" from the shape of
+ * the day (an appointment or meeting near lunch doesn't mean the user wants to eat
+ * out) — the only thing that preselects "out" is one of the user's OWN dining
+ * errands already covering that meal, and that's handled separately as a meal LINK
+ * (detectMealErrands), where the errand's real venue stands in for the meal. So the
+ * baseline is simply Home, and the user flips up the few meals they want out.
+ */
+export function defaultMealModes(): Record<MealKey, 'home' | 'out'> {
+  return { breakfast: 'home', lunch: 'home', dinner: 'home' };
 }
 
 /**

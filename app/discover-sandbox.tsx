@@ -36,6 +36,7 @@ export default function DiscoverSandboxScreen() {
   const [query, setQuery] = useState('pharmacy');
   const [area, setArea] = useState('Karlín');
   const [nearby, setNearby] = useState(false);
+  const [forceSmart, setForceSmart] = useState(false);
   const [loading, setLoading] = useState(false);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [result, setResult] = useState<DiscoverResult | null>(null);
@@ -55,6 +56,8 @@ export default function DiscoverSandboxScreen() {
         fallbackCenter: home
           ? { latitude: home.latitude, longitude: home.longitude }
           : null,
+        // On → force the web-grounded curated path; off → auto-detect from text.
+        ...(forceSmart ? { smart: true } : {}),
       });
       setResult(res);
     } finally {
@@ -133,6 +136,31 @@ export default function DiscoverSandboxScreen() {
             />
           </Pressable>
 
+          <Pressable
+            onPress={() => {
+              Haptics.selectionAsync().catch(() => undefined);
+              setForceSmart((v) => !v);
+            }}
+            style={styles.toggleRow}
+          >
+            <View style={{ flex: 1 }}>
+              <Text variant="body" weight="semibold">
+                Force curated (web)
+              </Text>
+              <Text variant="caption" tone="secondary">
+                Use the Gemini-grounded concierge even for plain queries
+              </Text>
+            </View>
+            <Switch
+              value={forceSmart}
+              onValueChange={(v) => {
+                Haptics.selectionAsync().catch(() => undefined);
+                setForceSmart(v);
+              }}
+              trackColor={{ true: t.colors.accent, false: t.colors.fill2 }}
+            />
+          </Pressable>
+
           <Button
             title="Discover"
             onPress={run}
@@ -163,6 +191,10 @@ export default function DiscoverSandboxScreen() {
             <Card padded style={styles.statusCard}>
               <StatRow label="Center" value={`${result.centerLabel ?? '—'} (${result.centerSource})`} />
               <StatRow label="Provider" value={result.provider} />
+              <StatRow
+                label="Path"
+                value={result.curated ? 'curated (web-grounded)' : 'category search'}
+              />
               <StatRow
                 label="Latency"
                 value={elapsedMs != null ? `${elapsedMs} ms` : '—'}

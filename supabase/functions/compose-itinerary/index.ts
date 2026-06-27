@@ -27,7 +27,7 @@
 //     anchors?: [{ id, title, name, latitude, longitude, startTime?, endTime?,
 //                  durationMin?, notes?, locationType? }],
 //     tasks?:   [{ id, title, startTime?, endTime?, durationMin?, notes?,
-//                  atHome?, placeQuery? }],
+//                  atHome? }],
 //     dayStart?: { time?, label? },
 //     dayEnd?:   { time?, label? },
 //     context?: { ...buildContextPayload... },
@@ -262,7 +262,6 @@ interface TaskInput {
   durationMin?: number;
   notes?: string;
   atHome?: boolean;
-  placeQuery?: string;
 }
 
 /** Onboarding rhythm lines (mirrors plan-itinerary's context personalisation),
@@ -331,7 +330,22 @@ function describeContext(ctx: any, includeMorning: boolean): string {
   return lines.join('\n');
 }
 
+/** Minutes since midnight for "HH:MM", or null if unparseable. */
+function hhmmToMin(hhmm?: string | null): number | null {
+  if (!hhmm) return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
 function fmtWhen(s?: string | null, e?: string | null, dur?: number | null): string {
+  const sMin = hhmmToMin(s);
+  const eMin = hhmmToMin(e);
+  // A "between" availability window: open across [s, e] with the work (dur)
+  // shorter than the span — schedule it ANYWHERE inside, never pinned to s.
+  if (sMin != null && eMin != null && eMin > sMin && dur != null && dur > 0 && eMin - sMin - dur > 0) {
+    return ` — OPEN BETWEEN ${s}–${e}: fit its ~${dur} min ANYWHERE inside this window ("window" flexibility; leave startTime/endTime null so the router places it — do NOT pin it to ${s})`;
+  }
   if (s) {
     return e
       ? ` — PINNED ${s}–${e} (START exactly at ${s}, do NOT move)`
@@ -380,13 +394,12 @@ function buildPrompt(args: {
         .map((t, i) => {
           const id = t.id ?? `task-${i}`;
           const home = t.atHome ? ' — AT-HOME / ONLINE: no physical venue' : '';
-          const hint = !t.atHome && t.placeQuery ? ` [place hint: ${t.placeQuery}]` : '';
           const note = t.notes ? ` — ${t.notes}` : '';
           return `  - id="${id}": "${t.title ?? ''}"${fmtWhen(
             t.startTime,
             t.endTime,
             t.durationMin,
-          )}${home}${hint}${note}`;
+          )}${home}${note}`;
         })
         .join('\n')
     : '  (none)';
@@ -424,7 +437,10 @@ ${args.intent || '(none)'}
 YOUR JOB — emit "blocks", a SINGLE ORDERED list covering the whole day from start to finish:
 1. INCLUDE every anchor and every task as a block. For an anchor, set placement="anchor" and anchorId to its id (we attach its real venue + coords). For a task, set taskId to its id.
 2. SPLIT the free text into discrete activities (e.g. "deep work 2h at a cafe, language 1.5h, skincare, read before sleep, go to a max fitness gym" is FIVE activities). Add each as its own block.
-3. POSITION place-y blocks in the RIGHT neighbourhood. Look at the located anchors + home and decide where the day is happening; for a flexible venue write placement="find" with a SPECIFIC, geocodable findQuery that NAMES the category + brand + area (e.g. user said "max fitness gym" and the day is around Karlín → findQuery="Max Fitness gym, Karlín, Prague", area="Karlín"). Keep brand/specifics the user gave; do NOT invent an exact branch name — name the category + area so a places search finds the real one.
+3. POSITION place-y blocks in the RIGHT neighbourhood. For a flexible venue write placement="find" with a SPECIFIC, geocodable findQuery. STRIP filler from the user's words down to the core searchable venue — drop verbs/qualifiers like "go to / workout at / near / a / the / buy / pick up / get" (so task "Workout at near max fitness gym" → findQuery "Max Fitness gym", NOT the whole sentence) — and turn a PRODUCT into the SHOP that sells it ("buy domestos / cleaning supplies" → findQuery "drogerie" or "supermarket"; "pick up bread" → "bakery"). Keep a real brand the user gave (Max Fitness); do NOT invent an exact branch name. THEN decide WHERE each find searches:
+   • A quick LOCAL everyday errand with no geography of its own — groceries, gym, pharmacy, drogerie/household shop, post office, drycleaner, bakery — belongs near HOME. Write findQuery as the BARE brand/category with NO neighbourhood and NO city ("Max Fitness gym", "drogerie", "supermarket") and set area=null; the planner finds the branch nearest the user's home automatically. Do NOT write a district or city into these — that is what sends the user to the wrong branch across town.
+   • A find that is genuinely EN ROUTE to (or clustered with) a located anchor takes THAT anchor's real neighbourhood: put the area in BOTH findQuery and the area field (e.g. a coffee stop by a Karlín meeting → findQuery="specialty coffee, Karlín, Prague", area="Karlín").
+   • NEVER guess, invent, or append a district/branch you cannot SEE from a located anchor or the user's own words. A wrong guess (e.g. tacking "Holešovice" onto a gym when home is elsewhere) sends the user across town. When unsure of the area, OMIT it and keep findQuery clean.
 4. CO-LOCATE compatible activities onto a stop that ALREADY exists: if "deep work" or "content prep" can happen at a café anchor, set placement="colocate" and anchorId=<that anchor's id> (no findQuery).
 5. AT-HOME / ONLINE blocks → placement="home", no query. This covers self-care (skincare, reading, a nap, journaling, stretching) AND anything online/remote (a video/phone call, telehealth/online therapy, remote work, a virtual class). If a task is marked AT-HOME, or its words say online/virtual/remote/zoom/meet/teams/video call/phone, it has NO venue — ALWAYS placement="home", even if it has a clock time.
 6. A venue the USER NAMED verbatim (in a task hint or the free text, e.g. "hostinec U Mišků") → placement="venue", userQuery=<their EXACT words>.

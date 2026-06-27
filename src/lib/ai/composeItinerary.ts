@@ -69,8 +69,6 @@ export interface ComposeTaskInput {
   notes?: string;
   /** At-home / online (a call, telehealth, remote work) — no physical venue. */
   atHome?: boolean;
-  /** A category hint for a place-y task ("quiet café", "gym"). */
-  placeQuery?: string;
 }
 
 export interface ComposeInput {

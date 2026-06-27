@@ -15,8 +15,11 @@ import { logTokenUsage, shapeUsage, type LlmTokenUsage } from '@/lib/usage';
 import {
   personAliases,
   usePeopleStore,
+  type Person,
   type PersonPlace,
 } from '@/store/usePeopleStore';
+import { useHomeStore, type LocationPin } from '@/store/useHomeStore';
+import type { TravelPref } from '@/store/useErrandsStore';
 import type { VenueOpeningHours } from '@/types/itinerary';
 
 /** The fields the parser fills. `null` means "the user didn't say". */
@@ -46,12 +49,11 @@ export interface ErrandDraft {
   priceLevel?: number | null;
   openingHours?: VenueOpeningHours | null;
   /**
-   * "Let AI plan it": set when the user defers the venue choice to the planner
-   * (from the discover footer, or the form's "Where" toggle). The AI parser
-   * never sets these — they're carried through the drawer only.
+   * Travel preference (`'commute'` | `'car'`) carried when re-opening a located
+   * errand for editing, so the chosen mode survives the round-trip. The AI
+   * parser never sets this.
    */
-  autoPlace?: boolean | null;
-  placeQuery?: string | null;
+  travelMode?: TravelPref | null;
   notes: string | null;
 }
 
@@ -149,7 +151,7 @@ function shapeRemote(data: Record<string, unknown>, rawText: string): ParsedErra
   let discovery: DiscoveryIntent | null = null;
 
   if (intent === 'discover') {
-    discovery = shapeDiscovery(data.discovery);
+    discovery = shapeDiscovery(data.discovery, rawText);
     if (!discovery) intent = 'plan';
   }
   if (intent === null) {
@@ -162,37 +164,82 @@ function shapeRemote(data: Record<string, unknown>, rawText: string): ParsedErra
     }
   }
 
+  // A FIXED venue the user named pins the errand to a real spot: a saved
+  // person's place ("chill at Ondra's place") or the user's OWN home ("dentist
+  // at my place", "lunch at home").
+  const personPlace = personPlaceForDraft(data, rawText);
+  // Person place keeps its established behaviour: only on a plan-intent line,
+  // never for a companion ("cinema with Ondra").
+  if (personPlace && intent === 'plan') {
+    return {
+      draft: withPersonPlace(draft, personPlace),
+      intent: 'plan',
+      discovery: null,
+      usage: shapeUsage(data.usage),
+    };
+  }
+  // The user's home wins even over a "discover" guess — "dinner at my place" is
+  // dining at home, not a venue to go choose (the proximity case "near my place"
+  // is excluded inside mentionsHomeVenue, so it still flows to discovery).
+  if (!personPlace && mentionsHomeVenue(rawText)) {
+    const home = useHomeStore.getState().home;
+    return {
+      // Home not set yet → keep it a plan but DON'T geocode "my place"; clear the
+      // guessed place so the user can pin one (or set their home and re-add).
+      draft: home ? withHomePlace(draft, home) : clearPlace(draft),
+      intent: 'plan',
+      discovery: null,
+      usage: shapeUsage(data.usage),
+    };
+  }
+
   // The discovered venue is chosen later — don't keep a half-guessed address.
   if (intent === 'discover') draft.address = null;
 
-  // "Chill at Ondra's place" → swap in Ondra's saved place (with coordinates).
-  // Only for plan intent; a "with X" / "call X" companion comes back with
-  // usePersonPlace=false, so this is a no-op there.
-  const finalDraft =
-    intent === 'plan'
-      ? applyPersonPlace(draft, data.personId, data.usePersonPlace === true)
-      : draft;
-
-  return { draft: finalDraft, intent, discovery, usage: shapeUsage(data.usage) };
+  return { draft, intent, discovery, usage: shapeUsage(data.usage) };
 }
 
 /**
- * When the orchestrator flagged a saved person whose place we should use, swap
- * that person's saved place (label + coordinates) into the draft, replacing any
- * raw address text the model echoed. Resolves the person on-device by id.
+ * The saved person's fixed place to pin for a possessive line ("chill at
+ * Ondra's place"), or null when none applies. Trusts the orchestrator's verdict
+ * when the redeployed function returns it (`usePersonPlace` true/false),
+ * resolving the person by the id it echoed. Falls back to the on-device
+ * possessive/companion matcher when the field is absent (function not yet
+ * redeployed) or the echoed id doesn't match a saved person — so people-place
+ * resolution works whether or not the Edge Function knows about people yet.
  */
-function applyPersonPlace(
-  draft: ErrandDraft,
-  personId: unknown,
-  usePersonPlace: boolean,
-): ErrandDraft {
-  if (!usePersonPlace || typeof personId !== 'string' || !personId.trim()) {
-    return draft;
+function personPlaceForDraft(
+  data: Record<string, unknown>,
+  rawText: string,
+): PersonPlace | null {
+  const verdict = data.usePersonPlace;
+  // The function explicitly decided this is a companion → never use a place.
+  if (verdict === false) return null;
+  if (verdict === true) {
+    const person = findPersonById(data.personId) ?? findPersonInText(rawText);
+    if (person?.place) return person.place;
   }
-  const person = usePeopleStore
-    .getState()
-    .items.find((p) => p.id === personId.trim());
-  return person?.place ? withPersonPlace(draft, person.place) : draft;
+  // Field absent (older deploy) or unresolved id → on-device fallback.
+  return resolvePersonPlaceFromText(rawText);
+}
+
+/** Resolve a saved person by the id the model echoed (defensive). */
+function findPersonById(personId: unknown): Person | undefined {
+  if (typeof personId !== 'string' || !personId.trim()) return undefined;
+  return usePeopleStore.getState().items.find((p) => p.id === personId.trim());
+}
+
+/** Find the first saved person (with a place) whose alias appears in the line. */
+function findPersonInText(text: string): Person | undefined {
+  const hay = ` ${text.toLowerCase().replace(/'s\b/g, 's')} `;
+  for (const person of usePeopleStore.getState().items) {
+    if (!person.place?.label) continue;
+    for (const alias of personAliases(person)) {
+      const a = escapeRegExp(alias.replace(/'s\b/g, 's'));
+      if (new RegExp(`\\b${a}s?\\b`).test(hay)) return person;
+    }
+  }
+  return undefined;
 }
 
 /** Overwrite a draft's place fields with a saved person's fixed place. */
@@ -203,23 +250,94 @@ function withPersonPlace(draft: ErrandDraft, place: PersonPlace): ErrandDraft {
     latitude: place.latitude ?? null,
     longitude: place.longitude ?? null,
     placeId: place.placeId ?? null,
-    // A person's fixed place is a real spot, not a "let Diem find it" auto-place.
-    autoPlace: false,
-    placeQuery: null,
+  };
+}
+
+/** Overwrite a draft's place fields with the user's saved home pin. */
+function withHomePlace(draft: ErrandDraft, home: LocationPin): ErrandDraft {
+  return {
+    ...draft,
+    address: home.label?.trim() || 'Home',
+    latitude: home.latitude,
+    longitude: home.longitude,
+    // Home is a fixed anchor, not a Google place.
+    placeId: null,
+  };
+}
+
+/**
+ * Strip any pinned or AI-guessed place from a draft. Used when the user named
+ * their home but no home pin is saved yet: better to leave the errand
+ * "Anywhere" than to geocode the literal words "my place".
+ */
+function clearPlace(draft: ErrandDraft): ErrandDraft {
+  return {
+    ...draft,
+    address: null,
+    latitude: null,
+    longitude: null,
+    placeId: null,
   };
 }
 
 /** Validate the model's discovery object; null if there's no usable category. */
-function shapeDiscovery(raw: unknown): DiscoveryIntent | null {
+function shapeDiscovery(raw: unknown, rawText: string): DiscoveryIntent | null {
   if (!raw || typeof raw !== 'object') return null;
   const d = raw as Record<string, unknown>;
   const query = typeof d.query === 'string' && d.query.trim() ? d.query.trim() : '';
   if (!query) return null;
   return {
-    query,
+    query: preserveBrandQuery(query, rawText),
     area: typeof d.area === 'string' && d.area.trim() ? d.area.trim() : null,
     nearby: d.nearby === true,
   };
+}
+
+// Filler/descriptive words that mark a phrase as a DESCRIPTION ("somewhere to
+// work out", "a quiet place") rather than a brand. If the user's own words
+// contain any of these, the model's category reduction is the better search
+// term, so we leave it alone. (Diacritic-normalized, lowercase.)
+const NON_BRAND_WORDS = new Set([
+  'a', 'an', 'the', 'some', 'any', 'to', 'for', 'of', 'near', 'around', 'by',
+  'at', 'in', 'on', 'me', 'here', 'us', 'my', 'our', 'somewhere', 'anywhere',
+  'place', 'places', 'spot', 'spots', 'something', 'option', 'options',
+  'nearby', 'closest', 'nearest', 'find', 'get', 'grab', 'eat', 'drink',
+  'work', 'workout', 'out', 'study', 'go', 'visit', 'do', 'good', 'nice',
+  'best', 'great', 'top', 'cheap', 'affordable', 'quiet', 'cozy', 'cosy',
+  'fancy', 'authentic', 'local', 'popular', 'busy', 'lively', 'new', 'and', 'or',
+]);
+
+/**
+ * Keep a BRAND/chain the user named in a discovery "what". The parse-errand
+ * model is told to reduce a discovery to its bare CATEGORY ("a quiet café" →
+ * "café"), but it over-applies that to a real CHAIN — "max fitness near OC
+ * Krakov" comes back as "gym", so the search returns *any* gym instead of the
+ * Max Fitness the user asked for.
+ *
+ * Detection without a brand list: the on-device extractor keeps the user's own
+ * words ("max fitness"). We restore them only when they (a) share NO word with
+ * the model's category — so it REPLACED a brand rather than trimming filler —
+ * and (b) read like a brand: ≤3 tokens, none of them descriptive filler. That
+ * leaves legit reductions intact ("good gym" → "gym" shares "gym"; "somewhere
+ * to work out" → "gym" contains filler) while rescuing "max fitness", "dm",
+ * "starbucks", "rohlik", etc.
+ */
+function preserveBrandQuery(modelQuery: string, rawText: string): string {
+  const local = detectDiscovery(rawText)?.query?.trim();
+  if (!local || local.toLowerCase() === modelQuery.toLowerCase()) return modelQuery;
+  // Strip combining diacritics (U+0300–U+036F covers Czech č/ž/ř/á/ě/š/ý…) so
+  // "café" ≈ "cafe"; avoids \p{Diacritic} which not every JS engine supports.
+  const norm = (s: string) => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const localToks = norm(local).split(/[^a-z0-9]+/).filter(Boolean);
+  const modelToks = new Set(norm(modelQuery).split(/[^a-z0-9]+/).filter(Boolean));
+  if (localToks.length === 0 || modelToks.size === 0) return modelQuery;
+  // Shared word ⇒ the model only trimmed filler off the user's words — trust it.
+  for (const tk of localToks) if (modelToks.has(tk)) return modelQuery;
+  // Brand-like = short and free of descriptive filler; otherwise the model's
+  // category is the better search term (it understood a vague description).
+  const brandLike =
+    localToks.length <= 3 && localToks.every((tk) => !NON_BRAND_WORDS.has(tk));
+  return brandLike ? local : modelQuery;
 }
 
 /**
@@ -231,9 +349,19 @@ function localParse(text: string, today: string): ParsedErrand {
   const base = localParseErrand(text, today);
   // People win over discovery: "chill at Ondra's place" is a fixed spot, not a
   // category to go choose. A companion line ("cinema with Ondra") returns null.
-  const personPlace = resolvePersonPlaceLocally(text);
+  const personPlace = resolvePersonPlaceFromText(text);
   if (personPlace) {
     return { draft: withPersonPlace(base, personPlace), intent: 'plan', discovery: null };
+  }
+  // The user's own home ("at my place", "lunch at home") is a fixed spot too —
+  // pin home, or just clear the guessed place when no home pin is saved.
+  if (mentionsHomeVenue(text)) {
+    const home = useHomeStore.getState().home;
+    return {
+      draft: home ? withHomePlace(base, home) : clearPlace(base),
+      intent: 'plan',
+      discovery: null,
+    };
   }
   const detected = detectDiscovery(text);
   if (detected) {
@@ -253,13 +381,16 @@ function escapeRegExp(s: string): string {
 }
 
 /**
- * Offline mirror of the orchestrator's people rule. Returns a saved person's
+ * On-device mirror of the orchestrator's people rule. Returns a saved person's
  * place ONLY when the line is possessive / "at <name>'s" ("chill at Ondra's
  * place", "at Ondra's", "Ondra's flat") — and never when the person is a
  * companion or the target of a communication ("cinema with Ondra", "call
  * Ondra"). Null when no saved person's place applies.
+ *
+ * Exported so the planner's free-text brain path can reuse the exact same
+ * possessive/companion disambiguation when it materialises decomposed items.
  */
-function resolvePersonPlaceLocally(text: string): PersonPlace | null {
+export function resolvePersonPlaceFromText(text: string): PersonPlace | null {
   const people = usePeopleStore.getState().items;
   if (!people.length) return null;
   // Normalize "ondra's" → "ondras" so one set of patterns covers both.
@@ -287,6 +418,104 @@ function resolvePersonPlaceLocally(text: string): PersonPlace | null {
     }
   }
   return null;
+}
+
+/**
+ * True when a line names the user's OWN home as the venue — a possessive ("my
+ * place", "our apartment", "my flat"), the generic "the apartment/flat", or the
+ * "home" family used as a destination ("lunch at home", "work from home").
+ *
+ * Deliberately conservative to avoid false hits:
+ *   - PROXIMITY phrasings ("coffee near my place", "gym near home") are a search
+ *     ANCHOR, not the venue, so they're excluded (→ they stay discovery).
+ *   - A COMMUNICATION at home ("call home") is a reminder, not a place to go.
+ *   - Store BRANDS that start with "home" ("Home Depot", "Home Goods") are not
+ *     the user's home.
+ *
+ * Used by the errand parser (remote + local) to pin the home anchor; the actual
+ * coordinates are read on-device from `useHomeStore`, never round-tripped.
+ */
+export function mentionsHomeVenue(text: string): boolean {
+  const hay = ` ${(text ?? '').toLowerCase().replace(/[’]/g, "'")} `;
+  if (!hay.trim()) return false;
+  // "near / around / close to my place|home|…" → a reference point to search
+  // around, not the place we're going. Let it fall through to discovery. ("by"
+  // is left out on purpose — "stop by my place" means GO home, not "nearby".)
+  if (
+    /\b(?:near|nearby|around|close\s+to|next\s+to|closest)\s+(?:to\s+)?(?:my|our|the\s+)?(?:place|home|house|apartment|apt|flat|pad|crib)\b/.test(
+      hay,
+    )
+  ) {
+    return false;
+  }
+  // A communication aimed at "home" ("call home", "text home") → a reminder.
+  if (
+    /\b(?:call|calling|phone|phoning|ring|ringing|text|texting|message|messaging|email|emailing|dm)\s+home\b/.test(
+      hay,
+    )
+  ) {
+    return false;
+  }
+  // Possessive home nouns: "my place", "our home", "my apartment", "my flat", …
+  if (/\b(?:my|our)\s+(?:place|home|house|apartment|apt|flat|pad|crib)\b/.test(hay)) {
+    return true;
+  }
+  // "the apartment / the flat" — in an errand this is almost always your home.
+  if (/\bthe\s+(?:apartment|apt|flat)\b/.test(hay)) return true;
+  // The "home" family used as a destination, minus store brands ("Home Depot").
+  if (
+    /\b(?:at|in|from|back|stay|staying|head|heading|go|going|get|getting)\s+home\b/.test(
+      hay,
+    ) &&
+    !/\bhome\s+(?:depot|goods|bargains|base|sense|store|decor|décor|improvement|hardware|center|centre|appliances?|furnishings?)\b/.test(
+      hay,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Day-description connectors we split a free-text plan on to test each clause
+ * for a person's place. Deliberately conservative — we avoid bare "and"/"." so
+ * "fish and chips" / "St. Anne's" don't get torn apart.
+ */
+const CLAUSE_SPLIT_RE =
+  /\s*(?:,|;|\n|->|→|\bthen\b|\band then\b|\bafter that\b|\bafterwards\b)\s*/i;
+
+/**
+ * Pull "<activity> at <saved person>'s place" clauses out of a free-text day
+ * description. Each match becomes a fully-placed {@link ErrandDraft} pinned to
+ * that person's saved place — exactly how the errand composer resolves it — and
+ * is removed from the returned `remaining` text. Companion lines ("dinner with
+ * Ondra") never match, so they stay in `remaining` for the planner's brain.
+ *
+ * The planner runs this BEFORE the brain so a person's place resolves the same
+ * way whether you type it in the composer or describe it in the day's free
+ * text; the brain then clusters the rest of the day around the fixed place.
+ */
+export function extractPersonPlaceErrands(
+  text: string,
+  today: string,
+): { drafts: ErrandDraft[]; remaining: string } {
+  const clean = (text ?? '').trim();
+  if (!clean || usePeopleStore.getState().items.length === 0) {
+    return { drafts: [], remaining: clean };
+  }
+  const drafts: ErrandDraft[] = [];
+  const leftover: string[] = [];
+  for (const segment of clean.split(CLAUSE_SPLIT_RE)) {
+    const seg = segment.trim();
+    if (!seg) continue;
+    const place = resolvePersonPlaceFromText(seg);
+    if (place) {
+      drafts.push(withPersonPlace(localParseErrand(seg, today), place));
+    } else {
+      leftover.push(seg);
+    }
+  }
+  return { drafts, remaining: leftover.join(', ') };
 }
 
 function capitalize(s: string): string {

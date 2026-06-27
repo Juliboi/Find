@@ -7,7 +7,7 @@ import {
   StyleSheet,
   View,
 } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import * as Haptics from 'expo-haptics';
@@ -51,13 +51,19 @@ function formatLongDate(iso: string): string {
 export default function DayPlansScreen() {
   const router = useRouter();
   const t = useTheme();
+  const params = useLocalSearchParams<{ date?: string }>();
   const today = todayISO();
+  // Which day's plans to show — passed from the home "other plans" link so this
+  // screen follows the focused day; falls back to today on a direct open.
+  const date =
+    typeof params.date === 'string' && params.date ? params.date : today;
+  const isThatToday = date === today;
 
   const items = useSavedItineraries((s) => s.items);
   const activate = useSavedItineraries((s) => s.activate);
   const remove = useSavedItineraries((s) => s.remove);
-  const plans = useMemo(() => plansForDate(items, today), [items, today]);
-  const active = useMemo(() => activePlanForDate(items, today), [items, today]);
+  const plans = useMemo(() => plansForDate(items, date), [items, date]);
+  const active = useMemo(() => activePlanForDate(items, date), [items, date]);
 
   const onOpen = (id: string) => {
     Haptics.selectionAsync().catch(() => undefined);
@@ -67,8 +73,8 @@ export default function DayPlansScreen() {
   const onActivate = (plan: SavedItinerary) => {
     Haptics.selectionAsync().catch(() => undefined);
     Alert.alert(
-      'Set as today\u2019s plan?',
-      `\u201C${plan.title}\u201D will show on your home screen as today\u2019s plan.`,
+      'Set as the active plan?',
+      `\u201C${plan.title}\u201D will show on your home screen for this day.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -98,7 +104,7 @@ export default function DayPlansScreen() {
           onPress: () => {
             // Pop back to home when this was the last plan for the day, so the
             // user isn't left staring at an empty "Today's plans" screen.
-            const isLast = plansForDate(items, today).length <= 1;
+            const isLast = plansForDate(items, date).length <= 1;
             remove(plan.id);
             Haptics.notificationAsync(
               Haptics.NotificationFeedbackType.Success,
@@ -116,8 +122,8 @@ export default function DayPlansScreen() {
       edges={['top', 'bottom']}
     >
       <TopBar
-        kicker={formatLongDate(today)}
-        title={'Today\u2019s plans'}
+        kicker={formatLongDate(date)}
+        title={isThatToday ? 'Today\u2019s plans' : 'Plans'}
         left={{
           icon: 'chevron-back',
           onPress: () => router.back(),
@@ -144,7 +150,7 @@ export default function DayPlansScreen() {
               color={t.colors.textTertiary}
             />
             <Text variant="body" tone="secondary" style={styles.emptyText}>
-              No plans for today yet.
+              {isThatToday ? 'No plans for today yet.' : 'No plans for this day yet.'}
             </Text>
           </View>
         ) : (

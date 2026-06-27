@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, StyleSheet, View } from 'react-native';
-import { BottomSheetScrollView } from '@gorhom/bottom-sheet';
+import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { BottomSheetScrollView, BottomSheetTextInput } from '@gorhom/bottom-sheet';
 import { Ionicons } from '@expo/vector-icons';
 import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -10,7 +10,13 @@ import { useTheme } from '@/theme/useTheme';
 import { Text } from './Text';
 import { Button } from './Button';
 import { ENTER, EXIT } from './errandDrawerAnim';
-import { discoverPlaces, type DiscoverResult } from '@/lib/discover';
+import {
+  detectDiscovery,
+  discoverPlaces,
+  normalizeDiscoveryQuery,
+  type DiscoverResult,
+  type DiscoveryIntent,
+} from '@/lib/discover';
 import { formatDistance, type Coords, type NearbyPlace } from '@/lib/places';
 import { collectDayAnchors, nearestAnchor, type DayAnchor } from '@/lib/dayAnchors';
 import { travelIconName } from '@/lib/travel';
@@ -29,7 +35,6 @@ const ON_FAINT = 'rgba(255, 255, 255, 0.40)';
 // brighter inset for the AI blurb so it reads as a panel-within-a-panel.
 const GLASS_TINT = 'rgba(18, 18, 24, 0.55)';
 const GLASS_BORDER = 'rgba(255, 255, 255, 0.14)';
-const GLASS_INSET = 'rgba(255, 255, 255, 0.09)';
 const ACCENT_ON_GLASS = '#5AC8FA';
 
 interface Props {
@@ -48,12 +53,37 @@ interface Props {
    * anchorDate, each card shows open/closed AT that planned time instead of
    * "right now" — "open now" is irrelevant when planning for later. */
   anchorTime: string | null;
-  /** Picked a candidate → hand back to the drawer to seed the confirm form. */
-  onPick: (place: NearbyPlace) => void;
-  /** Skip the suggestions and fill the form by hand. */
-  onManual: () => void;
-  /** Defer the venue choice to the day-planner ("Let Diem pick the spot"). */
-  onAutoPlan: () => void;
+  /** Picked a candidate → hand back to the drawer to seed the confirm form. The
+   * live "what" travels too, so a refined search ("sushi") titles the errand. */
+  onPick: (place: NearbyPlace, query: string) => void;
+  /** Skip the suggestions and fill the form by hand (carries the live "what"). */
+  onManual: (query: string) => void;
+}
+
+/**
+ * Rebuilds an editable one-line phrase from a split search shape so the refine
+ * input opens pre-filled and the user can tweak it ("lunch" → "lunch around
+ * Karlín"). The inverse of {@link detectDiscovery}.
+ */
+function composePhrase(query: string, area: string | null, nearby: boolean): string {
+  const q = (query ?? '').trim();
+  if (area && area.trim()) return `${q} around ${area.trim()}`;
+  if (nearby) return `${q} nearby`;
+  return q;
+}
+
+/** Capitalises the first letter so "home"/"you" read as "Home"/"You" on a chip
+ *  while real place names (already cased) pass through unchanged. */
+function capitalizeLabel(s: string): string {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+/** The glyph for a place chip without a photo: home, the live position, or a
+ *  generic pin for an errand venue. */
+function anchorIcon(kind: DayAnchor['kind']): keyof typeof Ionicons.glyphMap {
+  if (kind === 'home') return 'home';
+  if (kind === 'current') return 'navigate';
+  return 'location';
 }
 
 /**
@@ -72,14 +102,22 @@ export function ErrandDiscoverStep({
   anchorTime,
   onPick,
   onManual,
-  onAutoPlan,
 }: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
-  const [loading, setLoading] = useState(true);
+  // The search only runs once the user has written something, so we start idle
+  // unless the parent arrives with a query already (the home composer path).
+  const [loading, setLoading] = useState(() => (query ?? '').trim().length > 0);
   const [result, setResult] = useState<DiscoverResult | null>(null);
   const [version, setVersion] = useState(0);
   const reqRef = useRef(0);
+
+  // The LIVE search shape driving the fetch, and the editable phrase behind it.
+  // Both are seeded ONCE from the parent (empty for the form's "Discover", or the
+  // line the user already typed in the home composer) and from then on belong to
+  // the user — we never auto-fill or auto-update the box from the errand title.
+  const [search, setSearch] = useState<DiscoveryIntent>({ query, area, nearby });
+  const [text, setText] = useState(() => composePhrase(query, area, nearby));
 
   // The day's other located errands — the "stops" each candidate's closeness is
   // measured against ("≈12 min from Dentist"), so picking a place is informed by
@@ -90,15 +128,39 @@ export function ErrandDiscoverStep({
     [errands, anchorDate],
   );
 
-  // Refetch whenever the search shape changes (a new discovery submit) or the
-  // user hits retry. Guarded so a stale in-flight call can't overwrite a newer
-  // one, and so we never setState after the drawer closes.
+  // Optionally anchor the search on one of those stops: the user taps a day
+  // errand to mean "near here", then just describes WHAT to find ("coffee").
+  // The anchor's coordinate becomes the search center, overriding area/nearby.
+  const [anchorId, setAnchorId] = useState<string | null>(null);
+  const anchor = useMemo(
+    () => dayStops.find((s) => s.id === anchorId) ?? null,
+    [dayStops, anchorId],
+  );
+
+  // Fetch only once there's a written query (a submit), the anchor changes, or
+  // on retry. With no query we sit on the prompt state. Guarded so a stale
+  // in-flight call can't overwrite a newer one, nor setState after close.
+  const hasQuery = search.query.trim().length > 0;
   useEffect(() => {
+    if (!hasQuery) {
+      setLoading(false);
+      setResult(null);
+      return;
+    }
     const id = (reqRef.current += 1);
     let cancelled = false;
     setLoading(true);
     setResult(null);
-    discoverPlaces({ query, area, nearby, fallbackCenter })
+    discoverPlaces({
+      query: search.query,
+      // An anchored search is centered on the stop; otherwise honour the typed
+      // "near X" / "nearby" the parser pulled out of the phrase.
+      area: anchor ? null : search.area,
+      nearby: anchor ? false : search.nearby,
+      center: anchor?.coords ?? null,
+      centerLabel: anchor?.label ?? null,
+      fallbackCenter,
+    })
       .then((res) => {
         if (!cancelled && id === reqRef.current) setResult(res);
       })
@@ -112,27 +174,160 @@ export function ErrandDiscoverStep({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, area, nearby, fallbackCenter?.latitude, fallbackCenter?.longitude, version]);
+  }, [
+    hasQuery,
+    search.query,
+    search.area,
+    search.nearby,
+    anchor?.id,
+    anchor?.coords.latitude,
+    anchor?.coords.longitude,
+    fallbackCenter?.latitude,
+    fallbackCenter?.longitude,
+    version,
+  ]);
 
-  const where = whereLabel({ result, nearby, area });
+  // Run the search from the typed phrase: split it into what/where/nearby
+  // (reusing the home composer's parser), falling back to the whole line as the
+  // "what" when it isn't discovery-shaped (a bare "sushi").
+  const submitSearch = () => {
+    const raw = text.trim();
+    if (!raw) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    const next: DiscoveryIntent =
+      detectDiscovery(raw) ?? { query: normalizeDiscoveryQuery(raw), area: null, nearby: false };
+    setSearch(next);
+  };
+
+  const where = anchor
+    ? `Near ${anchor.label}`
+    : whereLabel({ result, nearby: search.nearby, area: search.area });
   const places = result?.places ?? [];
 
   return (
     <>
-      <Animated.View entering={ENTER(0)} exiting={EXIT(0)} style={styles.context}>
-        <View style={[styles.contextIcon, { backgroundColor: t.colors.fill1 }]}>
-          <Ionicons name="location-outline" size={15} color={t.colors.accent} />
-        </View>
-        <View style={{ flex: 1 }}>
-          <Text variant="body" weight="semibold" numberOfLines={1} tight>
-            {capitalize(query)}
-          </Text>
-          {where ? (
-            <Text variant="caption" tone="secondary" numberOfLines={1}>
-              {where}
-            </Text>
+      <Animated.View entering={ENTER(0)} exiting={EXIT(0)} style={styles.searchWrap}>
+        {/* The refine bar: edit the phrase to re-run discovery ("lunch around
+            Karlín"). Submitting re-parses what/where/nearby and refetches. */}
+        <View
+          style={[
+            styles.searchBar,
+            { backgroundColor: t.colors.fill1, borderColor: t.colors.separator },
+          ]}
+        >
+          <Ionicons name="search" size={16} color={t.colors.textTertiary} />
+          <BottomSheetTextInput
+            value={text}
+            onChangeText={setText}
+            onSubmitEditing={submitSearch}
+            placeholder={anchor ? `What near ${anchor.label}? e.g. coffee` : 'e.g. lunch around Karlín'}
+            placeholderTextColor={t.colors.textTertiary}
+            returnKeyType="search"
+            autoCapitalize="none"
+            autoCorrect={false}
+            autoFocus={(query ?? '').trim().length === 0}
+            style={[styles.searchInput, { color: t.colors.textPrimary }]}
+          />
+          {text.trim() ? (
+            <Pressable
+              onPress={submitSearch}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel="Search"
+            >
+              <Ionicons name="arrow-forward-circle" size={24} color={t.colors.accent} />
+            </Pressable>
           ) : null}
         </View>
+        {/* Anchor the search on one of the day's places — tap a card to mean
+            "near here", then just describe WHAT to find. Tap again to clear. */}
+        {dayStops.length > 0 ? (
+          <View style={styles.anchorBlock}>
+            <Text variant="caption" tone="tertiary">
+              {anchor
+                ? `Searching near ${capitalizeLabel(anchor.label)} — tap again to clear`
+                : "Looking near one of today's places? Tap one to search around it."}
+            </Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={styles.anchorRowContent}
+            >
+              {dayStops.map((stop) => {
+                const selected = stop.id === anchorId;
+                return (
+                  <Pressable
+                    key={stop.id}
+                    onPress={() => {
+                      Haptics.selectionAsync().catch(() => undefined);
+                      setAnchorId(selected ? null : stop.id);
+                    }}
+                    style={[
+                      styles.anchorChip,
+                      {
+                        backgroundColor: selected ? t.colors.accent : t.colors.fill1,
+                        borderColor: t.colors.accent,
+                      },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected }}
+                    accessibilityLabel={`Search near ${stop.label}`}
+                  >
+                    {stop.photoUrl ? (
+                      <Image source={{ uri: stop.photoUrl }} style={styles.anchorThumb} />
+                    ) : (
+                      <View
+                        style={[
+                          styles.anchorThumb,
+                          styles.anchorThumbIcon,
+                          {
+                            backgroundColor: selected
+                              ? 'rgba(255,255,255,0.22)'
+                              : t.colors.fill2,
+                          },
+                        ]}
+                      >
+                        <Ionicons
+                          name={anchorIcon(stop.kind)}
+                          size={14}
+                          color={selected ? t.colors.textOnAccent : t.colors.accent}
+                        />
+                      </View>
+                    )}
+                    <Text
+                      variant="caption"
+                      weight="bold"
+                      numberOfLines={1}
+                      style={{
+                        color: selected ? t.colors.textOnAccent : t.colors.textPrimary,
+                      }}
+                    >
+                      {capitalizeLabel(stop.label)}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          </View>
+        ) : null}
+        {where || result?.curated ? (
+          <View style={styles.subRow}>
+            {where ? (
+              <Text variant="caption" tone="secondary" numberOfLines={1} style={{ flexShrink: 1 }}>
+                {where}
+              </Text>
+            ) : null}
+            {result?.curated ? (
+              <View style={[styles.curatedPill, { backgroundColor: t.colors.fill1 }]}>
+                <Ionicons name="sparkles" size={10} color={t.colors.accent} />
+                <Text variant="caption" weight="semibold" style={{ color: t.colors.accent }} tight>
+                  Curated
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
       </Animated.View>
 
       <BottomSheetScrollView
@@ -146,6 +341,16 @@ export function ErrandDiscoverStep({
             <ActivityIndicator color={t.colors.accent} />
             <Text variant="body" weight="semibold" tone="secondary">
               Finding places…
+            </Text>
+          </View>
+        ) : !hasQuery ? (
+          <View style={styles.state}>
+            <Ionicons name="search-outline" size={28} color={t.colors.textTertiary} />
+            <Text variant="body" weight="semibold" tone="secondary" style={styles.stateText}>
+              What are you looking for?
+            </Text>
+            <Text variant="bodySm" tone="tertiary" style={styles.stateText}>
+              Type a place to find above — like “lunch around Karlín” or “pharmacy nearby”.
             </Text>
           </View>
         ) : places.length === 0 ? (
@@ -179,7 +384,7 @@ export function ErrandDiscoverStep({
               anchorTime={anchorTime}
               onPress={() => {
                 Haptics.selectionAsync().catch(() => undefined);
-                onPick(p);
+                onPick(p, search.query);
               }}
             />
           ))
@@ -195,22 +400,11 @@ export function ErrandDiscoverStep({
         ]}
       >
         <Button
-          title="Let Diem pick the spot"
-          variant="tonal"
-          leftIcon={<Ionicons name="sparkles" size={16} color={t.colors.accent} />}
-          onPress={() => {
-            Haptics.selectionAsync().catch(() => undefined);
-            onAutoPlan();
-          }}
-          fullWidth
-          size="lg"
-        />
-        <Button
-          title="Enter details manually"
+          title="Enter a place manually"
           variant="ghost"
           onPress={() => {
             Haptics.selectionAsync().catch(() => undefined);
-            onManual();
+            onManual(search.query);
           }}
           fullWidth
           size="md"
@@ -401,26 +595,69 @@ function whereLabel({
   return 'Near you';
 }
 
-function capitalize(s: string): string {
-  const trimmed = (s ?? '').trim();
-  return trimmed ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : trimmed;
-}
-
 const styles = StyleSheet.create({
-  context: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
+  searchWrap: {
     paddingHorizontal: 16,
     paddingTop: 2,
     paddingBottom: 10,
+    gap: 8,
   },
-  contextIcon: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
+  searchBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    minHeight: 44,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 16,
+    paddingVertical: 10,
+  },
+  anchorBlock: {
+    gap: 8,
+  },
+  anchorRowContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 2,
+    paddingRight: 8,
+  },
+  anchorChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    maxWidth: 200,
+    paddingVertical: 4,
+    paddingLeft: 4,
+    paddingRight: 13,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  anchorThumb: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+  },
+  anchorThumbIcon: {
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  subRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  curatedPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
   },
   scroll: {
     flex: 1,

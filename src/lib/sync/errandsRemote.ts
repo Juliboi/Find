@@ -13,7 +13,7 @@
  * the next successful pull/flush instead of blocking the UI.
  */
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
-import type { Errand } from '@/store/useErrandsStore';
+import type { Errand, TravelPref } from '@/store/useErrandsStore';
 import type { VenueOpeningHours } from '@/types/itinerary';
 
 const TABLE = 'errands';
@@ -35,8 +35,7 @@ interface ErrandRow {
   rating_count: number | null;
   price_level: number | null;
   opening_hours: VenueOpeningHours | null;
-  auto_place: boolean | null;
-  place_query: string | null;
+  travel_mode: string | null;
   notes: string | null;
   raw_text: string;
   planned_date: string | null;
@@ -63,8 +62,10 @@ function rowToErrand(r: ErrandRow): Errand {
     ratingCount: r.rating_count ?? undefined,
     priceLevel: r.price_level ?? undefined,
     openingHours: r.opening_hours ?? undefined,
-    autoPlace: r.auto_place ?? undefined,
-    placeQuery: r.place_query ?? undefined,
+    travelMode:
+      r.travel_mode === 'commute' || r.travel_mode === 'car'
+        ? (r.travel_mode as TravelPref)
+        : undefined,
     notes: r.notes ?? undefined,
     rawText: r.raw_text ?? '',
     plannedDate: r.planned_date ?? undefined,
@@ -93,8 +94,7 @@ function errandToRow(e: Errand, userId: string): ErrandRow {
     rating_count: e.ratingCount ?? null,
     price_level: e.priceLevel ?? null,
     opening_hours: e.openingHours ?? null,
-    auto_place: e.autoPlace ?? null,
-    place_query: e.placeQuery ?? null,
+    travel_mode: e.travelMode ?? null,
     notes: e.notes ?? null,
     raw_text: e.rawText ?? '',
     planned_date: e.plannedDate ?? null,
@@ -120,26 +120,49 @@ export async function pullErrands(userId: string): Promise<Errand[] | null> {
   return (data as ErrandRow[]).map(rowToErrand);
 }
 
+/**
+ * Upsert errand rows, tolerating a server that predates the `travel_mode` column
+ * (migration 0013). If the upsert is rejected because that column is missing, we
+ * strip it and retry ONCE so the rest of the row still syncs — the preference
+ * just stays local until the migration lands, after which full rows sync with no
+ * code change. Fire-and-forget; never throws.
+ */
+function upsertErrandRows(rows: ErrandRow[]): void {
+  if (!supabase || rows.length === 0) return;
+  void supabase
+    .from(TABLE)
+    .upsert(rows)
+    .then(({ error }) => {
+      if (!error) return;
+      const msg = `${error.message ?? ''} ${(error as { details?: string }).details ?? ''}`;
+      if (msg.toLowerCase().includes('travel_mode')) {
+        const stripped = rows.map((r) => {
+          const rest = { ...r } as Partial<ErrandRow>;
+          delete rest.travel_mode;
+          return rest;
+        });
+        void supabase!
+          .from(TABLE)
+          .upsert(stripped)
+          .then(({ error: retryError }) => {
+            if (retryError) console.warn('[errands-sync] push failed', retryError.message);
+          });
+        return;
+      }
+      console.warn('[errands-sync] push failed', error.message);
+    });
+}
+
 /** Upsert one errand. Fire-and-forget — never throws. */
 export function pushErrand(errand: Errand, userId: string): void {
   if (!isSupabaseConfigured || !supabase) return;
-  void supabase
-    .from(TABLE)
-    .upsert(errandToRow(errand, userId))
-    .then(({ error }) => {
-      if (error) console.warn('[errands-sync] push failed', error.message);
-    });
+  upsertErrandRows([errandToRow(errand, userId)]);
 }
 
 /** Upsert many errands in one round-trip (used to flush local-only rows). */
 export function pushErrands(errands: Errand[], userId: string): void {
   if (!isSupabaseConfigured || !supabase || errands.length === 0) return;
-  void supabase
-    .from(TABLE)
-    .upsert(errands.map((e) => errandToRow(e, userId)))
-    .then(({ error }) => {
-      if (error) console.warn('[errands-sync] bulk push failed', error.message);
-    });
+  upsertErrandRows(errands.map((e) => errandToRow(e, userId)));
 }
 
 /** Delete one errand by id. Fire-and-forget — never throws. */

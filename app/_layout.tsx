@@ -235,6 +235,7 @@ export default function RootLayout() {
             />
             <Stack.Screen name="itinerary" />
             <Stack.Screen name="day-plans" />
+            <Stack.Screen name="day-calendar" />
             <Stack.Screen
               name="discover-sandbox"
               options={{

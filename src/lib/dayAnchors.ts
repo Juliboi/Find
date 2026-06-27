@@ -17,10 +17,33 @@ export type DayAnchorKind = 'current' | 'home' | 'errand';
 
 export interface DayAnchor {
   id: string;
-  /** Short human label: an errand title, or "home" / "you". */
+  /** Short human label: a PLACE name (e.g. "Cafedu", "Karlín"), or "home" /
+   * "you". Deliberately the venue, NOT the errand title — the day moves through
+   * places, and two errands at one venue share a single anchor. */
   label: string;
   coords: Coords;
   kind: DayAnchorKind;
+  /** The place's photo (when it came from a resolved venue), for richer chips. */
+  photoUrl?: string;
+}
+
+/**
+ * A short, chip-sized place label from an errand's freeform address. Venue names
+ * ("Cafedu") have no comma and pass through; a full street address
+ * ("Pekařova 859/12, Prague, Czechia") collapses to its leading segment so the
+ * chip reads as the place, not a paragraph.
+ */
+function shortPlaceLabel(address?: string): string | null {
+  const a = (address ?? '').trim();
+  if (!a) return null;
+  return a.split(',')[0]!.trim() || null;
+}
+
+/** Stable key that groups errands at the SAME place: a shared Google placeId, or
+ *  failing that the rounded coordinate (~11 m). Lets duplicates collapse. */
+function placeKey(e: Pick<Errand, 'placeId' | 'latitude' | 'longitude'>): string {
+  if (e.placeId) return `id:${e.placeId}`;
+  return `xy:${e.latitude!.toFixed(4)},${e.longitude!.toFixed(4)}`;
 }
 
 /**
@@ -43,18 +66,30 @@ export function collectDayAnchors(opts: {
     anchors.push({ id: 'current', label: 'you', coords: current, kind: 'current' });
   }
 
+  // Collapse multiple errands at one venue into a single place anchor (keyed by
+  // placeId / rounded coords), so e.g. two errands at "Cafedu" surface as ONE
+  // chip. Backfill a photo from whichever same-place errand has one.
+  const byPlace = new Map<string, DayAnchor>();
   for (const e of errands) {
     if (excludeErrandId && e.id === excludeErrandId) continue;
     if (date && e.date !== date) continue;
     if (e.done) continue;
     if (e.latitude == null || e.longitude == null) continue;
-    anchors.push({
+    const key = placeKey(e);
+    const existing = byPlace.get(key);
+    if (existing) {
+      if (!existing.photoUrl && e.photoUrl) existing.photoUrl = e.photoUrl;
+      continue;
+    }
+    byPlace.set(key, {
       id: e.id,
-      label: e.title,
+      label: shortPlaceLabel(e.address) ?? e.title,
       coords: { latitude: e.latitude, longitude: e.longitude },
       kind: 'errand',
+      photoUrl: e.photoUrl,
     });
   }
+  for (const a of byPlace.values()) anchors.push(a);
 
   if (home) {
     anchors.push({

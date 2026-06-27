@@ -26,9 +26,6 @@ import type { VenueOpeningHours } from '@/types/itinerary';
  *                        the `(6) PLANNER INPUT` log's `anchors` array. THIS is
  *                        how you pin "Massage → your Korunní TAWAN" instead of
  *                        letting the resolver pick the Hilton branch.
- *   • `autoPlaceQuery` — a search string; Diem picks the venue (may differ run to
- *                        run — this is what put Tawan at Hilton). Use only when
- *                        you don't care about the exact branch.
  *   • neither          — a place-less task (online / at-home, e.g. a video call).
  * ─────────────────────────────────────────────────────────────────────────────
  */
@@ -62,8 +59,6 @@ interface TestErrand {
     priceLevel?: number;
     openingHours?: VenueOpeningHours;
   };
-  /** OR a search string for Diem to resolve (only when `place` is omitted). */
-  autoPlaceQuery?: string;
 }
 
 /** A plain 7-day "HH:MM–HH:MM" weekly schedule for a venue's opening hours. */
@@ -79,14 +74,23 @@ function weeklyHours(openHour: number, closeHour: number): VenueOpeningHours {
 const TEST_ERRANDS: TestErrand[] = [
   {
     title: 'Teeth whitening',
-    // TODO: paste your exact Premier Clinic venue into `place` to pin it.
-    autoPlaceQuery: 'Premier Clinic, Prague',
+    // Verbatim located errand. Swap for your exact Premier Clinic venue (paste
+    // from the `(6) PLANNER INPUT` log) to pin the precise branch.
+    place: {
+      name: 'Premier Clinic, Prague',
+      latitude: 50.0796,
+      longitude: 14.4304,
+    },
   },
   {
     title: 'Deep work',
     durationMin: 120,
-    // TODO: paste your exact Space Café venue into `place` to pin it.
-    autoPlaceQuery: 'Space Café Karlín, Prague',
+    // Verbatim located errand. Swap for your exact Space Café venue to pin it.
+    place: {
+      name: 'Space Café Karlín, Prague',
+      latitude: 50.0925,
+      longitude: 14.4509,
+    },
   },
   {
     // Place-less: the title has "online", so the planner keeps it at home and
@@ -139,7 +143,7 @@ export interface SeedTestPlanResult {
  *   1. Remove prior DEBUG errands (`source: 'test'`) + tomorrow's brain-made
  *      freestyle errands. NEVER touches your real ('user') errands.
  *   2. Create the {@link TEST_ERRANDS} fresh, dated tomorrow, tagged 'test'
- *      (verbatim venue / autoPlace / place-less, per entry).
+ *      (verbatim venue / place-less, per entry).
  *   3. Pin the day frame: home → home, 08:30 → 23:00, tomorrow.
  *
  * Returns the day + the free-text intent for the caller to auto-plan with.
@@ -173,7 +177,7 @@ export function seedTestPlan(): SeedTestPlanResult {
     let venue: string;
     if (t.place) {
       // A verbatim located errand: an `address` makes the coords + metadata
-      // stick (see normalizeInput), and clears any autoPlace flag.
+      // stick (see normalizeInput).
       input.address = t.place.name;
       input.latitude = t.place.latitude;
       input.longitude = t.place.longitude;
@@ -184,10 +188,6 @@ export function seedTestPlan(): SeedTestPlanResult {
       input.priceLevel = t.place.priceLevel;
       input.openingHours = t.place.openingHours;
       venue = `VERBATIM "${t.place.name}" (${t.place.latitude}, ${t.place.longitude})`;
-    } else if (t.autoPlaceQuery) {
-      input.autoPlace = true;
-      input.placeQuery = t.autoPlaceQuery;
-      venue = `autoPlace "${t.autoPlaceQuery}"`;
     } else {
       venue = 'place-less (at-home / online)';
     }

@@ -11,6 +11,15 @@ import {
 } from '@/lib/sync/errandsRemote';
 
 /**
+ * How the user wants to TRAVEL to a located errand: `'commute'` (walk / public
+ * transport — the planner auto-picks walk or transit by distance, never a car)
+ * or `'car'` (route by car when one is available). Only meaningful alongside a
+ * resolved location. When unset, the planner falls back to the user's default —
+ * `'car'` if they own one, else `'commute'` (see `applyErrandTravelModes`).
+ */
+export type TravelPref = 'commute' | 'car';
+
+/**
  * An "errand" is a lightweight reminder / task the user jots down from the home
  * composer — "call mom", "dentist at 18:00", "visit dentist at Pirktova". Unlike
  * a planned day item it is NOT yet scheduled: any of its slots can be empty
@@ -62,17 +71,12 @@ export interface Errand {
   priceLevel?: number;
   openingHours?: VenueOpeningHours;
   /**
-   * "Let AI plan it": the user deliberately did NOT pin a venue. When this
-   * errand is folded into a plan the day-planner finds the best spot for
-   * `placeQuery` (closest / least detour / open at the time). Mutually exclusive
-   * with a resolved `address` + coords — a real picked place clears it.
+   * How the user wants to get here — `'commute'` or `'car'`. Only ever set on a
+   * LOCATED errand (a resolved place with coords); cleared when the place is.
+   * Feeds the planner so the route to this stop is driven / transited
+   * accordingly. Unset = use the user's default (car if they own one).
    */
-  autoPlace?: boolean;
-  /**
-   * The place CATEGORY to auto-find ("grocery store", "gas station"), carried
-   * from the discovery query. Only meaningful alongside `autoPlace`.
-   */
-  placeQuery?: string;
+  travelMode?: TravelPref;
   /** Optional extra note the parser pulled out. */
   notes?: string;
   /**
@@ -124,8 +128,7 @@ export type ErrandInput = Pick<
   | 'ratingCount'
   | 'priceLevel'
   | 'openingHours'
-  | 'autoPlace'
-  | 'placeQuery'
+  | 'travelMode'
   | 'notes'
   | 'source'
   | 'rawText'
@@ -189,6 +192,11 @@ function numOrUndef(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** Keep only a valid travel preference; anything else → undefined. */
+function cleanMode(value: unknown): TravelPref | undefined {
+  return value === 'commute' || value === 'car' ? value : undefined;
+}
+
 /** Keep opening hours only when they carry something usable. */
 function cleanHours(
   v: VenueOpeningHours | null | undefined,
@@ -202,9 +210,6 @@ function cleanHours(
 
 function normalizeInput(input: ErrandInput): ErrandInput {
   const address = clean(input.address);
-  // Auto-place ("Let AI plan it") only applies when the user did NOT pin a real
-  // place — a resolved address always wins and clears the flag.
-  const autoPlace = !address && input.autoPlace === true;
   // All place metadata is meaningless without an address — drop it wholesale
   // when there's no place, so a cleared address can't leave a stale photo/pin.
   return {
@@ -222,8 +227,9 @@ function normalizeInput(input: ErrandInput): ErrandInput {
     ratingCount: address ? numOrUndef(input.ratingCount) : undefined,
     priceLevel: address ? numOrUndef(input.priceLevel) : undefined,
     openingHours: address ? cleanHours(input.openingHours) : undefined,
-    autoPlace: autoPlace ? true : undefined,
-    placeQuery: autoPlace ? clean(input.placeQuery) ?? clean(input.title) : undefined,
+    // A travel preference only means something with a destination — drop it for
+    // an "Anywhere" errand so a cleared place can't leave a stale mode behind.
+    travelMode: address ? cleanMode(input.travelMode) : undefined,
     notes: clean(input.notes),
     source:
       input.source === 'freestyle'
@@ -246,7 +252,17 @@ function mergeErrands(local: Errand[], remote: Errand[]): Errand[] {
   for (const e of local) byId.set(e.id, e);
   for (const r of remote) {
     const l = byId.get(r.id);
-    if (!l || r.updatedAt >= l.updatedAt) byId.set(r.id, r);
+    if (!l || r.updatedAt >= l.updatedAt) {
+      // `travelMode` may not be on the server yet (migration 0013): keep the
+      // local choice when the remote copy carries none, so a pull can't wipe a
+      // preference set offline / before the column existed.
+      byId.set(
+        r.id,
+        l && r.travelMode === undefined && l.travelMode !== undefined
+          ? { ...r, travelMode: l.travelMode }
+          : r,
+      );
+    }
   }
   return [...byId.values()].slice(0, MAX_ERRANDS);
 }
@@ -303,12 +319,11 @@ export const useErrandsStore = create<ErrandsState>()(
             if ('date' in patch) next.date = clean(patch.date);
             if ('notes' in patch) next.notes = clean(patch.notes);
             if ('rawText' in patch) next.rawText = clean(patch.rawText) ?? e.rawText;
-            // Address, auto-place, and place metadata move together. A real
-            // picked address resets coords/photo/rating/hours AND clears
-            // auto-place; an explicit auto-place (no address) clears the pin.
-            if ('address' in patch || 'autoPlace' in patch || 'placeQuery' in patch) {
+            if ('travelMode' in patch) next.travelMode = cleanMode(patch.travelMode);
+            // Address + place metadata move together. A real picked address
+            // resets coords/photo/rating/hours; clearing it drops them all.
+            if ('address' in patch) {
               const addr = clean(patch.address);
-              const auto = !addr && patch.autoPlace === true;
               next.address = addr;
               next.latitude = addr ? numOrUndef(patch.latitude) : undefined;
               next.longitude = addr ? numOrUndef(patch.longitude) : undefined;
@@ -318,10 +333,8 @@ export const useErrandsStore = create<ErrandsState>()(
               next.ratingCount = addr ? numOrUndef(patch.ratingCount) : undefined;
               next.priceLevel = addr ? numOrUndef(patch.priceLevel) : undefined;
               next.openingHours = addr ? cleanHours(patch.openingHours) : undefined;
-              next.autoPlace = auto ? true : undefined;
-              next.placeQuery = auto
-                ? clean(patch.placeQuery) ?? next.placeQuery ?? clean(next.title)
-                : undefined;
+              // A travel preference is meaningless without a destination.
+              next.travelMode = next.address ? next.travelMode : undefined;
             }
             return next;
           }),

@@ -9,6 +9,7 @@ import {
   useRecurringErrandsStore,
   type RecurringErrand,
 } from '@/store/useRecurringErrandsStore';
+import { propagateRecurringEdit } from '@/lib/recurring';
 import { formatTime } from '@/utils/time';
 
 interface Props {
@@ -36,7 +37,6 @@ function subtitle(errand: RecurringErrand): string {
   const parts = [weekdaysLabel(errand.weekdays)];
   if (errand.startTime) parts.push(formatTime(errand.startTime));
   if (errand.address) parts.push(errand.address);
-  else if (errand.autoPlace) parts.push('Diem picks the spot');
   return parts.join(' · ');
 }
 
@@ -127,8 +127,12 @@ export function RecurringErrandManager({ editId }: Props) {
         onClose={() => setEditing(null)}
         errand={editingErrand}
         onSubmit={(input) => {
-          if (editingErrand) update(editingErrand.id, input);
-          else add(input);
+          if (editingErrand) {
+            update(editingErrand.id, input);
+            // Push the edit onto occurrences already on screen (the idempotent
+            // materializer won't), so existing days reflect the new rule.
+            propagateRecurringEdit(editingErrand.id);
+          } else add(input);
         }}
         onDelete={editingErrand ? () => remove(editingErrand.id) : undefined}
       />

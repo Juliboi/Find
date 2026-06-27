@@ -49,36 +49,48 @@ import {
   type ErrandInput,
 } from '@/store/useErrandsStore';
 import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
-import { materializeRecurringForDate } from '@/lib/recurring';
+import {
+  materializeRecurringForDate,
+  recurringInstancesForDate,
+} from '@/lib/recurring';
 import { PlanSetupSheet } from '@/components/PlanSetupSheet';
+import { DayBalanceCard } from '@/components/DayBalanceCard';
 import { Card } from '@/components/Card';
 import { Text } from '@/components/Text';
 import { ErrandRow } from '@/components/ErrandRow';
 import { ErrandDrawer } from '@/components/ErrandDrawer';
-import { PlanComposer } from '@/components/PlanComposer';
-import type { ErrandDraft } from '@/lib/ai/parseErrand';
+import { Button } from '@/components/Button';
+import { type ErrandDraft } from '@/lib/ai/parseErrand';
 import { TripMap, type LatLng, type TripStop } from '@/components/TripMap';
 import {
   buildContextPayload,
   planItinerary,
+  sanitizeItinerary,
   type ItineraryDebug,
   type PlanAnchor,
   type PlanDayEdge,
   type PlanTask,
 } from '@/lib/ai/itinerary';
-import { decomposeIntent } from '@/lib/ai/decomposeIntent';
-import { composeItinerary } from '@/lib/ai/composeItinerary';
+import { composeItinerary, type ComposedBlock } from '@/lib/ai/composeItinerary';
+import {
+  orderDay,
+  fillDay,
+  type OrderDayErrand,
+  type FillStop,
+} from '@/lib/ai/composeV3';
+import { planDayV4, type V4Block } from '@/lib/ai/composeV4';
 import {
   assembleComposedDay,
+  lastComposedBlocks,
   type AssembleAnchor,
   type AssembleTask,
 } from '@/lib/ai/composeAssemble';
 import { refineItinerary } from '@/lib/ai/refineItinerary';
 import { recomputeItinerary } from '@/lib/ai/recomputeItinerary';
+import { applyErrandTravelModes } from '@/lib/itinerary/travelModes';
+import { scoreDay } from '@/lib/planning/mindfulness';
 import { requestAdjustOps } from '@/lib/ai/adjustItinerary';
 import { collectDayAnchors } from '@/lib/dayAnchors';
-import { resolveAutoPlaceVenues } from '@/lib/resolveAutoPlace';
-import type { NearbyPlace } from '@/lib/places';
 import {
   applyOp,
   applyRoutedLegs,
@@ -86,7 +98,6 @@ import {
   classifyReorder,
   describeOp,
   fitGapsToAnchors,
-  flatten,
   opNeedsRoute,
   type CascadeConflict,
   type EditOp,
@@ -102,7 +113,6 @@ import {
   type AbsSpan,
 } from '@/lib/itinerary/timeline';
 import { AdjustBar } from '@/components/AdjustBar';
-import { PlaceSwapSheet } from '@/components/PlaceSwapSheet';
 import { ItemActionsSheet } from '@/components/ItemActionsSheet';
 import { GapActionsSheet } from '@/components/GapActionsSheet';
 import { LegModeSheet } from '@/components/LegModeSheet';
@@ -123,6 +133,7 @@ import type { SchedulerContext } from '@/lib/ai/scheduler';
 import {
   addMinutes,
   currentHHMM,
+  errandTimeMode,
   formatDuration,
   formatTime,
   minutesOfDay,
@@ -137,6 +148,13 @@ import { getVenueHoursStatus } from '@/lib/itinerary/hours';
  * `false` to hide the pills again; the field stays in the data model.
  */
 const SHOW_FLEX_BADGES = true;
+
+/** One-line description of each planning pipeline for the drawer selector. */
+const PLANNER_MODE_HINT: Record<'v2' | 'v3' | 'v4', string> = {
+  v2: 'Unified: one compose brain + resolve/route',
+  v3: 'Staged: order → locate → route → fill',
+  v4: 'Solo: one grounded brain does it all',
+};
 
 /**
  * Dev logging verbosity for the `[day-snapshot]` dump. `false` (default) logs
@@ -183,6 +201,7 @@ function errandToDraft(e: Errand): ErrandDraft {
     ratingCount: e.ratingCount ?? null,
     priceLevel: e.priceLevel ?? null,
     openingHours: e.openingHours ?? null,
+    travelMode: e.travelMode ?? null,
     notes: e.notes ?? null,
   };
 }
@@ -270,6 +289,26 @@ const REMOTE_ACTIVITY_RE =
 function isRemoteActivity(...parts: (string | null | undefined)[]): boolean {
   const text = parts.filter(Boolean).join(' ');
   return !!text && REMOTE_ACTIVITY_RE.test(text);
+}
+
+/**
+ * Best-fit {@link ItineraryItemKind} for an errand, from a quick keyword scan of
+ * its title/notes. Only a hint for the V3 pipeline's first-pass blocks (icons +
+ * the fill brain's context); the brains/assembler can still refine it.
+ */
+function inferErrandKind(...parts: (string | null | undefined)[]): string {
+  const t = parts.filter(Boolean).join(' ').toLowerCase();
+  if (!t) return 'other';
+  if (/\b(breakfast|brunch|lunch|dinner|eat|meal|restaurant|food|café|cafe|coffee)\b/.test(t))
+    return 'meal';
+  if (/\b(gym|workout|run|yoga|swim|training|fitness|exercise|walk|hike)\b/.test(t))
+    return 'activity';
+  if (/\b(work|deep work|study|focus|coworking|email|prep|writing)\b/.test(t)) return 'work';
+  if (/\b(drinks|bar|pub|beer|wine|cocktail)\b/.test(t)) return 'drinks';
+  if (/\b(meet|meetup|catch up|see |with )\b/.test(t)) return 'meetup';
+  if (/\b(museum|gallery|sightsee|landmark|tour|explore)\b/.test(t)) return 'sightseeing';
+  if (/\b(show|concert|match|game|movie|cinema|event|class)\b/.test(t)) return 'event';
+  return 'activity';
 }
 
 /**
@@ -412,24 +451,6 @@ function coordKey(lat: number, lng: number): string {
   return `${lat.toFixed(5)},${lng.toFixed(5)}`;
 }
 
-/** Map a nearby-place search result into the itinerary's place shape — mirrors
- *  PlaceSwapSheet's `toItineraryPlace`, used to carry alternative candidates. */
-function nearbyToItineraryPlace(p: NearbyPlace, emoji?: string): ItineraryPlace {
-  return {
-    name: p.name,
-    category: p.types?.[0]?.replace(/_/g, ' '),
-    emoji,
-    address: p.address ?? undefined,
-    rating: p.rating ?? undefined,
-    ratingCount: p.ratingCount ?? undefined,
-    priceLevel:
-      typeof p.priceLevel === 'number' ? '$'.repeat(Math.max(1, p.priceLevel)) : undefined,
-    coords: { latitude: p.latitude, longitude: p.longitude },
-    photoUrl: p.photoUrl ?? undefined,
-    openingHours: p.openingHours ?? undefined,
-  };
-}
-
 /** Re-attach carried alternative venues onto the planned places that match
  *  them by coordinate. The base planner emits its own places (and skips lookups
  *  for fixed anchors), so alternatives from the discover pre-pass are merged
@@ -474,6 +495,9 @@ export default function ItineraryScreen() {
   const dietary = useProfileStore((s) => s.dietary);
   const dietaryNotes = useProfileStore((s) => s.dietaryNotes);
   const useCarToday = usePlanSetupStore((s) => s.useCarToday);
+  // Experimental planning pipeline selector (dev/testing control in the drawer).
+  const plannerMode = usePlanSetupStore((s) => s.plannerMode);
+  const setPlannerMode = usePlanSetupStore((s) => s.setPlannerMode);
   const planMealModes = usePlanSetupStore((s) => s.mealModes);
   const planMealLinks = usePlanSetupStore((s) => s.mealLinks);
   const saveItinerary = useSavedItineraries((s) => s.save);
@@ -528,7 +552,6 @@ export default function ItineraryScreen() {
     return scrubHomePlacesFromSaved(saved, home);
   }, [params.id, home]);
 
-  const [input, setInput] = useState('');
   const [itinerary, setItinerary] = useState<Itinerary | null>(preloaded);
   const [usedAi, setUsedAi] = useState(!!preloaded);
   // `loading` covers the BLOCKING planning call only — while it's true the
@@ -549,6 +572,11 @@ export default function ItineraryScreen() {
   const planSeqRef = useRef(0);
   const [debug, setDebug] = useState<ItineraryDebug | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // True when the user picked the v4 brain but it didn't finalise the plan (it
+  // timed out / errored) so a lesser pipeline produced what's on screen. Surfaced
+  // in the header so a fall-back is never invisible — the "I picked v4 but got
+  // the zig-zag day and didn't know it wasn't v4" trap.
+  const [v4FellBack, setV4FellBack] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
   const [activeStopId, setActiveStopId] = useState<string | null>(null);
@@ -561,8 +589,6 @@ export default function ItineraryScreen() {
   // --- live editing state ---------------------------------------------------
   // True while an edit is being applied (route refresh / AI re-plan in flight).
   const [editBusy, setEditBusy] = useState(false);
-  // The block whose venue the user is browsing alternatives for (place swap).
-  const [swapItem, setSwapItem] = useState<ItineraryItem | null>(null);
   // Conflicts surfaced by the last cascade — e.g. an edit pushed past a fixed
   // anchor. Rendered as a non-blocking banner; user picks how to resolve.
   const [conflicts, setConflicts] = useState<CascadeConflict[]>([]);
@@ -594,8 +620,11 @@ export default function ItineraryScreen() {
   const removeErrand = useErrandsStore((s) => s.remove);
   const reopenErrand = useErrandsStore((s) => s.reopen);
   const setErrandsPlanned = useErrandsStore((s) => s.setPlanned);
-  // Edit-drawer state — tapping an errand row opens it in (edit-only) mode.
+  // Errand-drawer state — tapping a row opens it in edit mode; the
+  // "+ New errand for this day" button opens it in create mode for the planned
+  // day. Both flows resolve a concrete location inside the drawer.
   const [errandDrawerOpen, setErrandDrawerOpen] = useState(false);
+  const [errandDrawerMode, setErrandDrawerMode] = useState<'create' | 'edit'>('edit');
   const [errandSeed, setErrandSeed] = useState<ErrandDraft>(EMPTY_ERRAND_DRAFT);
   const [errandRawText, setErrandRawText] = useState('');
   const [errandSeedKey, setErrandSeedKey] = useState('errand-0');
@@ -636,6 +665,10 @@ export default function ItineraryScreen() {
   );
   // The drawer plans ONE day, so its scheduled group is just that day's open
   // errands (other days live on the home list); anytime + completed follow.
+  // `dayErrands` stays the FULL set (recurring occurrences included) so the
+  // preselect + fold-into-plan bookkeeping below treats them like any other of
+  // the day's errands; the render below splits the recurring ones into their
+  // own "Repeats" section (mirroring the home screen) without affecting that.
   const dayErrands = useMemo(
     () => errandGroups.scheduled.filter((e) => e.date === effectiveDate),
     [errandGroups, effectiveDate],
@@ -652,6 +685,26 @@ export default function ItineraryScreen() {
   useEffect(() => {
     materializeRecurringForDate(effectiveDate);
   }, [effectiveDate, recurringTemplates]);
+
+  // The planned day's still-open recurring occurrences. They get their own
+  // "Repeats" section at the top of the list (with a repeat glyph) — exactly
+  // like the home screen — so the user can SEE them, distinct from one-off
+  // errands. They're still part of `dayErrands` above, so they stay preselected
+  // and fold into the plan unless the user unticks them.
+  const recurringDay = useMemo(
+    () => recurringInstancesForDate(errands, effectiveDate),
+    [errands, effectiveDate],
+  );
+  const recurringDayIds = useMemo(
+    () => new Set(recurringDay.map((e) => e.id)),
+    [recurringDay],
+  );
+  // The day group renders only the NON-recurring errands, so a recurring
+  // occurrence never shows twice (Repeats section + day group).
+  const dayOnlyErrands = useMemo(
+    () => dayErrands.filter((e) => !recurringDayIds.has(e.id)),
+    [dayErrands, recurringDayIds],
+  );
 
   // Open dated errands for the planned day are the user's clear intent, so they
   // get preselected. `groupErrands` already excludes done/planned ones.
@@ -686,9 +739,38 @@ export default function ItineraryScreen() {
     });
   }, [effectiveDate, dayErrandIds, seedSelectedErrands]);
 
+  // ----- Mindfulness / day balance (live as errands are ticked) -----
+  // Score the day the user is assembling: the ticked errands' hours + estimated
+  // travel (from where the day starts, through the located stops, back to where
+  // it ends) against the plan's window. Unticking an errand re-scores instantly,
+  // so a lighter, calmer day is something the user can feel before they plan.
+  const selectedErrands = useMemo(
+    () => errands.filter((e) => selectedErrandIds.has(e.id)),
+    [errands, selectedErrandIds],
+  );
+  const planScore = useMemo(
+    () =>
+      scoreDay({
+        startTime: planStartTime,
+        endTime: planEndTime,
+        errands: selectedErrands,
+        startAnchor: planStartLocation ?? home ?? null,
+        endAnchor: planEndLocation ?? home ?? null,
+      }),
+    [
+      planStartTime,
+      planEndTime,
+      selectedErrands,
+      planStartLocation,
+      planEndLocation,
+      home,
+    ],
+  );
+
   const onEditErrand = (errand: Errand) => {
     // No haptic here: ErrandRow's body tap already fires the selection tick, so
     // firing again would double up (matches the home screen's onEditErrand).
+    setErrandDrawerMode('edit');
     setEditErrandId(errand.id);
     setErrandRawText(errand.rawText);
     setErrandSeed(errandToDraft(errand));
@@ -696,8 +778,26 @@ export default function ItineraryScreen() {
     setErrandDrawerOpen(true);
   };
 
+  // "+ New errand for this day": open the drawer in create mode, pre-dated to
+  // the planned day so the new errand lands on it (and gets preselected below).
+  const openNewErrand = () => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setErrandDrawerMode('create');
+    setEditErrandId(null);
+    setErrandRawText('');
+    setErrandSeed({ ...EMPTY_ERRAND_DRAFT, date: effectiveDate });
+    setErrandSeedKey(`errand-new-${Date.now()}`);
+    setErrandDrawerOpen(true);
+  };
+
   const onSaveErrand = (patch: ErrandInput) => {
-    if (editErrandId) updateErrand(editErrandId, patch);
+    if (errandDrawerMode === 'edit' && editErrandId) {
+      updateErrand(editErrandId, patch);
+    } else {
+      // Create on the planned day and tick it so it folds into the next plan.
+      const newId = addErrand({ ...patch, date: patch.date ?? effectiveDate });
+      setSelectedErrandIds((prev) => new Set(prev).add(newId));
+    }
     setErrandDrawerOpen(false);
   };
 
@@ -950,6 +1050,7 @@ export default function ItineraryScreen() {
             usedAi,
             home: home?.label ?? null,
             endOfDay,
+            blocks: lastComposedBlocks,
             day: compactItinerary(itinerary),
           },
           null,
@@ -1116,38 +1217,41 @@ export default function ItineraryScreen() {
     [legMenuId, flatItems],
   );
 
-  // The located stops on either side of the venue being swapped. Walk the
-  // flat day outward from the target to the nearest items that actually
-  // have coordinates, falling back to home/origin at the day's edges (the
-  // day departs from and returns to home). Handing these to the swap sheet
-  // lets the search rank alternatives by how little they detour the route,
-  // instead of just "closest to the old pin" — which is what stops a swap
-  // from introducing a zig-zag.
-  const swapNeighbors = useMemo(() => {
-    if (!swapItem) return { prev: undefined, next: undefined };
+  // Search context for the per-card location editor: where to center a venue
+  // search and the located stops on either side. Walk the flat day outward
+  // from the open card to the nearest items that actually have coordinates,
+  // falling back to home/origin at the day's edges (the day departs from and
+  // returns to home). Handing these to the editor lets discovery rank options
+  // by how little they detour the route, instead of just "closest to the old
+  // pin" — which is what stops a change from introducing a zig-zag. The center
+  // is the card's own pin when it has one, else the nearest neighbour.
+  const menuSearch = useMemo(() => {
+    if (!menuItem) return { center: undefined, prev: undefined, next: undefined };
     const homeCoord = home
       ? { latitude: home.latitude, longitude: home.longitude }
       : undefined;
-    const idx = flatItems.findIndex((it) => it.id === swapItem.id);
-    if (idx === -1) return { prev: homeCoord, next: homeCoord };
+    const idx = flatItems.findIndex((it) => it.id === menuItem.id);
     let prev: { latitude: number; longitude: number } | undefined;
-    for (let i = idx - 1; i >= 0; i--) {
-      const c = flatItems[i]?.place?.coords;
-      if (c) {
-        prev = c;
-        break;
-      }
-    }
     let next: { latitude: number; longitude: number } | undefined;
-    for (let i = idx + 1; i < flatItems.length; i++) {
-      const c = flatItems[i]?.place?.coords;
-      if (c) {
-        next = c;
-        break;
+    if (idx !== -1) {
+      for (let i = idx - 1; i >= 0; i--) {
+        const c = flatItems[i]?.place?.coords;
+        if (c) {
+          prev = c;
+          break;
+        }
+      }
+      for (let i = idx + 1; i < flatItems.length; i++) {
+        const c = flatItems[i]?.place?.coords;
+        if (c) {
+          next = c;
+          break;
+        }
       }
     }
-    return { prev: prev ?? homeCoord, next: next ?? homeCoord };
-  }, [swapItem, flatItems, home]);
+    const center = menuItem.place?.coords ?? prev ?? next ?? homeCoord;
+    return { center, prev: prev ?? homeCoord, next: next ?? homeCoord };
+  }, [menuItem, flatItems, home]);
 
   const nowSectionIndex = useMemo(() => {
     if (!itinerary || !nowItemId) return -1;
@@ -1346,12 +1450,11 @@ export default function ItineraryScreen() {
   }): Promise<boolean> => {
     const { seq, text, userChosen } = run;
 
-    // Located errands (a placed pick) are FIXED geography the brain clusters
-    // around; everything else (auto-place, at-home/online, pure tasks) is an
-    // unplaced TASK the brain positions. Online/remote stays place-less.
+    // Located errands (a concrete pin) are FIXED geography the brain clusters
+    // around; everything else (at-home/online, pure tasks) is an unplaced TASK
+    // the brain positions. Online/remote stays place-less.
     const located = userChosen.filter(
       (e) =>
-        !e.autoPlace &&
         e.latitude != null &&
         e.longitude != null &&
         !isRemoteActivity(e.title, e.notes),
@@ -1379,9 +1482,6 @@ export default function ItineraryScreen() {
       durationMin: e.durationMin,
       notes: e.notes,
       atHome: isRemoteActivity(e.title, e.notes),
-      placeQuery: e.autoPlace
-        ? e.placeQuery?.trim() || e.title
-        : e.address || undefined,
     }));
 
     // Located venues + pinned times keyed by errand id, so the assembler can
@@ -1494,6 +1594,7 @@ export default function ItineraryScreen() {
       dayAnchorCoords,
       start: startCoord,
       end: endCoord,
+      home: home ? { latitude: home.latitude, longitude: home.longitude } : null,
     });
     if (planSeqRef.current !== seq) return true;
     if (!itin) return false; // assembly produced nothing usable — fall back
@@ -1547,7 +1648,12 @@ export default function ItineraryScreen() {
       try {
         // Pass 1 — GROUND the day: resolve real door-to-door travel legs,
         // cascade the clock, synthesise idle gaps. (Venues already resolved.)
-        const grounded = await recomputeItinerary(itin, contextFor(itin));
+        // Lock "drive" onto the hops into car errands first so Google routes
+        // them by car (commute errands keep the walk/transit auto-pick).
+        const grounded = await recomputeItinerary(
+          applyErrandTravelModes(itin, userChosen, hasCar),
+          contextFor(itin),
+        );
         if (planSeqRef.current !== seq) return;
         let current = itin;
         if (grounded.refreshed) {
@@ -1599,6 +1705,7 @@ export default function ItineraryScreen() {
             dayAnchorCoords,
             start: startCoord,
             end: endCoord,
+            home: home ? { latitude: home.latitude, longitude: home.longitude } : null,
           });
         if (planSeqRef.current !== seq || !refinedItin) return;
         // Keep the day's id + baked start across the revision so it updates the
@@ -1606,7 +1713,12 @@ export default function ItineraryScreen() {
         refinedItin.id = current.id;
         refinedItin.startLocation = current.startLocation ?? refinedItin.startLocation;
 
-        const regrounded = await recomputeItinerary(refinedItin, contextFor(refinedItin));
+        // Re-apply the car locks — the refine re-assembly rebuilds legs from
+        // scratch, so the preference must be stamped on again before routing.
+        const regrounded = await recomputeItinerary(
+          applyErrandTravelModes(refinedItin, userChosen, hasCar),
+          contextFor(refinedItin),
+        );
         if (planSeqRef.current !== seq) return;
         const out = regrounded.refreshed ? regrounded.itinerary : refinedItin;
         attachAlternatives(out, refinedAlts);
@@ -1619,302 +1731,659 @@ export default function ItineraryScreen() {
     return true;
   };
 
-  const planIt = async (overrideText?: string, overrideErrandIds?: Set<string>) => {
+  /**
+   * EXPERIMENTAL V3 pipeline (drawer "V3" switch). A deliberately staged
+   * alternative to {@link runUnifiedCompose}, matching the user's mental model:
+   *
+   *   1. CREATE errands — user + recurring + (if free text) freestyle, via the
+   *      same `decompose-intent` brain the legacy path uses.
+   *   2. ORDER — one CHEAP `order-day` call returns the best geographic order
+   *      (ids only); a deterministic guard keeps fixed times ascending.
+   *   3. LOCATE — fill every place-less-but-place-y errand IN ORDER via
+   *      `resolveAutoPlaceVenuesInOrder` (cluster each onto the previous stop).
+   *   4. COMMUTE — assemble the ordered + located stops and route them
+   *      (`recompute-itinerary`) so the user sees a connected day immediately.
+   *   5. FILL — one HEAVY `fill-day` call weaves in the everyday scaffolding
+   *      (wake, meals, wind-down, sleep) + gap blocks around the routed stops.
+   *   6. RE-COMMUTE — re-assemble + re-route the filled day.
+   *
+   * Returns true once it has produced a day (even an un-filled one); false only
+   * when there is genuinely nothing to plan, so `planIt` can fall through.
+   */
+  const runComposeV3 = async (run: {
+    seq: number;
+    text: string;
+    userChosen: Errand[];
+  }): Promise<boolean> => {
+    const { seq } = run;
+    const dayErrands: Errand[] = [...run.userChosen];
+
+    const isLocated = (e: Errand) =>
+      e.latitude != null &&
+      e.longitude != null &&
+      !isRemoteActivity(e.title, e.notes);
+
+    // Day frame + corridor (same rule as the other paths): only send `now` once
+    // the day is genuinely underway, so a fresh day still gets its morning.
+    const planningToday = effectiveDate === todayISO();
+    const localNow = currentHHMM();
+    const dayUnderway = planningToday && !!planStartTime && localNow > planStartTime;
+    const nowArg = dayUnderway ? localNow : undefined;
+    const startForFrame = dayUnderway ? localNow : planStartTime;
+    const startCoord = planStartLocation
+      ? { latitude: planStartLocation.latitude, longitude: planStartLocation.longitude }
+      : home
+        ? { latitude: home.latitude, longitude: home.longitude }
+        : null;
+    const endCoord = planEndLocation
+      ? { latitude: planEndLocation.latitude, longitude: planEndLocation.longitude }
+      : home
+        ? { latitude: home.latitude, longitude: home.longitude }
+        : null;
+    const composeCtx = buildContextPayload(context);
+    if (composeCtx && !dayUnderway && startForFrame) composeCtx.wakeTime = startForFrame;
+
+    if (dayErrands.length === 0) {
+      tracePlan('V3 — nothing to plan, falling back', null);
+      return false;
+    }
+
+    // ---- PHASE 2: ORDER (cheap brain) ------------------------------------
+    const orderInput: OrderDayErrand[] = dayErrands.map((e) => {
+      const fixed = errandTimeMode(e.startTime, e.endTime, e.durationMin) === 'at';
+      return {
+        id: e.id,
+        title: e.title,
+        startTime: fixed ? e.startTime ?? null : null,
+        endTime: fixed ? e.endTime ?? null : null,
+        durationMin: e.durationMin ?? null,
+        address: isLocated(e) ? e.address ?? null : null,
+        located: isLocated(e),
+      };
+    });
+    tracePlan('V3 (2) ORDER — request', orderInput);
+    const ordered = await orderDay({
+      errands: orderInput,
+      dayStart: { time: startForFrame, label: planStartLocation?.label },
+      dayEnd: { time: planEndTime, label: planEndLocation?.label },
+      home: home ? { label: home.label } : undefined,
+      date: effectiveDate,
+    });
+    if (planSeqRef.current !== seq) return true;
+    tracePlan('V3 (2) ORDER — response (ids)', ordered.order);
+
+    const byId = new Map(dayErrands.map((e) => [e.id, e]));
+    const fixedMin = (e: Errand) =>
+      errandTimeMode(e.startTime, e.endTime, e.durationMin) === 'at'
+        ? minutesOfDay(e.startTime)
+        : null;
+    // Reorder per the brain, then a deterministic guard: stable-sort so any two
+    // FIXED-time errands sit in ascending clock order (the router needs that),
+    // while everything flexible keeps the brain's order.
+    const orderedErrands = (ordered.order.map((id) => byId.get(id)).filter(Boolean) as Errand[])
+      .map((e, i) => ({ e, i }))
+      .sort((a, b) => {
+        const ta = fixedMin(a.e);
+        const tb = fixedMin(b.e);
+        if (ta != null && tb != null && ta !== tb) return ta - tb;
+        return a.i - b.i;
+      })
+      .map((x) => x.e);
+
+    // Every located errand carries its own pin; nothing else is searched, so
+    // place-less blocks stay place-less (the user owns location choices).
+    const altByCoordKey = new Map<string, ItineraryPlace[]>();
+
+    // ---- ASSEMBLE + first COMMUTE ----------------------------------------
+    // Located user errands become "anchors" (their venue is attached verbatim);
+    // place-less ones are "tasks" (pinned time only).
+    const anchorsById = new Map<string, AssembleAnchor>();
+    const tasksById = new Map<string, AssembleTask>();
+    for (const e of orderedErrands) {
+      if (isLocated(e)) {
+        anchorsById.set(e.id, {
+          title: e.title,
+          place: {
+            name: e.address ?? e.title,
+            address: e.address ?? undefined,
+            coords: { latitude: e.latitude!, longitude: e.longitude! },
+            photoUrl: e.photoUrl ?? undefined,
+            rating: e.rating ?? undefined,
+            ratingCount: e.ratingCount ?? undefined,
+            priceLevel:
+              typeof e.priceLevel === 'number'
+                ? '$'.repeat(Math.max(1, e.priceLevel))
+                : undefined,
+            openingHours: e.openingHours ?? undefined,
+          },
+          startTime: e.startTime,
+          endTime: e.endTime,
+          durationMin: e.durationMin,
+        });
+      } else {
+        tasksById.set(e.id, {
+          title: e.title,
+          startTime: e.startTime,
+          endTime: e.endTime,
+          durationMin: e.durationMin,
+        });
+      }
+    }
+
+    const dayAnchorCoords = collectDayAnchors({ errands, date: effectiveDate, home }).map(
+      (a) => a.coords,
+    );
+    for (const e of orderedErrands) {
+      if (isLocated(e)) dayAnchorCoords.push({ latitude: e.latitude!, longitude: e.longitude! });
+    }
+    if (startCoord) dayAnchorCoords.push(startCoord);
+    if (endCoord) dayAnchorCoords.push(endCoord);
+
+    const toBlock = (e: Errand): ComposedBlock => {
+      const located = anchorsById.has(e.id);
+      const tm = errandTimeMode(e.startTime, e.endTime, e.durationMin);
+      return {
+        title: e.title,
+        kind: inferErrandKind(e.title, e.notes),
+        flexibility: tm === 'at' ? 'fixed' : tm === 'between' ? 'window' : 'flexible',
+        section: 'Your day',
+        period: null,
+        startTime: tm === 'at' ? e.startTime ?? null : null,
+        endTime: null,
+        durationMin: e.durationMin ?? null,
+        description: e.notes ?? null,
+        placement: located ? 'anchor' : 'home',
+        anchorId: located ? e.id : null,
+        taskId: located ? null : e.id,
+        findQuery: null,
+        area: null,
+        userQuery: null,
+      };
+    };
+    const firstBlocks = orderedErrands.map(toBlock);
+
+    const assembleArgs = {
+      date: effectiveDate,
+      anchorsById,
+      tasksById,
+      dayAnchorCoords,
+      start: startCoord,
+      end: endCoord,
+      home: home ? { latitude: home.latitude, longitude: home.longitude } : null,
+    };
+
+    const { itinerary: itin } = await assembleComposedDay({
+      ...assembleArgs,
+      blocks: firstBlocks,
+      title: ordered.title || 'Your day',
+      summary: ordered.summary || '',
+      city: ordered.city || '',
+    });
+    if (planSeqRef.current !== seq) return true;
+    if (!itin) return false;
+
+    if (planStartLocation) {
+      itin.startLocation = {
+        label: planStartLocation.label,
+        latitude: planStartLocation.latitude,
+        longitude: planStartLocation.longitude,
+      };
+    }
+    attachAlternatives(itin, altByCoordKey);
+
+    setUsedAi(true);
+    setDebug(null);
+    const id = saveItinerary(itin);
+    activatePlan(id);
+    setSavedId(id);
+    setItinerary(itin);
+    const plannedIds = run.userChosen.filter((e) => e.source !== 'test').map((e) => e.id);
+    if (plannedIds.length) setErrandsPlanned(plannedIds, effectiveDate);
+    setSelectedErrandIds(new Set());
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+    setTimeout(() => snapTo(collapsedTop), 520);
+
+    setLoading(false);
+    setRoutesRefining(true);
+    console.log(`[plan-trace] RECOMPUTE source=v3-bg seq=${seq}`);
+    void (async () => {
+      try {
+        // Phase 4 — GROUND the ordered + located day (real travel + clock).
+        const grounded = await recomputeItinerary(
+          applyErrandTravelModes(itin, dayErrands, hasCar),
+          contextFor(itin),
+        );
+        if (planSeqRef.current !== seq) return;
+        let current = itin;
+        if (grounded.refreshed) {
+          current = grounded.itinerary;
+          attachAlternatives(current, altByCoordKey);
+          setItinerary(current);
+          updateSavedItinerary(id, current);
+        }
+
+        // Phase 5 — FILL the day: weave in wake/meals/wind-down/sleep + gaps.
+        const fillStops: FillStop[] = orderedErrands.map((e) => {
+          const anchor = anchorsById.get(e.id);
+          const tm = errandTimeMode(e.startTime, e.endTime, e.durationMin);
+          return {
+            ref: e.id,
+            title: e.title,
+            kind: inferErrandKind(e.title, e.notes),
+            startTime: tm === 'at' ? e.startTime ?? null : null,
+            endTime: tm === 'at' ? e.endTime ?? null : null,
+            durationMin: e.durationMin ?? null,
+            place: anchor?.place.name ?? null,
+            located: !!anchor,
+            fixed: tm === 'at',
+          };
+        });
+        tracePlan('V3 (5) FILL — request', {
+          date: effectiveDate,
+          now: nowArg ?? null,
+          stops: fillStops,
+        });
+        const filled = await fillDay({
+          stops: fillStops,
+          dayStart: { time: startForFrame, label: planStartLocation?.label },
+          dayEnd: { time: planEndTime, label: planEndLocation?.label },
+          context: composeCtx,
+          home: home
+            ? { label: home.label, latitude: home.latitude, longitude: home.longitude }
+            : undefined,
+          date: effectiveDate,
+          now: nowArg,
+        });
+        if (planSeqRef.current !== seq) return;
+        if (filled.blocks.length === 0) {
+          tracePlan('V3 (5) FILL — empty, keeping routed day', null);
+          return;
+        }
+        tracePlan('V3 (5) FILL — response (blocks)', filled.blocks);
+
+        const { itinerary: filledItin, altByCoordKey: filledAlts } = await assembleComposedDay({
+          ...assembleArgs,
+          blocks: filled.blocks,
+          title: filled.title || current.title || 'Your day',
+          summary: filled.summary || current.summary || '',
+          city: filled.city || current.city || '',
+        });
+        if (planSeqRef.current !== seq || !filledItin) return;
+        filledItin.id = current.id;
+        filledItin.startLocation = current.startLocation ?? filledItin.startLocation;
+        // Keep the Phase-3 alternatives for stops the fill kept; add any new ones.
+        for (const [k, v] of altByCoordKey) if (!filledAlts.has(k)) filledAlts.set(k, v);
+
+        // Phase 6 — RE-COMMUTE the filled day.
+        const refilled = await recomputeItinerary(
+          applyErrandTravelModes(filledItin, dayErrands, hasCar),
+          contextFor(filledItin),
+        );
+        if (planSeqRef.current !== seq) return;
+        const out = refilled.refreshed ? refilled.itinerary : filledItin;
+        attachAlternatives(out, filledAlts);
+        setItinerary(out);
+        updateSavedItinerary(id, out);
+      } finally {
+        if (planSeqRef.current === seq) setRoutesRefining(false);
+      }
+    })();
+    return true;
+  };
+
+  /**
+   * EXPERIMENTAL V4 pipeline (drawer "v4"). The ISOLATED single-call approach.
+   * ONE grounded, high-thinking Gemini pass ({@link planDayV4}) returns the
+   * WHOLE day — order, times, and gaps for the user's located errands — as a
+   * compact block list. The client does only the deterministic bits:
+   *   1. BUILD the itinerary KEEPING the brain's clock, attaching each located
+   *      errand's own venue. Diem never searches venues; a block the brain named
+   *      a spot for stays place-less with the suggestion shown as a hint.
+   *   2. COMMUTE as a separate process: route once so real travel legs slot in
+   *      and the clock re-cascades around the brain's intended schedule.
+   *
+   * Returns true once it produces a day; false only when there's nothing to
+   * plan or the brain returns nothing, so `planIt` can fall through.
+   */
+  const runComposeV4 = async (run: {
+    seq: number;
+    text: string;
+    userChosen: Errand[];
+  }): Promise<boolean> => {
+    const { seq, text, userChosen } = run;
+    if (userChosen.length === 0) return false;
+    console.log(`[plan-trace] V4 ENTER seq=${seq} (plannerMode=v4)`);
+
+    const isLocated = (e: Errand) =>
+      e.latitude != null &&
+      e.longitude != null &&
+      !isRemoteActivity(e.title, e.notes);
+
+    // Day frame: only send `now` once the day is genuinely underway, so a fresh
+    // day still gets its morning. The morning anchors on the user's REAL wake
+    // time (profile) — NOT the plan-setup "start time", which defaults to
+    // now-rounded and is just a corridor hint. Using it as the wake is what made
+    // the day open at 07:15 instead of the user's actual 08:30.
+    const planningToday = effectiveDate === todayISO();
+    const localNow = currentHHMM();
+    const dayUnderway = planningToday && !!planStartTime && localNow > planStartTime;
+    const nowArg = dayUnderway ? localNow : undefined;
+    const startForFrame = dayUnderway ? localNow : profileWakeTime || planStartTime;
+
+    const composeCtx = buildContextPayload(context);
+    // Keep the profile wake time buildContextPayload set (the user's real 08:30);
+    // do NOT clobber it with the plan-setup start. When the day is already
+    // underway the brain skips the morning anyway (it plans from `now`).
+
+    // Located errands = fixed geography (anchors); everything else = tasks.
+    // Free text is handed to the brain whole — V4 splits it into activities
+    // itself (no separate decompose pass), keeping the flow to a single call.
+    const located = userChosen.filter(isLocated);
+    const locatedIds = new Set(located.map((e) => e.id));
+    const taskErrands = userChosen.filter((e) => !locatedIds.has(e.id));
+    const errandById = new Map(userChosen.map((e) => [e.id, e]));
+
+    const anchors = located.map((e) => ({
+      id: e.id,
+      title: e.title,
+      name: e.address ?? e.title,
+      latitude: e.latitude,
+      longitude: e.longitude,
+      startTime: e.startTime,
+      endTime: e.endTime,
+      durationMin: e.durationMin,
+      notes: e.notes,
+      locationType: (e.placeId ? 'business' : undefined) as 'business' | undefined,
+    }));
+    const tasks = taskErrands.map((e) => ({
+      id: e.id,
+      title: e.title,
+      startTime: e.startTime,
+      endTime: e.endTime,
+      durationMin: e.durationMin,
+      notes: e.notes,
+      atHome: isRemoteActivity(e.title, e.notes),
+    }));
+
+    tracePlan('V4 — single grounded brain (request)', {
+      intent: text,
+      date: effectiveDate,
+      now: nowArg ?? null,
+      anchors,
+      tasks,
+    });
+    const plan = await planDayV4({
+      intent: text,
+      anchors,
+      tasks,
+      dayStart: { time: startForFrame, label: planStartLocation?.label },
+      dayEnd: { time: planEndTime, label: planEndLocation?.label },
+      context: composeCtx,
+      home: home
+        ? { label: home.label, latitude: home.latitude, longitude: home.longitude }
+        : undefined,
+      date: effectiveDate,
+      now: nowArg,
+    });
+    if (planSeqRef.current !== seq) return true;
+    if (plan.blocks.length === 0) {
+      console.warn(
+        `[plan-trace] V4 seq=${seq} — brain returned 0 blocks → FALLING BACK TO v2. ` +
+          'Check the [plan-day-v4] warning above (function deployed? GEMINI_API_KEY set? timeout?).',
+      );
+      return false;
+    }
+    console.log(`[plan-trace] V4 seq=${seq} — brain returned ${plan.blocks.length} blocks; building day`);
+    tracePlan('V4 — brain blocks (response)', plan.blocks);
+
+    // Diem no longer searches venues — only the user's located errands carry a
+    // place; every other block stays place-less (the brain's suggestion shows
+    // as a hint the user can act on).
+    const altByCoordKey = new Map<string, ItineraryPlace[]>();
+
+    // ---- BUILD the itinerary, KEEPING the brain's clock ------------------
+    const periodOf = (hhmm: string | null, fallback: string): string => {
+      const m = hhmm ? minutesOfDay(hhmm) : null;
+      if (m == null) return fallback;
+      if (m < 12 * 60) return 'Morning';
+      if (m < 17 * 60) return 'Afternoon';
+      return 'Evening';
+    };
+
+    interface V4RawItem {
+      title: string;
+      kind: string;
+      flexibility: TimeFlexibility;
+      startTime: string | null;
+      endTime: string | null;
+      durationMinutes: number | null;
+      windowStart: string | null;
+      windowEnd: string | null;
+      place: ItineraryPlace | undefined;
+      description: string | null;
+      period: string;
+    }
+
+    let lastPeriod = 'Morning';
+    const rawItems: V4RawItem[] = plan.blocks.map((b: V4Block, i: number) => {
+      const e = b.ref ? errandById.get(b.ref) : undefined;
+      let startTime: string | null = b.start;
+      let endTime: string | null = b.end;
+      let windowStart: string | null = null;
+      let windowEnd: string | null = null;
+      let flexibility: TimeFlexibility = b.fixed ? 'fixed' : 'flexible';
+      let durationMinutes: number | null = null;
+
+      // The user's OWN errand timing is LAW — the brain's clock is only a hint
+      // for it. A pinned errand keeps its pin; a "between" errand stays a window
+      // the router places.
+      if (e) {
+        const tm = errandTimeMode(e.startTime, e.endTime, e.durationMin);
+        if (tm === 'at') {
+          startTime = e.startTime ?? b.start;
+          endTime = e.endTime ?? b.end;
+          flexibility = 'fixed';
+        } else if (tm === 'between') {
+          windowStart = e.startTime ?? null;
+          windowEnd = e.endTime ?? null;
+          startTime = null;
+          endTime = null;
+          flexibility = 'window';
+          durationMinutes = e.durationMin ?? null;
+        } else if (e.durationMin) {
+          durationMinutes = e.durationMin;
+        }
+      }
+      if (startTime && endTime) {
+        const s = minutesOfDay(startTime);
+        const en = minutesOfDay(endTime);
+        if (s != null && en != null && en - s > 0) durationMinutes = en - s;
+      }
+
+      // Only the user's located errands carry a venue; everything else stays
+      // place-less (Diem never searches on the user's behalf).
+      let place: ItineraryPlace | undefined;
+      if (e && isLocated(e)) {
+        place = {
+          name: e.address ?? e.title,
+          address: e.address ?? undefined,
+          coords: { latitude: e.latitude!, longitude: e.longitude! },
+          photoUrl: e.photoUrl ?? undefined,
+          rating: e.rating ?? undefined,
+          ratingCount: e.ratingCount ?? undefined,
+          priceLevel:
+            typeof e.priceLevel === 'number'
+              ? '$'.repeat(Math.max(1, e.priceLevel))
+              : undefined,
+          openingHours: e.openingHours ?? undefined,
+        };
+      }
+
+      // A place-less block the brain named a spot for: surface the suggestion
+      // as a hint so the user can pick the business themselves.
+      let description: string | null = null;
+      if (!place && b.place) {
+        const sugg = [b.place, ...b.alts].slice(0, 3).join(', ');
+        description = `Pick a place${b.area ? ` in ${b.area}` : ''} — e.g. ${sugg}`;
+      }
+
+      const period = periodOf(startTime ?? windowStart, lastPeriod);
+      lastPeriod = period;
+
+      return {
+        title: b.title,
+        kind: b.kind === 'errand' ? 'activity' : b.kind,
+        flexibility,
+        startTime,
+        endTime,
+        durationMinutes,
+        windowStart,
+        windowEnd,
+        place,
+        description,
+        period,
+      };
+    });
+
+    // Group consecutive blocks of the same period into sections (Morning /
+    // Afternoon / Evening) — purely cosmetic for the rail.
+    const grouped: { title: string; period: string; items: V4RawItem[] }[] = [];
+    for (const it of rawItems) {
+      const last = grouped[grouped.length - 1];
+      if (last && last.period === it.period) last.items.push(it);
+      else grouped.push({ title: it.period, period: it.period, items: [it] });
+    }
+
+    const itin = sanitizeItinerary({
+      title: plan.title || 'Your day',
+      summary: plan.summary || '',
+      date: effectiveDate,
+      city: plan.city || '',
+      sections: grouped.map((s) => ({
+        title: s.title,
+        period: s.period,
+        items: s.items,
+      })),
+    });
+    if (planSeqRef.current !== seq) return true;
+    if (!itin) {
+      tracePlan('V4 — assembly produced nothing, falling back', null);
+      return false;
+    }
+    if (planStartLocation) {
+      itin.startLocation = {
+        label: planStartLocation.label,
+        latitude: planStartLocation.latitude,
+        longitude: planStartLocation.longitude,
+      };
+    }
+    attachAlternatives(itin, altByCoordKey);
+
+    setUsedAi(true);
+    setDebug(null);
+    const id = saveItinerary(itin);
+    activatePlan(id);
+    setSavedId(id);
+    setItinerary(itin);
+    const plannedIds = userChosen.filter((e) => e.source !== 'test').map((e) => e.id);
+    if (plannedIds.length) setErrandsPlanned(plannedIds, effectiveDate);
+    setSelectedErrandIds(new Set());
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+    setTimeout(() => snapTo(collapsedTop), 520);
+
+    // ---- COMMUTE (separate process): real travel legs + clock cascade ----
+    setLoading(false);
+    setRoutesRefining(true);
+    console.log(`[plan-trace] RECOMPUTE source=v4-bg seq=${seq}`);
+    void (async () => {
+      try {
+        const grounded = await recomputeItinerary(
+          applyErrandTravelModes(itin, userChosen, hasCar),
+          contextFor(itin),
+        );
+        if (planSeqRef.current !== seq) return;
+        if (grounded.refreshed) {
+          const current = grounded.itinerary;
+          attachAlternatives(current, altByCoordKey);
+          setItinerary(current);
+          updateSavedItinerary(id, current);
+        }
+      } finally {
+        if (planSeqRef.current === seq) setRoutesRefining(false);
+      }
+    })();
+    return true;
+  };
+
+  const planIt = async (overrideErrandIds?: Set<string>) => {
     if (loading) return;
-    const text = (overrideText ?? input).trim();
-    // The day's backbone is the errands the user ticked in the drawer; the
-    // free-text box now feeds the BRAIN (decompose-intent), which turns it into
-    // extra located errands before planning. Plan with either — errands, text,
-    // or both.
-    // Only the user's OWN ticked errands form the backbone. Freestyle errands
-    // (brain-decomposed from the free-text) are regenerated every plan, so we
-    // never feed a PRIOR run's freestyle back in — that's what tripled "Deep
-    // Work" after a few regenerations.
-    // The backbone is normally the ticked errands; the test harness passes an
-    // explicit id set so a debug run plans with EXACTLY its seeded errands,
-    // ignoring whatever else is on the date.
+    // The day's backbone is the located errands the user ticked in the drawer.
+    // The test harness passes an explicit id set so a debug run plans with
+    // EXACTLY its seeded errands, ignoring whatever else is on the date.
     const chosenIds = overrideErrandIds ?? selectedErrandIds;
     const userChosen = errands.filter(
       (e) => chosenIds.has(e.id) && !e.done && e.source !== 'freestyle',
     );
-    if (!text && userChosen.length === 0) return;
-    // Clear the previous generation's freestyle errands for this day before the
-    // brain makes fresh ones, so they can't accumulate in the list or sneak
-    // back into a later plan.
+    if (userChosen.length === 0) return;
+    // Sweep any leftover freestyle errands for this day (legacy data from the
+    // old free-text planner) so they can't sneak into a plan.
     errands
       .filter((e) => e.source === 'freestyle' && e.date === effectiveDate)
       .forEach((e) => removeErrand(e.id));
-    // Keep the latest free-text around — it's the basis for any later replan.
-    if (overrideText !== undefined && text !== input) setInput(text);
+
     Haptics.selectionAsync().catch(() => undefined);
     // Anything that was already in flight is no longer relevant; bump the seq
     // so a slow recompute from a previous plan can't slot itself in after
     // this one has rendered.
     const seq = ++planSeqRef.current;
     console.log(
-      `[plan-trace] START source=planIt seq=${seq} date=${effectiveDate} chosen=${userChosen.length} text=${JSON.stringify(text.slice(0, 48))} routeId=${params.id ?? 'none'}`,
+      `[plan-trace] START source=planIt seq=${seq} date=${effectiveDate} chosen=${userChosen.length} routeId=${params.id ?? 'none'}`,
     );
     setLoading(true);
     setErrorMsg(null);
+    setV4FellBack(false);
     setSavedId(null);
     resetTracking();
     snapTo(expandedTop); // show the skeleton full-height while we work
     try {
-      // UNIFIED COMPOSE (flag-gated): one brain + deterministic resolve/route.
-      // Handles the whole plan when it succeeds; falls through to the legacy
-      // decompose+plan pipeline below if the brain returns nothing usable.
-      if (UNIFIED_COMPOSE) {
-        const handled = await runUnifiedCompose({ seq, text, userChosen });
+      // EXPERIMENTAL V4 (drawer selector): ONE grounded brain does order +
+      // times + gaps; the client routes. Owns the plan when on; only falls
+      // through if there's genuinely nothing to do.
+      if (plannerMode === 'v4') {
+        const handled = await runComposeV4({ seq, text: '', userChosen });
+        if (handled) return;
+        // v4 was chosen but couldn't finalise (timeout/error → 0 blocks). We
+        // still build *a* day below so the user isn't stranded, but flag it so
+        // the header shows this ISN'T the v4 plan they asked for.
+        if (planSeqRef.current === seq) setV4FellBack(true);
+        console.warn(
+          `[plan-trace] V4 seq=${seq} did not finalise — using fallback pipeline. ` +
+            'See the [plan-day-v4] warning above for why (timeout >145s / function error).',
+        );
+      }
+      // EXPERIMENTAL V3 (drawer selector): staged order → route → fill. When on
+      // it owns the plan; only falls through if there's nothing to do.
+      if (plannerMode === 'v3') {
+        const handled = await runComposeV3({ seq, text: '', userChosen });
         if (handled) return;
       }
-      // Ranked alternative venues for auto-placed stops (coordKey → places),
-      // re-attached onto the plan once it returns so the card can offer swaps.
+      // UNIFIED COMPOSE (flag-gated): one brain + deterministic route. Handles
+      // the whole plan when it succeeds; falls through to the legacy pipeline
+      // below if the brain returns nothing usable.
+      if (UNIFIED_COMPOSE) {
+        const handled = await runUnifiedCompose({ seq, text: '', userChosen });
+        if (handled) return;
+      }
+      // Located errands carry their own pin; nothing is searched. No free-text,
+      // no decompose — the planner only orders/times what the user chose.
       const altByCoordKey = new Map<string, ItineraryPlace[]>();
-      // Brain-upgraded, neighbourhood-aware queries for EXISTING vague errands
-      // (errandId → better query), applied during venue resolution below.
-      const betterQueryById = new Map<string, string>();
-      // Brain-assigned neighbourhood per auto-place errand (errandId → "Karlín"),
-      // so venue resolution centres on the RIGHT area instead of the day's global
-      // centroid (the "gym in Holešovice not Karlín" bug).
-      const areaById = new Map<string, string>();
-
-      // ----- BRAIN DECOMPOSE --------------------------------------------------
-      // Hand the free-text field + any vague/no-place errands to the brain. Using
-      // the already-located errands as fixed geography, it clusters flexible asks
-      // into the right neighbourhood, co-locates compatible activities, and keeps
-      // at-home items place-less — returning structured items we materialise as
-      // (visible) freestyle errands so the rest of the pipeline treats them just
-      // like user errands. Falls back to today's behaviour if the brain is down.
-      let chosenErrands = userChosen;
-      // The free-text we still hand the base planner as STYLE/NOTES. Once the
-      // brain turns the free-text into structured errands we BLANK it, so the
-      // planner doesn't ALSO re-create those activities as isolated, place-less
-      // blocks (the exact "deep work at nowhere" problem). Pure-vibe text that
-      // yields no errands is kept, so preferences still colour the day.
-      let plannerIntent = text;
-      const located = userChosen.filter(
-        (e) => !e.autoPlace && e.latitude != null && e.longitude != null,
-      );
-      const vague = userChosen.filter(
-        (e) =>
-          !isRemoteActivity(e.title, e.notes) &&
-          (e.autoPlace || (!!e.address && (e.latitude == null || e.longitude == null))),
-      );
-      if (text || vague.length) {
-        tracePlan('(1) brain REQUEST — free-text + vague/no-place errands', {
-          intent: text,
-          anchorsLocated: located.map((e) => ({
-            id: e.id,
-            title: e.title,
-            address: e.address ?? null,
-            latitude: e.latitude ?? null,
-            longitude: e.longitude ?? null,
-          })),
-          unresolved: vague.map((e) => ({
-            id: e.id,
-            title: e.title,
-            placeQuery: e.placeQuery ?? e.address ?? null,
-            notes: e.notes ?? null,
-          })),
-          dayStart: { time: planStartTime, label: planStartLocation?.label ?? null },
-          dayEnd: { time: planEndTime, label: planEndLocation?.label ?? null },
-          date: effectiveDate,
-        });
-        const { items } = await decomposeIntent({
-          intent: text,
-          anchors: located.map((e) => ({
-            id: e.id,
-            title: e.title,
-            address: e.address,
-            latitude: e.latitude,
-            longitude: e.longitude,
-          })),
-          unresolved: vague.map((e) => ({
-            id: e.id,
-            title: e.title,
-            placeQuery: e.placeQuery ?? e.address,
-            notes: e.notes,
-          })),
-          dayStart: { time: planStartTime, label: planStartLocation?.label },
-          dayEnd: { time: planEndTime, label: planEndLocation?.label },
-          context: buildContextPayload(context),
-          home: home
-            ? { label: home.label, latitude: home.latitude, longitude: home.longitude }
-            : undefined,
-          date: effectiveDate,
-        });
-        if (planSeqRef.current !== seq) return; // reset / re-planned while thinking
-        tracePlan('(2) brain RESPONSE — decomposed items', items);
-        const createdIds = new Set<string>();
-        for (const item of items) {
-          // An item that reformats an EXISTING vague errand: upgrade that
-          // errand's search query in place rather than duplicating it.
-          if (item.sourceId && vague.some((v) => v.id === item.sourceId)) {
-            if (item.placement === 'find' && item.query) {
-              betterQueryById.set(item.sourceId, item.query);
-              if (item.area) areaById.set(item.sourceId, item.area);
-            }
-            continue;
-          }
-          const draft: ErrandInput = {
-            title: item.title,
-            durationMin: item.durationMin ?? undefined,
-            startTime: item.startTime ?? undefined,
-            endTime: item.endTime ?? undefined,
-            notes: item.notes ?? undefined,
-            date: effectiveDate,
-            source: 'freestyle',
-            rawText: item.title,
-          };
-          if (item.placement === 'find' && item.query) {
-            // Diem picks the spot — resolved to a real venue below.
-            draft.autoPlace = true;
-            draft.placeQuery = item.query;
-          } else if (item.placement === 'colocate' && item.colocateWith) {
-            // Share an existing located errand's venue (co-location by
-            // coordinate-sharing — the cards then read as one continuous stop).
-            const host = located.find((e) => e.id === item.colocateWith);
-            if (host?.address && host.latitude != null && host.longitude != null) {
-              draft.address = host.address;
-              draft.latitude = host.latitude;
-              draft.longitude = host.longitude;
-              draft.placeId = host.placeId;
-              draft.photoUrl = host.photoUrl;
-              draft.rating = host.rating;
-              draft.ratingCount = host.ratingCount;
-              draft.priceLevel = host.priceLevel;
-              draft.openingHours = host.openingHours;
-            }
-          }
-          // placement "home" (or an unusable colocate) → a place-less task.
-          const newId = addErrand(draft);
-          createdIds.add(newId);
-          if (item.placement === 'find' && item.query && item.area) {
-            areaById.set(newId, item.area);
-          }
-        }
-        if (createdIds.size) {
-          const fresh = useErrandsStore
-            .getState()
-            .items.filter((e) => createdIds.has(e.id));
-          chosenErrands = [...userChosen, ...fresh];
-          // The free-text's activities are now errands — don't double them via
-          // the planner's STYLE/NOTES pass.
-          plannerIntent = '';
-        }
-        tracePlan('(3) brain -> orchestration decisions', {
-          vagueErrandUpgrades: Array.from(betterQueryById, ([id, query]) => ({
-            id,
-            query,
-            area: areaById.get(id) ?? null,
-          })),
-          createdFreestyleErrands: useErrandsStore
-            .getState()
-            .items.filter((e) => createdIds.has(e.id))
-            .map((e) => ({
-              id: e.id,
-              title: e.title,
-              autoPlace: !!e.autoPlace,
-              placeQuery: e.placeQuery ?? null,
-              area: areaById.get(e.id) ?? null,
-              address: e.address ?? null,
-              latitude: e.latitude ?? null,
-              longitude: e.longitude ?? null,
-              startTime: e.startTime ?? null,
-              endTime: e.endTime ?? null,
-              durationMin: e.durationMin ?? null,
-              notes: e.notes ?? null,
-            })),
-          plannerIntentAfterBrain: plannerIntent,
-        });
-      }
-
-      // Pre-resolve "Diem picks the spot" (autoPlace) errands to a concrete,
-      // route-aware venue BEFORE planning, so they become hard ANCHORS rather
-      // than the planner guessing one. Best-effort: anything left unresolved
-      // falls through to a TASK the planner finds a venue for.
-      const autoErrands = chosenErrands.filter(
-        (e) => e.autoPlace && !isRemoteActivity(e.title, e.notes),
-      );
-      let resolvedPlaces = new Map<string, NearbyPlace[]>();
-      if (autoErrands.length) {
-        const startCoord = planStartLocation
-          ? { latitude: planStartLocation.latitude, longitude: planStartLocation.longitude }
-          : home
-            ? { latitude: home.latitude, longitude: home.longitude }
-            : null;
-        const endCoord = planEndLocation
-          ? { latitude: planEndLocation.latitude, longitude: planEndLocation.longitude }
-          : home
-            ? { latitude: home.latitude, longitude: home.longitude }
-            : null;
-        const anchorCoords = collectDayAnchors({ errands, date: effectiveDate, home }).map(
-          (a) => a.coords,
-        );
-        // Fold in any located errands chosen for THIS plan (incl. brain-created
-        // co-located freestyle ones, which the stale `errands` snapshot misses)
-        // so the search centres on the day's real geography.
-        for (const e of chosenErrands) {
-          if (e.latitude != null && e.longitude != null) {
-            anchorCoords.push({ latitude: e.latitude, longitude: e.longitude });
-          }
-        }
-        if (startCoord) anchorCoords.push(startCoord);
-        if (endCoord) anchorCoords.push(endCoord);
-        const resolveItems = autoErrands.map((e) => ({
-          id: e.id,
-          // Prefer the brain's neighbourhood-aware query when it upgraded one.
-          query: betterQueryById.get(e.id) ?? (e.placeQuery?.trim() || e.title),
-          // The brain's neighbourhood, so the search centres there.
-          area: areaById.get(e.id),
-        }));
-        tracePlan('(4) resolve REQUEST — auto-place venues ("Diem picks the spot")', {
-          items: resolveItems,
-          anchorCount: anchorCoords.length,
-          start: startCoord,
-          end: endCoord,
-        });
-        resolvedPlaces = await resolveAutoPlaceVenues({
-          items: resolveItems,
-          anchors: anchorCoords,
-          start: startCoord,
-          end: endCoord,
-        });
-        if (planSeqRef.current !== seq) return; // reset / re-planned while resolving
-        tracePlan(
-          '(5) resolve RESPONSE — chosen venue + alternatives per errand',
-          autoErrands.map((e) => {
-            const list = resolvedPlaces.get(e.id) ?? [];
-            return {
-              id: e.id,
-              title: e.title,
-              query: betterQueryById.get(e.id) ?? (e.placeQuery?.trim() || e.title),
-              area: areaById.get(e.id) ?? null,
-              resolved: list.length > 0,
-              chosen: list[0]
-                ? {
-                    name: list[0].name,
-                    latitude: list[0].latitude,
-                    longitude: list[0].longitude,
-                  }
-                : null,
-              alternatives: list.slice(1).map((p) => p.name),
-            };
-          }),
-        );
-      }
-
-      // Split the chosen errands into ANCHORS (located: a placed errand, or an
-      // auto-place we just resolved — the planner places these VERBATIM) and
-      // TASKS (unplaced: calls/admin, or an auto-place we couldn't resolve — the
-      // planner schedules them and finds a venue only for the place-y ones).
+      // Split the chosen errands into ANCHORS (located: their pin is placed
+      // VERBATIM) and TASKS (remote/at-home: a call, telehealth, remote work —
+      // scheduled at home, never given a venue). Every user errand now carries a
+      // concrete pin unless it's remote, so there's nothing left to search.
       const anchors: PlanAnchor[] = [];
       const tasks: PlanTask[] = [];
-      for (const e of chosenErrands) {
-        // Online / at-home commitments (a video call, telehealth, remote work)
-        // have NO physical venue — schedule them at home and never let the
-        // planner invent or search a place (the "online therapy → random shop
-        // across town" bug). This overrides autoPlace/address entirely.
+      for (const e of userChosen) {
         if (isRemoteActivity(e.title, e.notes)) {
           tasks.push({
             title: e.title,
@@ -1924,33 +2393,7 @@ export default function ItineraryScreen() {
             notes: e.notes,
             atHome: true,
           });
-          continue;
-        }
-        const pickedList = e.autoPlace ? resolvedPlaces.get(e.id) : null;
-        const picked = pickedList && pickedList.length ? pickedList[0] : null;
-        if (picked) {
-          anchors.push({
-            title: e.title,
-            name: picked.name,
-            latitude: picked.latitude,
-            longitude: picked.longitude,
-            startTime: e.startTime,
-            endTime: e.endTime,
-            durationMin: e.durationMin,
-            notes: e.notes,
-            locationType: 'business',
-            photoUrl: picked.photoUrl ?? undefined,
-            rating: picked.rating ?? undefined,
-            ratingCount: picked.ratingCount ?? undefined,
-            openingHours: picked.openingHours ?? undefined,
-          });
-          // Keep the runner-up candidates as swappable alternatives, matched
-          // back to the planned place by coordinate after the plan returns.
-          const alts = pickedList!.slice(1).map((p) => nearbyToItineraryPlace(p));
-          if (alts.length) {
-            altByCoordKey.set(coordKey(picked.latitude, picked.longitude), alts);
-          }
-        } else if (!e.autoPlace && e.address && e.latitude != null && e.longitude != null) {
+        } else if (e.address && e.latitude != null && e.longitude != null) {
           anchors.push({
             title: e.title,
             name: e.address,
@@ -1969,24 +2412,13 @@ export default function ItineraryScreen() {
             openingHours: e.openingHours,
           });
         } else {
-          // Unplaced → a TASK. An auto-place we couldn't resolve, or a typed
-          // address that never geocoded, still WANTS a venue (hand the model a
-          // query to find one); a pure task ("call mom") gets none.
-          const unresolvedAddress = !e.autoPlace && !!e.address;
-          const wantsVenue = e.autoPlace === true || unresolvedAddress;
-          const placeQuery = e.autoPlace
-            ? e.placeQuery?.trim() || e.title
-            : unresolvedAddress
-              ? e.address
-              : undefined;
+          // No coords (legacy/edge data) → a place-less task; never searched.
           tasks.push({
             title: e.title,
             startTime: e.startTime,
             endTime: e.endTime,
             durationMin: e.durationMin,
             notes: e.notes,
-            ...(wantsVenue ? { wantsVenue: true } : {}),
-            ...(placeQuery ? { placeQuery } : {}),
           });
         }
       }
@@ -2018,7 +2450,7 @@ export default function ItineraryScreen() {
       // is the dataset to copy into AI Studio to iterate on ordering/routing —
       // it is deliberately NOT connected or time-sequenced yet.
       tracePlan('(6) PLANNER INPUT — copy this whole block into AI Studio', {
-        intent: plannerIntent,
+        intent: '',
         date: effectiveDate,
         now: nowArg ?? null,
         dayStart: {
@@ -2040,7 +2472,7 @@ export default function ItineraryScreen() {
         tasks,
       });
 
-      const result = await planItinerary(plannerIntent, {
+      const result = await planItinerary('', {
         context,
         date: effectiveDate,
         now: nowArg,
@@ -2110,7 +2542,7 @@ export default function ItineraryScreen() {
       // Debug ('test') errands persist: they're never marked Planned, so they
       // stay put for the next reproducible run (only a manual delete or re-seed
       // removes them). Real + freestyle errands move to Planned as usual.
-      const plannedIds = chosenErrands
+      const plannedIds = userChosen
         .filter((e) => e.source !== 'test')
         .map((e) => e.id);
       if (plannedIds.length) {
@@ -2129,7 +2561,7 @@ export default function ItineraryScreen() {
       setLoading(false);
       setRoutesRefining(true);
       console.log(`[plan-trace] RECOMPUTE source=planIt-bg seq=${seq}`);
-      void recomputeItinerary(itin, contextFor(itin))
+      void recomputeItinerary(applyErrandTravelModes(itin, userChosen, hasCar), contextFor(itin))
         .then((refreshed) => {
           if (planSeqRef.current !== seq) return;
           if (!refreshed.refreshed) return;
@@ -2164,12 +2596,10 @@ export default function ItineraryScreen() {
     autoplanRef.current = true;
     const ids = new Set(testErrands.map((e) => e.id));
     setSelectedErrandIds(ids); // reflect the debug selection in the drawer
-    const seedIntent =
-      typeof params.seedIntent === 'string' ? params.seedIntent : '';
-    void planIt(seedIntent, ids);
+    void planIt(ids);
     // planIt is intentionally omitted: this is a one-shot guarded by autoplanRef.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.autoplan, params.seedIntent, preloaded, dayErrands]);
+  }, [params.autoplan, preloaded, dayErrands]);
 
   const reset = () => {
     // Invalidate any in-flight jobs so their resolutions are dropped instead of
@@ -2214,93 +2644,6 @@ export default function ItineraryScreen() {
     if (undoTimer.current) clearTimeout(undoTimer.current);
     undoTimer.current = setTimeout(() => setUndo(null), 5000);
   }, []);
-
-  /**
-   * Resourceful escalation. When a re-routed day no longer fits a FIXED anchor
-   * (the real, time-aware commutes ate ALL the downstream slack), a pure clock
-   * cascade can't rescue it — shrinking gaps already failed. So we hand the day
-   * to the planner to genuinely rebalance it (shorten / reorder / drop), tell
-   * it exactly which commitment overran and by how much, then route the result
-   * for real time-aware legs before showing it. Auto-applied but fully
-   * undoable: `before` is the PRE-edit day, so a single Undo rolls back the
-   * edit AND the replan. `mySeq` guard drops the result if a newer edit landed.
-   */
-  const escalateReplan = useCallback(
-    async (
-      before: Itinerary,
-      routed: Itinerary,
-      conflicts: CascadeConflict[],
-      mySeq: number,
-    ) => {
-      const overrun = conflicts.find((c) => c.kind === 'fixedOverrun') ?? conflicts[0];
-      const blocking = overrun
-        ? flatten(routed).find((i) => i.id === overrun.itemId)
-        : undefined;
-      const basis = describeItineraryForReplan(routed, input);
-      const constraint = overrun
-        ? `Important: after my latest change the day no longer fits. "${
-            blocking?.title ?? 'a fixed commitment'
-          }" gets pushed to ${overrun.proposedStart} but it is fixed at ${
-            overrun.requiredStart
-          } (about ${overrun.overrunMin} minutes too late), because the real travel time between places is longer than the free time allows. Re-plan the day so everything fits: keep the fixed commitments at their exact times, and shorten, reorder, or drop the flexible activities as needed. Keep the same overall intent of the day.`
-        : 'Important: after my latest change the day no longer fits its real travel times. Re-plan it so everything fits, keeping the fixed commitments at their exact times.';
-      const request = `${basis}\n\n${constraint}`;
-
-      console.log(
-        `[plan-trace] START source=escalateReplan editSeq=${mySeq} current=${editSeqRef.current} overrun=${overrun?.itemId ?? 'none'}`,
-      );
-      // Carry the day frame (start/end time + locations) into the replan so a
-      // fast rebalance keeps the same bookends — otherwise it would drop the
-      // wind-down/wake frame and collapse the day onto defaults.
-      const setup = usePlanSetupStore.getState();
-      const replanDate = routed.date ?? todayISO();
-      const planningToday = replanDate === todayISO();
-      const localNow = currentHHMM();
-      const dayUnderway = planningToday && !!setup.startTime && localNow > setup.startTime;
-      const dayStart: PlanDayEdge = { time: dayUnderway ? localNow : setup.startTime };
-      if (setup.startLocation?.label) dayStart.label = setup.startLocation.label;
-      const dayEnd: PlanDayEdge = { time: setup.endTime };
-      if (setup.endLocation?.label) dayEnd.label = setup.endLocation.label;
-      const result = await planItinerary(request, {
-        context: contextFor(routed),
-        date: replanDate,
-        now: dayUnderway ? localNow : undefined,
-        dayStart,
-        dayEnd,
-        fast: true,
-      });
-      if (mySeq !== editSeqRef.current) return;
-      if (!result.itinerary) return;
-
-      // A replan keeps the day's original starting point.
-      result.itinerary.startLocation = routed.startLocation;
-
-      // Route the fresh plan for real (time-aware) legs before it lands, then
-      // re-cascade on the client (keeping the planner's anchors authoritative).
-      const { itinerary: rerouted } = await recomputeItinerary(
-        result.itinerary,
-        contextFor(result.itinerary),
-      );
-      if (mySeq !== editSeqRef.current) return;
-      const cascaded = fitGapsToAnchors(applyRoutedLegs(result.itinerary, rerouted));
-      setItinerary(cascaded.itinerary);
-      setConflicts(cascaded.conflicts);
-      setUsedAi(result.usedAi);
-      persist(cascaded.itinerary);
-      logItineraryEdit({
-        phase: 'replan',
-        before,
-        after: cascaded.itinerary,
-        conflicts: cascaded.conflicts,
-        note: 'escalated replan — re-routed commutes did not fit the fixed anchors',
-      });
-      showUndo(before, 'Replanned around the longer commute');
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
-        () => undefined,
-      );
-    },
-    [contextFor, input, persist, showUndo],
-  );
 
   /**
    * The single edit pipeline used by every editing surface. Each op is
@@ -2379,24 +2722,9 @@ export default function ItineraryScreen() {
         // the real travel so the day's end anchor stays honest.
         const merged = applyRoutedLegs(optimistic, refreshed);
         const cascaded = fitGapsToAnchors(merged);
-        // Decision point ("reroute if there's slack, else replan"): if the
-        // real, time-aware commutes still overrun a FIXED anchor after gaps
-        // were shrunk, the day genuinely doesn't fit — hand it to the planner.
-        // We only escalate when the backend actually re-routed (`didRefresh`);
-        // otherwise the overrun is just the optimistic estimate and we keep the
-        // existing non-blocking conflict banner.
-        const hardOverrun = cascaded.conflicts.some((c) => c.kind === 'fixedOverrun');
-        if (didRefresh && hardOverrun) {
-          logItineraryEdit({
-            phase: 'after-route',
-            before: optimistic,
-            after: cascaded.itinerary,
-            conflicts: cascaded.conflicts,
-            note: 'fixed-anchor overrun after reroute -> escalating to a planner rebalance',
-          });
-          await escalateReplan(before, cascaded.itinerary, cascaded.conflicts, mySeq);
-          return;
-        }
+        // If the real, time-aware commutes still overrun a FIXED anchor after
+        // the gaps were shrunk, we keep the cascaded day as-is and let the
+        // conflict banner surface it — no auto-escalation to a planner rerun.
         setItinerary(cascaded.itinerary);
         setConflicts(cascaded.conflicts);
         persist(cascaded.itinerary);
@@ -2416,7 +2744,7 @@ export default function ItineraryScreen() {
         if (mySeq === editSeqRef.current) setEditBusy(false);
       }
     },
-    [itinerary, persist, showUndo, contextFor, escalateReplan],
+    [itinerary, persist, showUndo, contextFor],
   );
   /** Convenience: most callers only have one op. */
   const applyEdit = useCallback((op: EditOp) => applyOps([op]), [applyOps]);
@@ -2464,7 +2792,7 @@ export default function ItineraryScreen() {
         console.log(
           `[plan-trace] START source=runReplan editSeq=${mySeq} text=${JSON.stringify(text.slice(0, 48))}`,
         );
-        const basis = describeItineraryForReplan(itinerary, input);
+        const basis = describeItineraryForReplan(itinerary);
         const request = `${basis}\n\nAdjustment requested: ${text}`;
         const result = await planItinerary(request, {
           context: contextFor(itinerary),
@@ -2496,7 +2824,7 @@ export default function ItineraryScreen() {
         if (mySeq === editSeqRef.current) setEditBusy(false);
       }
     },
-    [itinerary, input, contextFor, persist, showUndo],
+    [itinerary, contextFor, persist, showUndo],
   );
 
   // Free-text adjustments — three-stage funnel:
@@ -2722,7 +3050,11 @@ export default function ItineraryScreen() {
             <View style={styles.sheetHeader}>
               <View style={{ flex: 1 }}>
                 <Text variant="micro" tone="tertiary" uppercase weight="bold">
-                  {loading ? 'Planning' : 'Sandbox · v2'}
+                  {loading
+                    ? 'Planning'
+                    : v4FellBack
+                      ? 'Sandbox · v4 → fallback'
+                      : `Sandbox · ${plannerMode}`}
                 </Text>
                 <Text variant="title3" weight="bold" tight numberOfLines={1}>
                   {headerTitle}
@@ -2807,6 +3139,48 @@ export default function ItineraryScreen() {
               </View>
             ) : null}
 
+            {showPlanLanding ? (
+              <View style={[styles.v3Row, { backgroundColor: t.colors.fill1 }]}>
+                <View style={{ flex: 1 }}>
+                  <Text variant="caption" weight="semibold">
+                    Planner pipeline (test)
+                  </Text>
+                  <Text variant="micro" tone="tertiary">
+                    {PLANNER_MODE_HINT[plannerMode]}
+                  </Text>
+                </View>
+                <View style={[styles.modeSegment, { backgroundColor: t.colors.fill2 }]}>
+                  {(['v2', 'v3', 'v4'] as const).map((m) => {
+                    const active = plannerMode === m;
+                    return (
+                      <Pressable
+                        key={m}
+                        onPress={() => {
+                          Haptics.selectionAsync().catch(() => undefined);
+                          setPlannerMode(m);
+                        }}
+                        hitSlop={6}
+                        style={[
+                          styles.modePill,
+                          active && { backgroundColor: t.colors.accent },
+                        ]}
+                      >
+                        <Text
+                          variant="caption"
+                          weight="bold"
+                          style={{
+                            color: active ? t.colors.textOnAccent : t.colors.textSecondary,
+                          }}
+                        >
+                          {m}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+            ) : null}
+
             {sections.length > 0 ? (
               <ScrollView
                 ref={tabsRef}
@@ -2884,11 +3258,31 @@ export default function ItineraryScreen() {
                   Tap an errand to add it into this plan · tap the arrow to edit.
                 </Text>
               ) : null}
+              {selectedErrandIds.size > 0 ? (
+                <DayBalanceCard score={planScore} surface="plain" />
+              ) : null}
+              {recurringDay.length > 0 ? (
+                <ErrandGroup
+                  label={`Repeats · ${dayMeta.title}`}
+                  count={recurringDay.length}
+                  items={recurringDay}
+                  emptyHint=""
+                  repeats
+                  onEdit={onEditErrand}
+                  onToggle={toggleErrandDone}
+                  selectedIds={selectedErrandIds}
+                  onToggleSelect={toggleErrandSelected}
+                />
+              ) : null}
               <ErrandGroup
                 label={dayGroupLabel}
-                count={dayErrands.length}
-                items={dayErrands}
-                emptyHint="Nothing for this day yet — add errands from home, then plan below."
+                count={dayOnlyErrands.length}
+                items={dayOnlyErrands}
+                emptyHint={
+                  recurringDay.length > 0
+                    ? 'No other errands for this day.'
+                    : 'Nothing for this day yet — add errands from home, then plan below.'
+                }
                 onEdit={onEditErrand}
                 onToggle={toggleErrandDone}
                 selectedIds={selectedErrandIds}
@@ -2977,10 +3371,6 @@ export default function ItineraryScreen() {
                   }
                   rearrangeMode={rearrangeMode}
                   onEnterRearrange={enterRearrange}
-                  onPressPlace={(it) => {
-                    Haptics.selectionAsync().catch(() => undefined);
-                    setSwapItem(it);
-                  }}
                   onPickAlternative={handlePickAlternative}
                   onOpenMenu={(it) => {
                     Haptics.selectionAsync().catch(() => undefined);
@@ -3151,34 +3541,41 @@ export default function ItineraryScreen() {
         onSubmit={submitAdjust}
       />
 
-      {/* The plan composer takes the bottom while there's no plan yet; once a
-          day is built the AdjustBar above replaces it. */}
-      <PlanComposer
-        visible={showPlanLanding}
-        busy={loading}
-        placeholder="Describe your day — e.g. deep work, lunch with a friend, then drinks"
-        allowEmpty={selectedErrandIds.size > 0}
-        onSubmit={(text) => planIt(text)}
-      />
+      {/* The plan actions take the bottom while there's no plan yet: add a new
+          errand for the day, or build the day from the ticked errands. Once a
+          day is built the AdjustBar above replaces this. */}
+      {showPlanLanding ? (
+        <View
+          pointerEvents="box-none"
+          style={[styles.planActions, { paddingBottom: Math.max(insets.bottom, 16) }]}
+        >
+          <Button
+            title="New errand"
+            variant="secondary"
+            onPress={openNewErrand}
+            leftIcon={<Ionicons name="add" size={18} color={t.colors.accent} />}
+            style={styles.planActionBtn}
+          />
+          <Button
+            title="Plan my day"
+            onPress={() => planIt()}
+            loading={loading}
+            disabled={selectedErrandIds.size === 0}
+            style={styles.planActionBtn}
+          />
+        </View>
+      ) : null}
 
-      <PlaceSwapSheet
-        item={swapItem}
-        city={itinerary?.city}
-        date={itinerary?.date}
-        prevCoords={swapNeighbors.prev}
-        nextCoords={swapNeighbors.next}
-        onClose={() => setSwapItem(null)}
-        onPick={(place: ItineraryPlace) => {
-          const target = swapItem;
-          setSwapItem(null);
-          if (target) applyEdit({ type: 'replacePlace', id: target.id, place });
-        }}
-      />
-
-      {/* One "..." entry point, two sheets: gaps get the gap-specific actions
-          (name / resize / split), every other block gets the standard ones. */}
+      {/* One "..." entry point (also the whole card), two sheets: gaps get the
+          gap-specific actions (name / resize / split), every other block gets
+          the standard ones — including the inline place editor. */}
       <ItemActionsSheet
         item={menuItem && menuItem.kind !== 'gap' ? menuItem : null}
+        city={itinerary?.city}
+        date={itinerary?.date}
+        searchCenter={menuSearch.center}
+        prevCoords={menuSearch.prev}
+        nextCoords={menuSearch.next}
         onClose={() => setMenuItemId(null)}
         onAdjustDuration={(deltaMin) => {
           if (!menuItem) return;
@@ -3189,9 +3586,10 @@ export default function ItineraryScreen() {
           setMenuItemId(null);
           applyEdit({ type: 'moveTime', id: menuItem.id, hhmm });
         }}
-        onSwapPlace={() => {
+        onSetPlace={(place) => {
           if (!menuItem) return;
-          setSwapItem(menuItem);
+          setMenuItemId(null);
+          applyEdit({ type: 'replacePlace', id: menuItem.id, place });
         }}
         onAddGapAfter={() => {
           if (!menuItem) return;
@@ -3260,9 +3658,11 @@ export default function ItineraryScreen() {
         rawText={errandRawText}
         parsing={false}
         seedKey={errandSeedKey}
-        mode="edit"
+        mode={errandDrawerMode}
+        currentErrandId={editErrandId}
+        fallbackCenter={home ? { latitude: home.latitude, longitude: home.longitude } : null}
         onSave={onSaveErrand}
-        onDelete={onDeleteErrand}
+        onDelete={errandDrawerMode === 'edit' ? onDeleteErrand : undefined}
       />
     </View>
   );
@@ -3282,6 +3682,7 @@ function ErrandGroup({
   onToggle,
   selectedIds,
   onToggleSelect,
+  repeats = false,
   completed = false,
   today,
   onReopen,
@@ -3299,6 +3700,8 @@ function ErrandGroup({
   /** When provided, rows become selectable (tap the circle to fold into plan). */
   selectedIds?: Set<string>;
   onToggleSelect?: (id: string) => void;
+  /** Badge every row with the recurring "repeat" glyph (the Repeats section). */
+  repeats?: boolean;
   /** Completed mode: rows show a status tag + pull-back, and aren't selectable. */
   completed?: boolean;
   today?: string;
@@ -3348,6 +3751,7 @@ function ErrandGroup({
             <ErrandRow
               key={errand.id}
               errand={errand}
+              repeats={repeats}
               onPress={completed ? undefined : () => onEdit(errand)}
               onToggleDone={() => onToggle(errand.id)}
               showSeparator={i < items.length - 1}
@@ -3574,7 +3978,6 @@ function SectionBlock({
   sectionPast,
   rearrangeMode,
   onEnterRearrange,
-  onPressPlace,
   onPickAlternative,
   onOpenMenu,
   onPressLeg,
@@ -3611,10 +4014,9 @@ function SectionBlock({
   rearrangeMode: boolean;
   /** Long-press a card -> enter rearrange mode. */
   onEnterRearrange: () => void;
-  onPressPlace: (item: ItineraryItem) => void;
   /** Tap an alternative venue thumbnail → swap the card's place to it. */
   onPickAlternative: (item: ItineraryItem, place: ItineraryPlace) => void;
-  /** Tap the "..." on a card → open the per-card actions sheet. */
+  /** Tap a card (or its "...") → open the per-card actions sheet. */
   onOpenMenu: (item: ItineraryItem) => void;
   /** Tap a travel connector → open the mode picker for that leg. */
   onPressLeg: (item: ItineraryItem) => void;
@@ -3713,9 +4115,14 @@ function SectionBlock({
                 </View>
               ) : null}
               <Pressable
+                onPress={rearrangeMode ? undefined : () => onOpenMenu(item)}
                 onLongPress={rearrangeMode ? undefined : onEnterRearrange}
                 delayLongPress={350}
-                style={[styles.cardWrap, past && styles.pastDim]}
+                style={({ pressed }) => [
+                  styles.cardWrap,
+                  past && styles.pastDim,
+                  pressed && !rearrangeMode && { opacity: 0.92 },
+                ]}
                 onLayout={(e) =>
                   onCardLayout(item.id, e.nativeEvent.layout.y, e.nativeEvent.layout.height)
                 }
@@ -3730,7 +4137,6 @@ function SectionBlock({
                     item={item}
                     dayDate={dayDate}
                     isContinuation={continuationIds.has(item.id)}
-                    onPressPlace={rearrangeMode ? undefined : () => onPressPlace(item)}
                     onPickAlternative={
                       rearrangeMode
                         ? undefined
@@ -4693,7 +5099,6 @@ function ItemCard({
   item,
   dayDate,
   isContinuation,
-  onPressPlace,
   onPickAlternative,
   onOpenMenu,
   hasConflict,
@@ -4708,8 +5113,6 @@ function ItemCard({
    * workout" — the title alone makes the continuity clear.
    */
   isContinuation?: boolean;
-  /** Tap-handler on the place block (opens the swap-place sheet). */
-  onPressPlace?: () => void;
   /** Tap-handler on an alternative venue thumbnail (swaps to that place). */
   onPickAlternative?: (place: ItineraryPlace) => void;
   /** Tap-handler on the "..." menu button (opens the per-card actions sheet). */
@@ -4787,11 +5190,9 @@ function ItemCard({
 
       {place ? (
         <>
-          <Pressable
-            onPress={onPressPlace}
-            disabled={!onPressPlace}
-            style={({ pressed }) => [styles.placeRow, pressed && onPressPlace && { opacity: 0.7 }]}
-          >
+          {/* The venue is shown for reference only; tapping anywhere on the card
+              opens the actions drawer (where the place can be changed). */}
+          <View style={styles.placeRow}>
             {place.photoUrl ? (
               <Image
                 source={{ uri: place.photoUrl }}
@@ -4828,15 +5229,7 @@ function ItemCard({
                 <OpenStatus status={place.openStatus} />
               ) : null}
             </View>
-            {onPressPlace ? (
-              <Ionicons
-                name="chevron-forward"
-                size={18}
-                color={t.colors.textTertiary}
-                style={styles.placeChevron}
-              />
-            ) : null}
-          </Pressable>
+          </View>
           {hours.warning ? (
             <View
               style={[
@@ -5008,6 +5401,19 @@ const styles = StyleSheet.create({
       android: { elevation: 4 },
     }),
   },
+  planActions: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: 'row',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+  },
+  planActionBtn: {
+    flex: 1,
+  },
   whenRow: {
     flexDirection: 'row',
     gap: 8,
@@ -5024,6 +5430,31 @@ const styles = StyleSheet.create({
   },
   whenChipText: {
     flexShrink: 1,
+  },
+  v3Row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 10,
+    paddingVertical: 8,
+    paddingLeft: 14,
+    paddingRight: 8,
+    borderRadius: 16,
+  },
+  modeSegment: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 2,
+    borderRadius: 999,
+    gap: 2,
+  },
+  modePill: {
+    minWidth: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderRadius: 999,
   },
   errandsWrap: {
     gap: 18,
@@ -5120,9 +5551,6 @@ const styles = StyleSheet.create({
   },
   metaText: {
     flexShrink: 1,
-  },
-  placeChevron: {
-    alignSelf: 'center',
   },
   altStrip: {
     marginTop: 10,

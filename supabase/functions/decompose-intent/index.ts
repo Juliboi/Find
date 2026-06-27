@@ -1,5 +1,9 @@
 // Supabase Edge Function: decompose-intent
 //
+// DEPRECATED / UNUSED: the app no longer has a free-text day planner, so this
+// function is retired from the client path (the planner now only orders/times
+// the user's pre-located errands). Kept deployed for reference; safe to delete.
+//
 // The planning BRAIN. Before the base planner ever runs, this turns the
 // planner's free-text field (and any vague / no-place errands) into a small set
 // of well-formed, neighbourhood-aware errand ITEMS the client can resolve

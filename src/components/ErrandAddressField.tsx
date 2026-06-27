@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -19,7 +19,10 @@ import {
 } from '@/lib/geocoding';
 import { getOpeningHoursStatus } from '@/lib/itinerary/hours';
 import { todayISO } from '@/utils/time';
+import { usePeopleStore } from '@/store/usePeopleStore';
+import { suggestPeople, type PersonSuggestion } from '@/lib/people/suggest';
 import type { VenueOpeningHours } from '@/types/itinerary';
+import type { LocationPin } from '@/store/useHomeStore';
 
 /**
  * A place selection. `label` is always set; coords + rich metadata (photo,
@@ -82,6 +85,12 @@ interface Props {
   value: AddressValue | null;
   /** Bias search toward here (the user's home) so nearby places rank first. */
   center?: { latitude: number; longitude: number } | null;
+  /**
+   * The user's saved home pin. When set, a one-tap "Home" shortcut appears (in
+   * the empty state and at the top of search) so they can place an errand at
+   * home without searching for their own address.
+   */
+  home?: LocationPin | null;
   /** Bumped by the parent whenever the form is (re)seeded. */
   seedKey: string;
   /**
@@ -95,6 +104,29 @@ interface Props {
   dateISO?: string;
   startTime?: string;
   endTime?: string;
+  /**
+   * When set, a typed query that fuzzily matches a saved person (by name or by
+   * their place's label) surfaces that saved place atop the live results — so a
+   * misspelled/mispronounced place ("Váš Praktik") still finds the saved one
+   * ("Váš praktika kobylisy"). Off in contexts where it'd be circular (e.g. the
+   * person editor itself).
+   */
+  suggestSavedPlaces?: boolean;
+  /**
+   * Bump this number to imperatively pop the search open (e.g. the host's
+   * "Specific location" button). The initial value is ignored — only changes
+   * after mount open the field — so it never fights the `seedQuery` auto-search.
+   */
+  autoOpenToken?: number;
+  /** Hide the built-in one-tap "Home" shortcut (when the host offers its own). */
+  hideHomeShortcut?: boolean;
+  /**
+   * When false, drop the "Use '…' as typed" escape hatch so the result must be
+   * a real, located place (the planner needs coordinates). Defaults to true.
+   */
+  allowUnpinned?: boolean;
+  /** Resting empty-state label. Defaults to the generic "tap to add" copy. */
+  emptyLabel?: string;
   onChange: (next: AddressValue | null) => void;
 }
 
@@ -108,14 +140,21 @@ interface Props {
 export function ErrandAddressField({
   value,
   center,
+  home,
   seedKey,
   seedQuery,
   dateISO,
   startTime,
   endTime,
+  suggestSavedPlaces,
+  autoOpenToken,
+  hideHomeShortcut,
+  allowUnpinned = true,
+  emptyLabel,
   onChange,
 }: Props) {
   const t = useTheme();
+  const people = usePeopleStore((s) => s.items);
   const [editing, setEditing] = useState(false);
   const [query, setQuery] = useState('');
   const [search, setSearch] = useState<SearchState>({ kind: 'idle' });
@@ -128,9 +167,34 @@ export function ErrandAddressField({
   // errand lands on a real, pinned business instead of plain text). Consumed
   // once, the first time results come back for that seed.
   const autoResolveRef = useRef(false);
+  // Skip the initial `autoOpenToken` value — only later bumps pop the field.
+  const autoOpenSeen = useRef(false);
 
   const located = value?.latitude != null && value?.longitude != null;
   const centerKey = center ? `${center.latitude},${center.longitude}` : '';
+
+  // Is the current selection already the home pin? (so we hide the shortcut).
+  const isHomeSelected =
+    !!home &&
+    value?.latitude != null &&
+    value?.longitude != null &&
+    Math.abs(value.latitude - home.latitude) < 1e-6 &&
+    Math.abs(value.longitude - home.longitude) < 1e-6;
+
+  // Saved people whose name or place label fuzzily matches the live query, shown
+  // above the live search hits. Cheap to recompute per keystroke.
+  const savedMatches = useMemo<PersonSuggestion[]>(() => {
+    if (!suggestSavedPlaces) return [];
+    const q = query.trim();
+    if (q.length < 2) return [];
+    return suggestPeople({
+      people,
+      nameText: q,
+      placeText: q,
+      skipPlaceLabel: value?.label ?? null,
+      limit: 3,
+    });
+  }, [suggestSavedPlaces, people, query, value?.label]);
 
   // React to (re)seeds: auto-open search for the AI's guess, else rest. We read
   // `seedQuery` (not `value`) because the parent commits `value` via an effect
@@ -153,6 +217,22 @@ export function ErrandAddressField({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedKey]);
+
+  // Host-driven "open the search now" pulse (the "Specific location" button).
+  // The first observed value is ignored so a mount doesn't fight `seedQuery`.
+  useEffect(() => {
+    if (autoOpenToken === undefined) return;
+    if (!autoOpenSeen.current) {
+      autoOpenSeen.current = true;
+      return;
+    }
+    sessionRef.current = newSessionToken();
+    setQuery(value?.label ?? '');
+    setSearch({ kind: 'idle' });
+    setEditing(true);
+    setTimeout(() => inputRef.current?.focus(), 60);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpenToken]);
 
   // Debounced place + address search while the field is open.
   useEffect(() => {
@@ -248,6 +328,31 @@ export function ErrandAddressField({
     closeEdit();
   };
 
+  // Pin a saved person's place straight from the search suggestions.
+  const pickSaved = (s: PersonSuggestion) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    onChange({
+      label: s.place.label,
+      latitude: s.place.latitude,
+      longitude: s.place.longitude,
+      placeId: s.place.placeId ?? null,
+    });
+    closeEdit();
+  };
+
+  // One-tap "place this at home": pins the saved home coords so the planner can
+  // route to it, no searching for your own address.
+  const pickHome = () => {
+    if (!home) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    onChange({
+      label: home.label?.trim() || 'Home',
+      latitude: home.latitude,
+      longitude: home.longitude,
+    });
+    closeEdit();
+  };
+
   // ----------------------------------------------------------------- editing
   if (editing) {
     const q = query.trim();
@@ -293,6 +398,56 @@ export function ErrandAddressField({
         </View>
 
         <View style={styles.results}>
+          {/* Quick "Home" pick — shown before a real search is typed so placing
+              an errand at home is one tap, not a self-address lookup. */}
+          {home && !isHomeSelected && q.length < 3 && !hideHomeShortcut ? (
+            <HomeOption label={home.label} onPress={pickHome} />
+          ) : null}
+          {savedMatches.length > 0 ? (
+            <View
+              style={[styles.savedGroup, { borderBottomColor: t.colors.separator }]}
+            >
+              {savedMatches.map((s, i) => (
+                <Pressable
+                  key={s.person.id}
+                  onPress={() => pickSaved(s)}
+                  disabled={resolvingId !== null}
+                  style={({ pressed }) => [
+                    styles.hitRow,
+                    i > 0 && {
+                      borderTopWidth: StyleSheet.hairlineWidth,
+                      borderTopColor: t.colors.separator,
+                    },
+                    pressed && { opacity: 0.6 },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Use ${s.person.name}'s saved place: ${s.place.label}`}
+                >
+                  <Ionicons
+                    name="bookmark"
+                    size={16}
+                    color={t.colors.accentText}
+                    style={styles.hitIcon}
+                  />
+                  <View style={{ flex: 1 }}>
+                    <Text variant="bodySm" weight="semibold" numberOfLines={1}>
+                      {s.person.name}
+                    </Text>
+                    <Text variant="caption" tone="tertiary" numberOfLines={1}>
+                      {s.place.label}
+                    </Text>
+                  </View>
+                  <View
+                    style={[styles.savedTag, { backgroundColor: t.colors.accentSoft }]}
+                  >
+                    <Text variant="micro" weight="bold" tone="accent" uppercase>
+                      Saved
+                    </Text>
+                  </View>
+                </Pressable>
+              ))}
+            </View>
+          ) : null}
           {search.kind === 'searching' ? (
             <View style={styles.statusRow}>
               <ActivityIndicator size="small" color={t.colors.textSecondary} />
@@ -352,8 +507,9 @@ export function ErrandAddressField({
               })
             : null}
 
-          {/* Manual escape hatch: keep whatever was typed as an unpinned place. */}
-          {q.length > 0 ? (
+          {/* Manual escape hatch: keep whatever was typed as an unpinned place.
+              Hidden when the host requires a located place (needs coordinates). */}
+          {q.length > 0 && allowUnpinned ? (
             <Pressable
               onPress={keepAsTyped}
               style={({ pressed }) => [
@@ -384,21 +540,27 @@ export function ErrandAddressField({
   // ------------------------------------------------------------ resting: empty
   if (!value) {
     return (
-      <Pressable
-        onPress={openEdit}
-        style={({ pressed }) => [
-          styles.restEmpty,
-          { backgroundColor: t.colors.fill1, borderColor: t.colors.separator },
-          pressed && { opacity: 0.7 },
-        ]}
-        accessibilityRole="button"
-        accessibilityLabel="Add a place"
-      >
-        <Ionicons name="search" size={17} color={t.colors.textTertiary} />
-        <Text variant="body" tone="tertiary" style={{ flex: 1 }}>
-          Anywhere — tap to add a place
-        </Text>
-      </Pressable>
+      <View style={styles.emptyWrap}>
+        <Pressable
+          onPress={openEdit}
+          style={({ pressed }) => [
+            styles.restEmpty,
+            { backgroundColor: t.colors.fill1, borderColor: t.colors.separator },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Add a place"
+        >
+          <Ionicons name="search" size={17} color={t.colors.textTertiary} />
+          <Text variant="body" tone="tertiary" style={{ flex: 1 }}>
+            {emptyLabel ?? 'Anywhere — tap to add a place'}
+          </Text>
+        </Pressable>
+        {/* Skip the self-address search: one tap to drop the errand at home. */}
+        {home && !hideHomeShortcut ? (
+          <HomeOption label={home.label} onPress={pickHome} />
+        ) : null}
+      </View>
     );
   }
 
@@ -517,7 +679,62 @@ export function ErrandAddressField({
   );
 }
 
+/**
+ * One-tap "use my home" shortcut. Renders a small home badge, the word "Home",
+ * and the saved address beneath it. Shown in the empty state and atop search so
+ * the user never has to look up their own address.
+ */
+function HomeOption({ label, onPress }: { label: string; onPress: () => void }) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.homeOption,
+        { backgroundColor: t.colors.fill1, borderColor: t.colors.separator },
+        pressed && { opacity: 0.7 },
+      ]}
+      accessibilityRole="button"
+      accessibilityLabel="Use home as the place"
+    >
+      <View style={[styles.homeBadge, { backgroundColor: t.colors.accentSoft }]}>
+        <Ionicons name="home" size={15} color={t.colors.accentText} />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text variant="bodySm" weight="semibold">
+          Home
+        </Text>
+        {label?.trim() ? (
+          <Text variant="caption" tone="tertiary" numberOfLines={1}>
+            {label}
+          </Text>
+        ) : null}
+      </View>
+      <Ionicons name="arrow-forward" size={15} color={t.colors.textTertiary} />
+    </Pressable>
+  );
+}
+
 const styles = StyleSheet.create({
+  emptyWrap: {
+    gap: 8,
+  },
+  homeOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  homeBadge: {
+    width: 30,
+    height: 30,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   wrap: {
     gap: 8,
   },
@@ -545,6 +762,15 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingVertical: 10,
     paddingHorizontal: 4,
+  },
+  savedGroup: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    marginBottom: 2,
+  },
+  savedTag: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
   },
   hitRow: {
     flexDirection: 'row',

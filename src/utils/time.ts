@@ -21,6 +21,38 @@ export function minutesOfDay(hhmm?: string | null): number | null {
   return h * 60 + m;
 }
 
+/**
+ * The three ways an errand (or recurring template) can relate to the clock:
+ *   - 'anytime'  — no start; the planner places it freely.
+ *   - 'at'       — a fixed start (its block is start … start+duration).
+ *   - 'between'  — an availability WINDOW [start, end] the planner schedules a
+ *                  `durationMin` block inside (the user is "open" in that range).
+ *
+ * "between" is encoded with the existing fields (start = window start, end =
+ * window end, durationMin = length) and recognised by its slack: the window is
+ * longer than the work, i.e. `end − start > durationMin`. A fixed "at a time"
+ * errand always has `end = start + durationMin` (no slack), so the two never
+ * collide.
+ */
+export type TimeMode = 'anytime' | 'at' | 'between';
+
+export function errandTimeMode(
+  startTime?: string | null,
+  endTime?: string | null,
+  durationMin?: number | null,
+): TimeMode {
+  if (!startTime) return 'anytime';
+  // A fixed "at a time" errand always ends exactly `durationMin` after it starts.
+  // An end that DOESN'T match that (a wider — or otherwise different — span) is an
+  // availability window the user opened for the errand: "between" mode.
+  if (endTime && durationMin != null) {
+    const e = minutesOfDay(endTime);
+    const expectedEnd = minutesOfDay(addMinutes(startTime, durationMin));
+    if (e != null && expectedEnd != null && e !== expectedEnd) return 'between';
+  }
+  return 'at';
+}
+
 export function addMinutes(hhmm: string, minutes: number): string {
   const [hStr, mStr] = hhmm.split(':');
   const total = Number(hStr) * 60 + Number(mStr) + minutes;

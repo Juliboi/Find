@@ -12,6 +12,8 @@ import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
 import { useSavedItineraries } from '@/store/useSavedItineraries';
 import {
   normalizeTime,
+  MEAL_WINDOW_COLUMN,
+  type MealWindowsInput,
   type OnboardingInput,
   type ProfileRow,
 } from '@/types/profile';
@@ -41,6 +43,12 @@ interface AuthState {
   ) => Promise<{ needsConfirmation: boolean }>;
   fetchProfile: () => Promise<void>;
   saveOnboarding: (input: OnboardingInput) => Promise<void>;
+  /**
+   * Patch one or more meal windows in isolation (e.g. tweaked from the planner
+   * drawer) without re-saving the whole onboarding profile. Updates the local
+   * mirror immediately, then best-effort persists to the `profiles` table.
+   */
+  updateMealWindows: (windows: Partial<MealWindowsInput>) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
@@ -316,6 +324,34 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const saved = data as ProfileRow;
     applyProfileToStores(saved);
     set({ profile: saved, profileLoaded: true, needsOnboarding: false });
+  },
+
+  updateMealWindows: async (windows) => {
+    // Apply locally first so the meals step + planner read the new windows
+    // straight away (and the change survives a relaunch via the persisted
+    // mirror) even before — or without — a backend round-trip.
+    useProfileStore.getState().hydrate(windows);
+
+    const user = get().user;
+    // No backend / not signed in: the local mirror is the source of truth.
+    if (!supabase || !user) return;
+
+    const patch: Record<string, string> = {};
+    (Object.keys(windows) as (keyof MealWindowsInput)[]).forEach((key) => {
+      const value = windows[key];
+      if (value) patch[MEAL_WINDOW_COLUMN[key]] = value;
+    });
+    if (Object.keys(patch).length === 0) return;
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update(patch)
+      .eq('id', user.id)
+      .select()
+      .single();
+    // Best-effort: a failed write (offline, etc.) keeps the optimistic local
+    // value, which the next successful save reconciles.
+    if (!error && data) set({ profile: data as ProfileRow });
   },
 
   signOut: async () => {

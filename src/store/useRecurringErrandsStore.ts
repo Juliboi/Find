@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { uid } from '@/utils/id';
+import type { TravelPref } from '@/store/useErrandsStore';
 import {
   deleteRecurringErrandRemote,
   pullRecurringErrands,
@@ -27,13 +28,23 @@ export interface RecurringErrand {
   /** JS weekday numbers 0..6 (0 = Sunday). Empty = never fires. */
   weekdays: number[];
   startTime?: string;
+  /**
+   * The "to" edge of a Between availability window. When set (alongside
+   * `startTime`), the template means "open between start…end" and the planner
+   * fits a `durationMin` block inside; when absent, `startTime` is a fixed time.
+   */
+  endTime?: string;
   durationMin?: number;
   address?: string;
   latitude?: number;
   longitude?: number;
   placeId?: string;
-  autoPlace?: boolean;
-  placeQuery?: string;
+  /**
+   * How to get to this errand — `'commute'` or `'car'` — inherited by every
+   * materialized occurrence. Only meaningful with a located place; unset means
+   * "use the user's default" (car if they own one). Mirrors `Errand.travelMode`.
+   */
+  travelMode?: TravelPref;
   notes?: string;
   /** Dates ("YYYY-MM-DD") the user skipped this occurrence on. */
   skippedDates: string[];
@@ -47,13 +58,13 @@ export type RecurringErrandInput = Pick<
   | 'title'
   | 'weekdays'
   | 'startTime'
+  | 'endTime'
   | 'durationMin'
   | 'address'
   | 'latitude'
   | 'longitude'
   | 'placeId'
-  | 'autoPlace'
-  | 'placeQuery'
+  | 'travelMode'
   | 'notes'
 >;
 
@@ -84,6 +95,11 @@ function numOrUndef(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** Keep only a valid travel preference; anything else → undefined. */
+function cleanMode(value: unknown): TravelPref | undefined {
+  return value === 'commute' || value === 'car' ? value : undefined;
+}
+
 /** Keep only valid, unique JS weekday numbers (0..6), sorted. */
 function cleanWeekdays(list: number[] | undefined | null): number[] {
   if (!Array.isArray(list)) return [];
@@ -96,19 +112,20 @@ function cleanWeekdays(list: number[] | undefined | null): number[] {
 
 function normalizeInput(input: RecurringErrandInput): RecurringErrandInput {
   const address = clean(input.address);
-  // Auto-place ("Let Diem find it") only applies when no real place is pinned.
-  const autoPlace = !address && input.autoPlace === true;
+  const startTime = clean(input.startTime);
   return {
     title: clean(input.title) ?? 'Untitled',
     weekdays: cleanWeekdays(input.weekdays),
-    startTime: clean(input.startTime),
+    startTime,
+    // A window "to" only makes sense alongside a "from".
+    endTime: startTime ? clean(input.endTime) : undefined,
     durationMin: numOrUndef(input.durationMin),
     address,
     latitude: address ? numOrUndef(input.latitude) : undefined,
     longitude: address ? numOrUndef(input.longitude) : undefined,
     placeId: address ? clean(input.placeId) : undefined,
-    autoPlace: autoPlace ? true : undefined,
-    placeQuery: autoPlace ? clean(input.placeQuery) ?? clean(input.title) : undefined,
+    // A travel preference only means something with a destination.
+    travelMode: address ? cleanMode(input.travelMode) : undefined,
     notes: clean(input.notes),
   };
 }
@@ -122,7 +139,16 @@ function mergeRecurring(
   for (const e of local) byId.set(e.id, e);
   for (const r of remote) {
     const l = byId.get(r.id);
-    if (!l || r.updatedAt >= l.updatedAt) byId.set(r.id, r);
+    if (!l || r.updatedAt >= l.updatedAt) {
+      // Keep a local travel preference when the server copy has none yet
+      // (migration 0013 may not be applied) — see useErrandsStore.mergeErrands.
+      byId.set(
+        r.id,
+        l && r.travelMode === undefined && l.travelMode !== undefined
+          ? { ...r, travelMode: l.travelMode }
+          : r,
+      );
+    }
   }
   return [...byId.values()].slice(0, MAX_RECURRING);
 }
@@ -155,20 +181,21 @@ export const useRecurringErrandsStore = create<RecurringErrandsState>()(
             if ('title' in patch) next.title = clean(patch.title) ?? e.title;
             if ('weekdays' in patch) next.weekdays = cleanWeekdays(patch.weekdays);
             if ('startTime' in patch) next.startTime = clean(patch.startTime);
+            if ('endTime' in patch) next.endTime = clean(patch.endTime);
+            // A window "to" can't outlive its "from".
+            if (!next.startTime) next.endTime = undefined;
             if ('durationMin' in patch) next.durationMin = numOrUndef(patch.durationMin);
             if ('notes' in patch) next.notes = clean(patch.notes);
-            // Address + auto-place + place metadata move together (see errands).
-            if ('address' in patch || 'autoPlace' in patch || 'placeQuery' in patch) {
+            if ('travelMode' in patch) next.travelMode = cleanMode(patch.travelMode);
+            // Address + place metadata move together (see errands store).
+            if ('address' in patch) {
               const addr = clean(patch.address);
-              const auto = !addr && patch.autoPlace === true;
               next.address = addr;
               next.latitude = addr ? numOrUndef(patch.latitude) : undefined;
               next.longitude = addr ? numOrUndef(patch.longitude) : undefined;
               next.placeId = addr ? clean(patch.placeId) : undefined;
-              next.autoPlace = auto ? true : undefined;
-              next.placeQuery = auto
-                ? clean(patch.placeQuery) ?? next.placeQuery ?? clean(next.title)
-                : undefined;
+              // A travel preference is meaningless without a destination.
+              next.travelMode = next.address ? next.travelMode : undefined;
             }
             return next;
           }),

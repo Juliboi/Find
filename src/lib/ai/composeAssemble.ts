@@ -8,22 +8,21 @@
  *
  *   - placement "anchor"   → the located user errand's own venue (verbatim).
  *   - placement "colocate" → shares an existing anchor's venue.
- *   - placement "find"     → Google Places (`resolveAutoPlace`), neighbourhood-
- *                            centred, ranked by least detour; best venue chosen,
- *                            the rest kept as swappable alternatives.
- *   - placement "venue"    → the venue the user NAMED, geocoded verbatim.
+ *   - placement "find"     → place-less. Diem no longer searches venues; the
+ *                            user pins a location on their errand instead.
+ *   - placement "venue"    → place-less (same as find — no AI venue lookup).
  *   - placement "home"     → no venue (an at-home / online block).
  *
- * Venue truth therefore stays with Google Places (reliable), and the per-minute
- * clock + travel + gaps are laid down afterward by the routing engine
+ * Venue truth therefore stays entirely with the user's located errands, and the
+ * per-minute clock + travel + gaps are laid down afterward by the routing engine
  * (recompute-itinerary). PINNED user times are re-applied from the source errand
  * so the LLM can never corrupt a hard commitment.
  */
 import { Itinerary, ItineraryPlace } from '@/types/itinerary';
 import { sanitizeItinerary } from '@/lib/ai/itinerary';
-import { resolveAutoPlaceVenues } from '@/lib/resolveAutoPlace';
-import { findPlaces, type Coords, type NearbyPlace } from '@/lib/places';
+import { type Coords } from '@/lib/places';
 import type { ComposedBlock } from '@/lib/ai/composeItinerary';
+import { errandTimeMode } from '@/utils/time';
 
 /** A located user errand's resolved venue + any pinned time, keyed by errand id. */
 export interface AssembleAnchor {
@@ -56,16 +55,14 @@ export interface AssembleArgs {
   dayAnchorCoords: Coords[];
   start: Coords | null;
   end: Coords | null;
+  /** The user's home (kept for context/centring; no longer drives venue search). */
+  home?: Coords | null;
 }
 
 export interface AssembleResult {
   itinerary: Itinerary | null;
   /** coordKey → ranked alternative venues, attached by the caller after show. */
   altByCoordKey: Map<string, ItineraryPlace[]>;
-}
-
-function coordKey(lat: number, lng: number): string {
-  return `${lat.toFixed(5)},${lng.toFixed(5)}`;
 }
 
 /**
@@ -92,30 +89,27 @@ function normTitle(s: string | undefined | null): string {
 const BUFFER_TITLE_RE =
   /\b(wind[\s-]*down|winddown|calm(?:\s*time)?|unwind|decompress|down[\s-]*time|chill|relax(?:ation)?|leisure|me[\s-]*time|free[\s-]*time|buffer)\b/i;
 
-function centroid(points: Coords[]): Coords | null {
-  if (points.length === 0) return null;
-  const sum = points.reduce(
-    (a, p) => ({ latitude: a.latitude + p.latitude, longitude: a.longitude + p.longitude }),
-    { latitude: 0, longitude: 0 },
-  );
-  return { latitude: sum.latitude / points.length, longitude: sum.longitude / points.length };
+/**
+ * DEV-only: how the compose brain classified each block on the most recent
+ * assemble. Surfaced in the `[day-snapshot]` log so we can see, per block,
+ * whether the brain chose `find` (Diem picks), `venue` (brain named a place),
+ * `anchor` (a located user errand placed verbatim), etc. — the thing that
+ * decides whether the find resolver even runs.
+ */
+export interface ComposedBlockTrace {
+  i: number;
+  title: string;
+  placement: string;
+  findQuery?: string | null;
+  userQuery?: string | null;
+  area?: string | null;
+  anchorId?: string | null;
+  /** The located errand's saved venue name + coords, when this is an anchor. */
+  anchorPlace?: string | null;
+  anchorCoords?: string | null;
+  taskId?: string | null;
 }
-
-/** NearbyPlace → ItineraryPlace (mirrors itinerary.tsx's nearbyToItineraryPlace). */
-function nearbyToPlace(p: NearbyPlace): ItineraryPlace {
-  return {
-    name: p.name,
-    category: p.types?.[0]?.replace(/_/g, ' '),
-    address: p.address ?? undefined,
-    rating: p.rating ?? undefined,
-    ratingCount: p.ratingCount ?? undefined,
-    priceLevel:
-      typeof p.priceLevel === 'number' ? '$'.repeat(Math.max(1, p.priceLevel)) : undefined,
-    coords: { latitude: p.latitude, longitude: p.longitude },
-    photoUrl: p.photoUrl ?? undefined,
-    openingHours: p.openingHours ?? undefined,
-  };
-}
+export let lastComposedBlocks: ComposedBlockTrace[] = [];
 
 /**
  * Resolve every block's placement to a venue (or none) and assemble the ordered
@@ -126,38 +120,27 @@ function nearbyToPlace(p: NearbyPlace): ItineraryPlace {
 export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleResult> {
   const altByCoordKey = new Map<string, ItineraryPlace[]>();
   const blocks = args.blocks ?? [];
+  lastComposedBlocks = blocks.map((b, i) => {
+    const a = b.anchorId ? args.anchorsById.get(b.anchorId) : undefined;
+    const ac = a?.place.coords;
+    return {
+      i,
+      title: b.title,
+      placement: b.placement,
+      findQuery: b.findQuery ?? null,
+      userQuery: b.userQuery ?? null,
+      area: b.area ?? null,
+      anchorId: b.anchorId ?? null,
+      anchorPlace: a?.place.name ?? null,
+      anchorCoords: ac ? `${ac.latitude.toFixed(4)},${ac.longitude.toFixed(4)}` : null,
+      taskId: b.taskId ?? null,
+    };
+  });
   if (blocks.length === 0) return { itinerary: null, altByCoordKey };
 
-  // 1) Batch-resolve every "find" block through the area-aware Places search.
-  const findItems = blocks
-    .map((b, i) => ({ b, key: `cb-${i}` }))
-    .filter(({ b }) => b.placement === 'find' && b.findQuery)
-    .map(({ b, key }) => ({ id: key, query: b.findQuery as string, area: b.area ?? undefined }));
-  const findResults = findItems.length
-    ? await resolveAutoPlaceVenues({
-        items: findItems,
-        anchors: args.dayAnchorCoords,
-        start: args.start,
-        end: args.end,
-      })
-    : new Map<string, NearbyPlace[]>();
-
-  // 2) Geocode every "venue" block (a venue the user named verbatim) in parallel.
-  const center = centroid(args.dayAnchorCoords) ?? args.start ?? args.end ?? undefined;
-  const venueResults = new Map<string, NearbyPlace[]>();
-  await Promise.all(
-    blocks.map(async (b, i) => {
-      if (b.placement !== 'venue' || !b.userQuery) return;
-      try {
-        const res = await findPlaces(b.userQuery, b.userQuery, center, undefined, { limit: 4 });
-        if (res.places.length) venueResults.set(`cb-${i}`, res.places);
-      } catch {
-        // best-effort — falls back to a place-less block
-      }
-    }),
-  );
-
-  // 3) Build an ordered item per block, attaching the resolved venue + pinned time.
+  // Build an ordered item per block. Only located user errands (anchor /
+  // colocate) carry a venue — every other placement is place-less now, since
+  // Diem no longer searches Google Places on the user's behalf.
   const referencedAnchors = new Set<string>();
   const referencedTasks = new Set<string>();
   // Normalized titles already emitted into the main plan, so the safety net can
@@ -176,6 +159,11 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       startTime?: string | null;
       endTime?: string | null;
       durationMin?: number | null;
+      /** A "between" availability window — the block flexes within [start, end]. */
+      windowStart?: string | null;
+      windowEnd?: string | null;
+      /** Overrides the block's own flexibility (e.g. forcing 'window'). */
+      flexibility?: ComposedBlock['flexibility'];
       place?: ItineraryPlace;
     },
   ) => {
@@ -186,10 +174,12 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
     rawItems.push({
       title: b.title,
       kind: asGap ? 'gap' : b.kind,
-      flexibility: asGap ? 'flexible' : b.flexibility,
+      flexibility: asGap ? 'flexible' : opts.flexibility ?? b.flexibility,
       startTime: opts.startTime ?? undefined,
       endTime: opts.endTime ?? undefined,
       durationMinutes: opts.durationMin ?? undefined,
+      windowStart: opts.windowStart ?? undefined,
+      windowEnd: opts.windowEnd ?? undefined,
       place: opts.place,
       description: b.description ?? undefined,
       __section: (b.section || b.period || 'Your day').toString(),
@@ -215,7 +205,6 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
 
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
-    const key = `cb-${i}`;
 
     // Pinned time: a block linked to a source errand inherits THAT errand's hard
     // time (the brain can't corrupt it); otherwise use the brain's own pin.
@@ -250,9 +239,25 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       pinnedStart = srcStart ?? b.startTime ?? null;
       duration = srcDur ?? b.durationMin ?? null;
     }
-    const pinnedEnd = pinnedStart
+    let pinnedEnd = pinnedStart
       ? (firstSession || !isSplit ? srcEnd ?? b.endTime ?? null : b.endTime ?? null)
       : null;
+
+    // A "between" source errand is an availability WINDOW, not a pin: the user is
+    // open across [start, end] and the work (durationMin) is shorter. Emit it as
+    // a duration-long "window" block the router places — and the cascade keeps —
+    // INSIDE that range, instead of nailing it to the window's start.
+    let windowStart: string | null = null;
+    let windowEnd: string | null = null;
+    let flexOverride: ComposedBlock['flexibility'] | undefined;
+    if (!isSplit && errandTimeMode(srcStart, srcEnd, srcDur) === 'between') {
+      windowStart = srcStart;
+      windowEnd = srcEnd;
+      duration = srcDur ?? duration;
+      pinnedStart = null;
+      pinnedEnd = null;
+      flexOverride = 'window';
+    }
     if (b.anchorId && anchorSrc) referencedAnchors.add(b.anchorId);
     if (b.taskId && taskSrc) referencedTasks.add(b.taskId);
 
@@ -260,22 +265,19 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
     if ((b.placement === 'anchor' || b.placement === 'colocate') && anchorSrc) {
       // The located errand's own venue, kept verbatim.
       place = { ...anchorSrc.place, userNamed: true };
-    } else if (b.placement === 'find') {
-      const list = findResults.get(key) ?? [];
-      if (list[0]) {
-        place = nearbyToPlace(list[0]);
-        const alts = list.slice(1).map(nearbyToPlace);
-        if (alts.length && place.coords) {
-          altByCoordKey.set(coordKey(place.coords.latitude, place.coords.longitude), alts);
-        }
-      }
-    } else if (b.placement === 'venue') {
-      const list = venueResults.get(key) ?? [];
-      if (list[0]) place = { ...nearbyToPlace(list[0]), userNamed: true };
     }
-    // placement "home" (or anything that resolved to nothing) → no place.
+    // Every other placement (find / venue / home / unresolved) is place-less —
+    // the user pins a real location on the errand if they want one.
 
-    pushItem(b, { startTime: pinnedStart, endTime: pinnedEnd, durationMin: duration, place });
+    pushItem(b, {
+      startTime: pinnedStart,
+      endTime: pinnedEnd,
+      durationMin: duration,
+      windowStart,
+      windowEnd,
+      flexibility: flexOverride,
+      place,
+    });
   }
 
   // 3b) Safety net — never silently drop a user errand the brain forgot to
@@ -286,17 +288,55 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
   for (const [id, a] of args.anchorsById) {
     if (referencedAnchors.has(id)) continue;
     if (emittedTitles.has(normTitle(a.title))) continue;
+    const between = errandTimeMode(a.startTime, a.endTime, a.durationMin) === 'between';
     pushItem(
-      { title: a.title, kind: 'other', flexibility: a.startTime ? 'fixed' : 'flexible', section: 'Also today', period: null, description: null },
-      { startTime: a.startTime ?? null, endTime: a.endTime ?? null, durationMin: a.durationMin ?? null, place: { ...a.place, userNamed: true } },
+      {
+        title: a.title,
+        kind: 'other',
+        flexibility: between ? 'window' : a.startTime ? 'fixed' : 'flexible',
+        section: 'Also today',
+        period: null,
+        description: null,
+      },
+      between
+        ? {
+            durationMin: a.durationMin ?? null,
+            windowStart: a.startTime ?? null,
+            windowEnd: a.endTime ?? null,
+            place: { ...a.place, userNamed: true },
+          }
+        : {
+            startTime: a.startTime ?? null,
+            endTime: a.endTime ?? null,
+            durationMin: a.durationMin ?? null,
+            place: { ...a.place, userNamed: true },
+          },
     );
   }
   for (const [id, t] of args.tasksById) {
     if (referencedTasks.has(id)) continue;
     if (emittedTitles.has(normTitle(t.title))) continue;
+    const between = errandTimeMode(t.startTime, t.endTime, t.durationMin) === 'between';
     pushItem(
-      { title: t.title, kind: 'other', flexibility: t.startTime ? 'fixed' : 'flexible', section: 'Also today', period: null, description: null },
-      { startTime: t.startTime ?? null, endTime: t.endTime ?? null, durationMin: t.durationMin ?? null },
+      {
+        title: t.title,
+        kind: 'other',
+        flexibility: between ? 'window' : t.startTime ? 'fixed' : 'flexible',
+        section: 'Also today',
+        period: null,
+        description: null,
+      },
+      between
+        ? {
+            durationMin: t.durationMin ?? null,
+            windowStart: t.startTime ?? null,
+            windowEnd: t.endTime ?? null,
+          }
+        : {
+            startTime: t.startTime ?? null,
+            endTime: t.endTime ?? null,
+            durationMin: t.durationMin ?? null,
+          },
     );
   }
 

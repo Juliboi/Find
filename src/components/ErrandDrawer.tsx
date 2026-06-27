@@ -11,6 +11,7 @@ import { ErrandDiscoverStep } from './ErrandDiscoverStep';
 import { ENTER, EXIT } from './errandDrawerAnim';
 import type { ErrandDraft } from '@/lib/ai/parseErrand';
 import type { ErrandInput } from '@/store/useErrandsStore';
+import { useHomeStore } from '@/store/useHomeStore';
 import type { Coords, NearbyPlace } from '@/lib/places';
 
 /**
@@ -42,6 +43,8 @@ interface Props {
    */
   seedKey: string;
   mode: 'create' | 'edit';
+  /** The id of the errand being edited, so "at an existing errand" excludes it. */
+  currentErrandId?: string | null;
   /** Which step to open on. Defaults to the confirm form. */
   initialStep?: ErrandStep;
   /** Search shape for the discover step (set when `initialStep` is 'discover'). */
@@ -71,32 +74,6 @@ function mergePlaceIntoDraft(base: ErrandDraft, p: NearbyPlace, fallbackTitle: s
     ratingCount: p.ratingCount ?? null,
     priceLevel: p.priceLevel ?? null,
     openingHours: p.openingHours ?? null,
-    autoPlace: null,
-    placeQuery: null,
-  };
-}
-
-/**
- * Builds the confirm-form seed for "Let Diem find it": keep the parsed plan
- * fields (title, date, time, notes) but pin NO venue — flag it auto-place and
- * carry the search category so the planner can pick the best spot when the
- * errand is folded into a day.
- */
-function autoPlaceDraft(base: ErrandDraft, query: string, fallbackTitle: string): ErrandDraft {
-  return {
-    ...base,
-    title: base.title?.trim() ? base.title : fallbackTitle,
-    address: null,
-    latitude: null,
-    longitude: null,
-    placeId: null,
-    photoUrl: null,
-    rating: null,
-    ratingCount: null,
-    priceLevel: null,
-    openingHours: null,
-    autoPlace: true,
-    placeQuery: query?.trim() ? query.trim() : fallbackTitle,
   };
 }
 
@@ -113,6 +90,7 @@ export function ErrandDrawer({
   parsing,
   seedKey,
   mode,
+  currentErrandId,
   initialStep = 'form',
   discovery,
   fallbackCenter,
@@ -120,11 +98,18 @@ export function ErrandDrawer({
   onDelete,
 }: Props) {
   const t = useTheme();
+  const home = useHomeStore((s) => s.home);
   const [step, setStep] = useState<ErrandStep>(initialStep);
   // When the user picks (or skips) a place in the discover step we flip to the
   // form with a freshly built seed. That seed overrides the parent's `draft`
   // until the drawer is re-opened or re-seeded.
   const [override, setOverride] = useState<{ draft: ErrandDraft; seedKey: string } | null>(null);
+  // A discover request raised FROM the form ("Discover" location method): the
+  // form's current fields (so edits survive) plus the search shape. Takes
+  // precedence over the parent's initial `discovery` while it's set.
+  const [formDiscover, setFormDiscover] = useState<
+    { base: ErrandDraft; seed: DiscoverySeed } | null
+  >(null);
 
   // Land on the intended step (and clear any prior pick) each time the drawer
   // (re)opens or a new request is seeded.
@@ -132,12 +117,37 @@ export function ErrandDrawer({
     if (open) {
       setStep(initialStep);
       setOverride(null);
+      setFormDiscover(null);
     }
   }, [open, seedKey, initialStep]);
 
   const formDraft = override?.draft ?? draft;
   const formSeedKey = override?.seedKey ?? seedKey;
-  const discoverQuery = discovery?.query ?? rawText;
+  // The base the discover step folds a pick into: the in-form snapshot when the
+  // user opened discover from the form, else the parent's parsed draft.
+  const discoverBase = formDiscover?.base ?? draft;
+  const activeDiscovery = formDiscover?.seed ?? discovery ?? null;
+  // The search SEED for the discover step. It MUST preserve an empty string: the
+  // form's "Discover" button opens with "" so the user writes the search (no
+  // auto-search), while the home composer routes here with its parsed phrase.
+  // (`|| rawText` here would resurrect the errand title and auto-search it.)
+  const discoverSeedQuery = activeDiscovery?.query ?? '';
+  // A fallback TITLE only — used when a pick / manual entry carries no written
+  // query (e.g. "Enter a place manually" tapped before searching anything).
+  const discoverFallbackTitle =
+    activeDiscovery?.query || discoverBase.title?.trim() || rawText;
+  // Discover searches around the parent's center, falling back to home.
+  const discoverCenter: Coords | null =
+    fallbackCenter ??
+    (home ? { latitude: home.latitude, longitude: home.longitude } : null);
+
+  // The form's "Discover" location method: snapshot its fields and open the
+  // place-suggestion step with an EMPTY search. The user writes what to look for
+  // themselves ("lunch around Karlín") rather than us reusing the errand title.
+  const requestDiscover = (snapshot: ErrandDraft) => {
+    setFormDiscover({ base: snapshot, seed: { query: '', area: null, nearby: false } });
+    setStep('discover');
+  };
 
   const eyebrow = step === 'discover' ? 'Find a place' : mode === 'edit' ? 'Edit errand' : 'New errand';
   const heading =
@@ -187,31 +197,29 @@ export function ErrandDrawer({
           </View>
         ) : step === 'discover' ? (
           <ErrandDiscoverStep
-            query={discoverQuery}
-            area={discovery?.area ?? null}
-            nearby={discovery?.nearby ?? false}
-            fallbackCenter={fallbackCenter ?? null}
-            anchorDate={draft.date ?? null}
-            anchorTime={draft.startTime ?? null}
-            onPick={(place) => {
+            query={discoverSeedQuery}
+            area={activeDiscovery?.area ?? null}
+            nearby={activeDiscovery?.nearby ?? false}
+            fallbackCenter={discoverCenter}
+            anchorDate={discoverBase.date ?? null}
+            anchorTime={discoverBase.startTime ?? null}
+            onPick={(place, q) => {
               setOverride({
-                draft: mergePlaceIntoDraft(draft, place, discoverQuery),
+                draft: mergePlaceIntoDraft(discoverBase, place, q || discoverFallbackTitle),
                 seedKey: `picked-${place.id}-${Date.now()}`,
               });
+              setFormDiscover(null);
               setStep('form');
             }}
-            onManual={() => {
+            onManual={(q) => {
               setOverride({
-                draft: { ...draft, title: draft.title?.trim() ? draft.title : discoverQuery },
+                draft: {
+                  ...discoverBase,
+                  title: discoverBase.title?.trim() ? discoverBase.title : q || discoverFallbackTitle,
+                },
                 seedKey: `manual-${Date.now()}`,
               });
-              setStep('form');
-            }}
-            onAutoPlan={() => {
-              setOverride({
-                draft: autoPlaceDraft(draft, discoverQuery, discoverQuery),
-                seedKey: `auto-${Date.now()}`,
-              });
+              setFormDiscover(null);
               setStep('form');
             }}
           />
@@ -223,8 +231,10 @@ export function ErrandDrawer({
             parsing={parsing}
             seedKey={formSeedKey}
             mode={mode}
+            currentErrandId={currentErrandId}
             onSave={onSave}
             onDelete={onDelete}
+            onRequestDiscover={requestDiscover}
           />
         )}
       </View>

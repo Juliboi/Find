@@ -65,6 +65,30 @@ export interface OnboardingInput {
   dietaryNotes: string | null;
 }
 
+/**
+ * The six "HH:MM" meal-window fields, editable on their own (e.g. from the
+ * planner drawer) without re-saving the entire onboarding profile. Keyed to the
+ * `useProfileStore` fields so a patch can flow straight into the local mirror.
+ */
+export interface MealWindowsInput {
+  breakfastStart: string;
+  breakfastEnd: string;
+  lunchStart: string;
+  lunchEnd: string;
+  dinnerStart: string;
+  dinnerEnd: string;
+}
+
+/** Maps each meal-window field to its `public.profiles` column. */
+export const MEAL_WINDOW_COLUMN: Record<keyof MealWindowsInput, string> = {
+  breakfastStart: 'breakfast_start',
+  breakfastEnd: 'breakfast_end',
+  lunchStart: 'lunch_start',
+  lunchEnd: 'lunch_end',
+  dinnerStart: 'dinner_start',
+  dinnerEnd: 'dinner_end',
+};
+
 /** Trim a Postgres "HH:MM:SS" time to the app's "HH:MM". */
 export function normalizeTime(t: string | null | undefined): string | null {
   if (!t) return null;

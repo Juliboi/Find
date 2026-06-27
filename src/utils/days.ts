@@ -105,3 +105,15 @@ export function roundedNowHHMM(step = 5): string {
 export function isPastDay(iso: string): boolean {
   return iso < todayISO();
 }
+
+/**
+ * Local midnight Date for the start of the week containing `iso`. Defaults to a
+ * Monday-start week (`weekStartsOn = 1`, the common European convention); pass
+ * `0` for a Sunday-start week.
+ */
+export function startOfWeek(iso: string, weekStartsOn = 1): Date {
+  const d = dateFromISO(iso);
+  const diff = (d.getDay() - weekStartsOn + 7) % 7;
+  d.setDate(d.getDate() - diff);
+  return d;
+}
