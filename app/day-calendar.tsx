@@ -31,6 +31,10 @@ import {
 import { useRecurringErrandsStore } from '@/store/useRecurringErrandsStore';
 import { materializeRecurringForDate, skipRecurringOccurrence } from '@/lib/recurring';
 import { buildDayCalendar, dayWindow } from '@/lib/calendar/dayCalendar';
+import { dayErrandsWithPlan, stampErrandLinks } from '@/lib/calendar/planProjection';
+import { usePlanGridEditor } from '@/lib/itinerary/usePlanGridEditor';
+import type { EditOp } from '@/lib/itinerary/edits';
+import type { ItineraryPlace } from '@/types/itinerary';
 import { type ErrandDraft } from '@/lib/ai/parseErrand';
 import { currentHHMM, formatDuration, minutesOfDay, todayISO } from '@/utils/time';
 import {
@@ -41,7 +45,7 @@ import {
   type DayOption,
 } from '@/utils/days';
 
-const HOUR_HEIGHT = 64;
+const HOUR_HEIGHT = 80;
 const WEEK_HOUR_HEIGHT = 52;
 const WEEK_GUTTER = 44;
 const H_PAD_DAY = 16;
@@ -143,6 +147,35 @@ export default function DayCalendarScreen() {
   const removeErrand = useErrandsStore((s) => s.remove);
   const savedTrips = useSavedItineraries((s) => s.items);
 
+  // ----- Plan focus mode (staged inline plan editing on the grid) -----
+  const {
+    planId: focusPlanId,
+    staged: stagedPlan,
+    busy: planBusy,
+    dirty: planDirty,
+    begin: beginPlanFocus,
+    edit: editPlanStaged,
+    confirm: confirmPlan,
+    cancel: cancelPlan,
+  } = usePlanGridEditor();
+  const focusActive = focusPlanId != null;
+  // While focused, the calendar projects the STAGED copy in place of the saved
+  // plan, so edits show instantly but nothing persists until Confirm.
+  const effectiveTrips = useMemo(() => {
+    if (!focusPlanId || !stagedPlan) return savedTrips;
+    return savedTrips.map((s) =>
+      s.id === focusPlanId ? { ...s, itinerary: stagedPlan } : s,
+    );
+  }, [savedTrips, focusPlanId, stagedPlan]);
+  const focusPlanTitle = useMemo(
+    () => (focusPlanId ? savedTrips.find((s) => s.id === focusPlanId)?.title : undefined),
+    [savedTrips, focusPlanId],
+  );
+  // If the focused plan is deleted elsewhere, abandon the session.
+  useEffect(() => {
+    if (focusPlanId && !savedTrips.some((s) => s.id === focusPlanId)) cancelPlan();
+  }, [focusPlanId, savedTrips, cancelPlan]);
+
   // The Monday-start week containing `date`, for the week view + its nav.
   const weekOptions = useMemo(() => upcomingWeek(7, startOfWeek(date)), [date]);
   const isThisWeek = useMemo(
@@ -161,9 +194,17 @@ export default function DayCalendarScreen() {
     else materializeRecurringForDate(date);
   }, [isWeek, date, weekOptions, recurringTemplates]);
 
+  // The day's active plan, merged with real errands so the calendar reflects the
+  // plan (and re-renders when it's edited). The plan is authoritative: errands it
+  // already represents are folded into their plan blocks instead of shown twice.
+  const dayErrands = useMemo(
+    () => dayErrandsWithPlan(effectiveTrips, date, errands),
+    [effectiveTrips, date, errands],
+  );
+
   const { timed, untimed } = useMemo(
-    () => buildDayCalendar(errands, date),
-    [errands, date],
+    () => buildDayCalendar(dayErrands, date),
+    [dayErrands, date],
   );
   const weekDays = useMemo<WeekDay[]>(
     () =>
@@ -172,9 +213,12 @@ export default function DayCalendarScreen() {
         weekdayShort: o.weekdayShort,
         dayNum: o.dayNum,
         isToday: o.iso === today,
-        events: buildDayCalendar(errands, o.iso).timed,
+        events: buildDayCalendar(
+          dayErrandsWithPlan(savedTrips, o.iso, errands),
+          o.iso,
+        ).timed,
       })),
-    [weekOptions, errands, today],
+    [weekOptions, errands, savedTrips, today],
   );
   const weekTimed = useMemo(() => weekDays.flatMap((d) => d.events), [weekDays]);
 
@@ -231,18 +275,111 @@ export default function DayCalendarScreen() {
   const [seedRaw, setSeedRaw] = useState('');
   const [seedKey, setSeedKey] = useState('seed-0');
 
-  const openEdit = useCallback((errand: Errand) => {
-    Haptics.selectionAsync().catch(() => undefined);
-    setEditId(errand.id);
-    setSeed(errandToDraft(errand));
-    setSeedRaw(errand.rawText);
-    setSeedKey(`edit-${errand.id}-${errand.updatedAt}`);
-    setDrawerOpen(true);
-  }, []);
+  // ----- Add-a-stop drawer (focus mode only; saves into the plan, not errands) -----
+  const [addStopOpen, setAddStopOpen] = useState(false);
+  const [addStopKey, setAddStopKey] = useState('addstop-0');
+
+  const openEdit = useCallback(
+    (errand: Errand) => {
+      Haptics.selectionAsync().catch(() => undefined);
+      // Plan blocks aren't editable errands — open the plan they belong to.
+      if (errand.planRef) {
+        router.push({ pathname: '/itinerary', params: { id: errand.planRef.planId } });
+        return;
+      }
+      setEditId(errand.id);
+      setSeed(errandToDraft(errand));
+      setSeedRaw(errand.rawText);
+      setSeedKey(`edit-${errand.id}-${errand.updatedAt}`);
+      setDrawerOpen(true);
+    },
+    [router],
+  );
 
   // Stable so a held card's gesture keeps a steady callback into edit mode.
   const beginEditFromHold = useCallback(() => setEditing(true), []);
   const exitEdit = useCallback(() => setEditing(false), []);
+
+  // Open the day's plan in the planner — the heavier edit path (venue swap, AI
+  // replan) for the plan, one tap away from the inline grid editing.
+  const openPlan = useCallback(() => {
+    if (!plan) return;
+    Haptics.selectionAsync().catch(() => undefined);
+    router.push({ pathname: '/itinerary', params: { id: plan.id } });
+  }, [plan, router]);
+
+  // Tapping a plan block enters (or switches) focus for that plan. Focus and
+  // errand-edit are mutually exclusive, so leave edit mode on the way in. The
+  // plan's errand links are healed first so dragging a stop never un-folds the
+  // errand it represents.
+  const onFocusPlan = useCallback(
+    (planId: string) => {
+      const entry = savedTrips.find((s) => s.id === planId);
+      if (!entry) return;
+      setEditing(false);
+      beginPlanFocus(planId, stampErrandLinks(entry.itinerary, date, errands));
+    },
+    [savedTrips, date, errands, beginPlanFocus],
+  );
+
+  // A staged grid edit on the focused plan (persists only on Confirm).
+  const onPlanEdit = editPlanStaged;
+
+  // Open the composer to add a new stop to the focused plan.
+  const openAddStop = useCallback(() => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setAddStopKey(`addstop-${Date.now()}`);
+    setAddStopOpen(true);
+  }, []);
+
+  // Save the composed stop into the staged plan as a brand-new item, anchored
+  // by its time so the cascade keeps the day in order.
+  const onAddStopSave = useCallback(
+    (input: ErrandInput) => {
+      setAddStopOpen(false);
+      const itin = stagedPlan;
+      if (!focusPlanId || !itin) return;
+      const startMin = minutesOfDay(input.startTime ?? null);
+      // The last visible stop that starts at/before the new one → insert after it
+      // (untimed adds fall to the end; an earliest stop goes before the first).
+      let afterId: string | undefined;
+      let firstVisibleId: string | undefined;
+      for (const section of itin.sections) {
+        for (const it of section.items) {
+          if (it.kind === 'gap' || it.kind === 'travel') continue;
+          if (!firstVisibleId) firstVisibleId = it.id;
+          const s = minutesOfDay(it.startTime ?? null);
+          if (startMin == null || (s != null && s <= startMin)) afterId = it.id;
+        }
+      }
+      const beforeId = afterId ? undefined : firstVisibleId;
+      const located = input.latitude != null && input.longitude != null;
+      const place: ItineraryPlace | undefined =
+        located || input.address
+          ? {
+              name: input.title,
+              address: input.address ?? undefined,
+              photoUrl: input.photoUrl ?? undefined,
+              coords: located
+                ? { latitude: input.latitude as number, longitude: input.longitude as number }
+                : undefined,
+            }
+          : undefined;
+      const op: EditOp = {
+        type: 'insertItem',
+        afterId,
+        beforeId,
+        item: {
+          title: input.title,
+          startTime: input.startTime ?? null,
+          durationMinutes: input.durationMin ?? null,
+          place,
+        },
+      };
+      editPlanStaged([op]);
+    },
+    [stagedPlan, focusPlanId, editPlanStaged],
+  );
 
   const onSave = (input: ErrandInput) => {
     if (editId) updateErrand(editId, input);
@@ -312,11 +449,12 @@ export default function DayCalendarScreen() {
             label="Back"
             onPress={() => {
               Haptics.selectionAsync().catch(() => undefined);
-              if (editing) setEditing(false);
+              if (focusActive) cancelPlan();
+              else if (editing) setEditing(false);
               else router.back();
             }}
           />
-          {!editing ? (
+          {!editing && !focusActive ? (
             <>
               <View style={[styles.pillDivider, { backgroundColor: t.colors.separator }]} />
               <HeaderButton
@@ -335,13 +473,13 @@ export default function DayCalendarScreen() {
           ) : null}
         </GlassSurface>
 
-        {editing ? (
+        {editing || focusActive ? (
           <View style={[styles.dayNav, styles.editNav]}>
             <Text variant="subhead" weight="bold" tight numberOfLines={1}>
-              Edit schedule
+              {focusActive ? 'Editing plan' : 'Edit schedule'}
             </Text>
             <Text variant="micro" tone="secondary" numberOfLines={1}>
-              {day.dateLabel}
+              {focusActive ? focusPlanTitle ?? day.dateLabel : day.dateLabel}
             </Text>
           </View>
         ) : (
@@ -517,11 +655,22 @@ export default function DayCalendarScreen() {
         <DayEditor
           key={date}
           date={date}
-          errands={errands}
+          errands={dayErrands}
           mode={editing ? 'edit' : 'view'}
           nowMin={liveNow}
           onPressEvent={openEdit}
           onRequestEdit={beginEditFromHold}
+          planTitle={plan?.title}
+          onOpenPlan={plan ? openPlan : undefined}
+          focusPlanId={focusPlanId}
+          focusPlanItinerary={stagedPlan}
+          onFocusPlan={onFocusPlan}
+          onPlanEdit={onPlanEdit}
+          onConfirmPlan={confirmPlan}
+          onCancelPlan={cancelPlan}
+          onAddPlanStop={openAddStop}
+          planBusy={planBusy}
+          planDirty={planDirty}
           onClose={exitEdit}
         />
       )}
@@ -537,6 +686,18 @@ export default function DayCalendarScreen() {
         currentErrandId={editId}
         onSave={onSave}
         onDelete={onDelete}
+      />
+
+      {/* Add-a-stop composer for the focused plan (saves into the plan itself) */}
+      <ErrandDrawer
+        open={addStopOpen}
+        onClose={() => setAddStopOpen(false)}
+        draft={{ ...EMPTY_DRAFT, date }}
+        rawText=""
+        parsing={false}
+        seedKey={addStopKey}
+        mode="create"
+        onSave={onAddStopSave}
       />
     </SafeAreaView>
   );

@@ -84,11 +84,14 @@ const ERRAND_SCHEMA: Record<string, unknown> = {
     discovery: {
       type: 'object',
       nullable: true,
-      propertyOrdering: ['query', 'area', 'nearby'],
+      propertyOrdering: ['query', 'area', 'nearby', 'openEnded'],
       properties: {
         query: { type: 'string', nullable: true },
         area: { type: 'string', nullable: true },
         nearby: { type: 'boolean', nullable: true },
+        // True for a QUESTION / PROBLEM to solve (not a tidy category) — routes
+        // the search to the web-researched concierge. See discovery rules.
+        openEnded: { type: 'boolean', nullable: true },
       },
     },
   },
@@ -214,6 +217,7 @@ Fields (fill for BOTH intents):
     - query: WHAT to search, cleaned — drop lookup verbs, the area, and "near me". KEEP the two kinds of words that change WHICH places match: (a) a real BRAND or CHAIN the user named — it narrows to THAT brand, so do NOT collapse it to the generic category ("max fitness near OC Krakov" → "Max Fitness" NOT "gym"; "find a starbucks" → "Starbucks" NOT "coffee"; "dm near karlin" → "dm drogerie" NOT "drugstore"); and (b) CURATION or DISTINCTION qualifiers — superlatives and special qualities like "best", "top", "most popular", "famous", "michelin", "fine dining", "rooftop", "interesting", "romantic", "hidden gem" ("most popular clubs in prague" → "most popular clubs"; "michelin restaurant near olomouc" → "michelin restaurant"; "interesting restaurants in prague" → "interesting restaurants"). Only drop BLAND fillers that don't narrow anything ("good","nice","great","cheap","a","some"). For an OCCASION with no stated category ("where to take my gf for our anniversary","somewhere special for a birthday"), set query to the occasion intent ("romantic anniversary dinner","birthday celebration restaurant"). With no brand, qualifier, or occasion, use the bare category ("pharmacy","coffee","ramen","tennis court").
     - area: the place to search AROUND when the user named one — EITHER a neighbourhood/district ("Karlín","Žižkov","Vinohrady") OR a SPECIFIC landmark, hotel, business, station, mall, or venue used as a reference point ("Hilton Prague","Charles Bridge","Anděl","Náměstí Míru"). Copy it EXACTLY as the user wrote it: keep the FULL name, and NEVER shorten a specific place to its city or district (NOT "Hilton Prague" → "Prague", NOT "Anděl mall" → "Smíchov"). null only if the user named no place to search around.
     - nearby: true ONLY for proximity to the user ("near me","nearby","closest","around here"); else false.
+    - openEnded: true when the line is a QUESTION or PROBLEM to solve rather than a tidy category — phrased as "where/how can I…", "where do I…", "I need somewhere to…", "what's the best way to…", or ANY need where the obvious category may not be the cheapest/fastest/best answer (a quick cheap passport/government photo, where to print documents, where to charge an EV, where to get keys cut). These get a knowledgeable, web-researched answer instead of a plain category list. false for a plain category lookup, even with a quality word ("pharmacy near me","good coffee in Karlín","gym at 18:00","best ramen") — those already work as a normal category search.
 
 Examples:
 "call the pharmacy" → {"intent":"plan","title":"Call the pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":null}
@@ -228,7 +232,7 @@ Examples:
 "work from home friday" → {"intent":"plan","title":"Work from home","date":"<friday's date>","startTime":null,"endTime":null,"address":"home","notes":null,"discovery":null}
 "clean my apartment" → {"intent":"plan","title":"Clean my apartment","date":null,"startTime":null,"endTime":null,"address":"home","notes":null,"discovery":null}
 "coffee near my place" → {"intent":"discover","title":"Coffee","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"coffee","area":null,"nearby":true}}
-"find a pharmacy" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":false}}
+"find a pharmacy" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":false,"openEnded":false}}
 "pharmacy near me" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":null,"nearby":true}}
 "find a pharmacy near karlin" → {"intent":"discover","title":"Pharmacy","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"pharmacy","area":"Karlín","nearby":false}}
 "gym session near hilton prague" → {"intent":"discover","title":"Gym","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"gym","area":"Hilton Prague","nearby":false}}
@@ -239,7 +243,7 @@ Examples:
 "natalie karlin coffee at 12:00" → {"intent":"discover","title":"Coffee with Natalie","date":null,"startTime":"12:00","endTime":"12:45","address":null,"notes":null,"discovery":{"query":"coffee","area":"Karlín","nearby":false}}
 "closest tennis court tomorrow" → {"intent":"discover","title":"Tennis","date":"<tomorrow's date>","startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"tennis court","area":null,"nearby":true}}
 "any karlin coworking or cafe" → {"intent":"discover","title":"Coworking or cafe","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"coworking or cafe","area":"Karlín","nearby":false}}
-"gym tomorrow 18:00" → {"intent":"discover","title":"Gym","date":"<tomorrow's date>","startTime":"18:00","endTime":"19:00","address":null,"notes":null,"discovery":{"query":"gym","area":null,"nearby":false}}
+"gym tomorrow 18:00" → {"intent":"discover","title":"Gym","date":"<tomorrow's date>","startTime":"18:00","endTime":"19:00","address":null,"notes":null,"discovery":{"query":"gym","area":null,"nearby":false,"openEnded":false}}
 "dinner at 8" → {"intent":"discover","title":"Dinner","date":null,"startTime":"20:00","endTime":"21:00","address":null,"notes":null,"discovery":{"query":"restaurant","area":null,"nearby":false}}
 
 Curated / knowledge-heavy examples — KEEP the superlative/distinction/occasion in "query" so the picker can curate (don't flatten to the bare category):
@@ -248,6 +252,12 @@ Curated / knowledge-heavy examples — KEEP the superlative/distinction/occasion
 "michelin restaurant near olomouc" → {"intent":"discover","title":"Michelin restaurant","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"michelin restaurant","area":"Olomouc","nearby":false}}
 "best coffee near me" → {"intent":"discover","title":"Best coffee","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"best coffee","area":null,"nearby":true}}
 "where to take my gf for our anniversary" → {"intent":"discover","title":"Anniversary dinner","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"romantic anniversary dinner","area":null,"nearby":false}}
+
+Open-ended / problem-solving examples — set "openEnded":true so the search gets a knowledgeable web-researched answer (the obvious category may NOT be the best/cheapest/fastest option). Still clean "query" to the underlying need:
+"where can i take a quick cheap government photo near me" → {"intent":"discover","title":"Government photo","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"passport photo","area":null,"nearby":true,"openEnded":true}}
+"cheap passport photo" → {"intent":"discover","title":"Passport photo","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"passport photo","area":null,"nearby":false,"openEnded":true}}
+"where do i get keys cut" → {"intent":"discover","title":"Key cutting","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"key cutting","area":null,"nearby":false,"openEnded":true}}
+"i need somewhere to print documents near karlin" → {"intent":"discover","title":"Printing","date":null,"startTime":null,"endTime":null,"address":null,"notes":null,"discovery":{"query":"printing services","area":"Karlín","nearby":false,"openEnded":true}}
 
 Named-venue (BRAND) examples — a proper name on a food/place word is ONE venue, so "plan" with the FULL name in address, NOT a category search:
 "bugr burger" → {"intent":"plan","title":"Bugr Burger","date":null,"startTime":null,"endTime":null,"address":"bugr burger","notes":null,"discovery":null}
@@ -358,7 +368,9 @@ function shapeDraft(parsed: any, rawText: string): {
 function shapeResult(parsed: any, rawText: string) {
   const draft = shapeDraft(parsed, rawText);
   let intent: 'plan' | 'discover' = parsed?.intent === 'discover' ? 'discover' : 'plan';
-  let discovery: { query: string; area: string | null; nearby: boolean } | null = null;
+  let discovery:
+    | { query: string; area: string | null; nearby: boolean; openEnded: boolean }
+    | null = null;
 
   // A saved person the line referenced, and whether to use THEIR place. The
   // client resolves the actual coordinates from its local people store — the
@@ -378,6 +390,7 @@ function shapeResult(parsed: any, rawText: string) {
         query,
         area: typeof d?.area === 'string' && d.area.trim() ? d.area.trim().slice(0, 120) : null,
         nearby: d?.nearby === true,
+        openEnded: d?.openEnded === true,
       };
     } else {
       // "discover" without a category is useless — treat it as an ordinary plan.

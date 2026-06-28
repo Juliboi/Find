@@ -115,11 +115,32 @@ export function isPlaceLookupSuggestion(chip: string): boolean {
   return PLACE_LOOKUP_PATTERNS.some((r) => r.test(chip));
 }
 
+/**
+ * A non-venue discovery suggestion from the curated concierge — a self-service
+ * method, a chain/category, or a tip that isn't a single mappable place (e.g.
+ * "photo booth in most metro stations", "any dm drogerie"). Rendered as an info
+ * row rather than a pin; tapping one with a `searchQuery` re-runs discovery for
+ * it on the map.
+ */
+export interface DiscoverTip {
+  title: string;
+  detail: string | null;
+  searchQuery?: string | null;
+}
+
 export interface FindPlacesResult {
   places: NearbyPlace[];
   category: string | null;
   provider: PlacesProvider;
   reason?: 'no_supabase' | 'no_location' | 'no_results' | 'error';
+  /**
+   * Curated path only: a short, flowing conversational answer (the concierge's
+   * "here's the best way to get what you need" summary). Absent on the plain
+   * category path.
+   */
+  answer?: string | null;
+  /** Curated path only: non-venue options/tips (see {@link DiscoverTip}). */
+  suggestions?: DiscoverTip[];
   /**
    * Human-readable detail when something went wrong. Surfaced in the UI
    * so a missing/broken edge function is debuggable instead of a generic
@@ -436,23 +457,44 @@ export async function curateDiscoveryPlaces(args: {
       };
     }
     const places = Array.isArray(data.places) ? (data.places as NearbyPlace[]) : [];
+    const answer =
+      typeof (data as any).answer === 'string' && (data as any).answer.trim()
+        ? ((data as any).answer.trim() as string)
+        : null;
+    const suggestions: DiscoverTip[] = (
+      Array.isArray((data as any).tips) ? (data as any).tips : []
+    )
+      .map((tp: any) => ({
+        title: typeof tp?.title === 'string' ? tp.title.trim() : '',
+        detail: typeof tp?.detail === 'string' && tp.detail.trim() ? tp.detail.trim() : null,
+        searchQuery:
+          typeof tp?.searchQuery === 'string' && tp.searchQuery.trim()
+            ? tp.searchQuery.trim()
+            : null,
+      }))
+      .filter((tp: DiscoverTip) => tp.title.length > 0);
     const usage = shapeUsage((data as any).usage);
+    // The curated path is useful when it returns ANY of: grounded venue cards, a
+    // written answer, or tips. Only when all three are empty is it a real miss
+    // (and the caller falls back to the plain category search).
+    const hasContent = places.length > 0 || !!answer || suggestions.length > 0;
     const result: FindPlacesResult = {
       places,
       category: null,
       provider: data.provider === 'google' ? 'google' : 'none',
-      reason:
-        places.length === 0
-          ? typeof (data as any).reason === 'string'
-            ? ((data as any).reason as FindPlacesResult['reason'])
-            : 'no_results'
-          : undefined,
+      reason: hasContent
+        ? undefined
+        : typeof (data as any).reason === 'string'
+          ? ((data as any).reason as FindPlacesResult['reason'])
+          : 'no_results',
+      answer,
+      suggestions,
       usage,
       debug: data,
     };
     logTokenUsage('discover-curate', usage);
-    // Cache without usage so a later hit serves places but re-attributes no spend.
-    if (places.length > 0) writeCache(key, { ...result, usage: null });
+    // Cache without usage so a later hit serves content but re-attributes no spend.
+    if (hasContent) writeCache(key, { ...result, usage: null });
     return result;
   } catch (e: any) {
     return {

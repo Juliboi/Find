@@ -231,6 +231,7 @@ function WeekBlock({
 }) {
   const t = useTheme();
   const { errand, flexible } = event;
+  const isPlan = errand.planRef != null;
   const showTitle = height >= 22 && width >= 26;
   return (
     <Pressable
@@ -239,26 +240,45 @@ function WeekBlock({
       accessibilityLabel={errand.title}
       style={({ pressed }) => [
         styles.block,
-        {
-          top,
-          left,
-          width,
-          height: Math.max(12, height - 1),
-          backgroundColor: flexible ? 'transparent' : t.colors.accentSoft,
-          borderColor: t.colors.accent,
-          borderWidth: flexible ? StyleSheet.hairlineWidth : 0,
-          borderStyle: flexible ? 'dashed' : 'solid',
-        },
+        isPlan
+          ? {
+              top,
+              left,
+              width,
+              height: Math.max(12, height - 1),
+              backgroundColor: 'rgba(175, 82, 222, 0.16)',
+              borderColor: t.colors.highlightPurple,
+              borderWidth: StyleSheet.hairlineWidth,
+              borderStyle: 'solid',
+            }
+          : {
+              top,
+              left,
+              width,
+              height: Math.max(12, height - 1),
+              backgroundColor: flexible ? 'transparent' : t.colors.accentSoft,
+              borderColor: t.colors.accent,
+              borderWidth: flexible ? StyleSheet.hairlineWidth : 0,
+              borderStyle: flexible ? 'dashed' : 'solid',
+            },
         pressed && { opacity: 0.7 },
       ]}
     >
-      <View style={[styles.blockBar, { backgroundColor: t.colors.accent }]} />
+      <View
+        style={[
+          styles.blockBar,
+          { backgroundColor: isPlan ? t.colors.highlightPurple : t.colors.accent },
+        ]}
+      />
       {showTitle ? (
         <Text
           variant="micro"
           weight="semibold"
           numberOfLines={3}
-          style={[styles.blockText, { color: t.colors.accentText }]}
+          style={[
+            styles.blockText,
+            { color: isPlan ? t.colors.textPrimary : t.colors.accentText },
+          ]}
         >
           {errand.title}
         </Text>

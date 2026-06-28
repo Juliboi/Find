@@ -2162,6 +2162,8 @@ export default function ItineraryScreen() {
       place: ItineraryPlace | undefined;
       description: string | null;
       period: string;
+      /** The source errand id this block IS (b.ref), so the calendar can dedupe it. */
+      errandId: string | null;
     }
 
     let lastPeriod = 'Morning';
@@ -2242,6 +2244,7 @@ export default function ItineraryScreen() {
         place,
         description,
         period,
+        errandId: b.ref ?? null,
       };
     });
 

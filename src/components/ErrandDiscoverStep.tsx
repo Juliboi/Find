@@ -15,6 +15,7 @@ import {
   discoverPlaces,
   normalizeDiscoveryQuery,
   type DiscoverResult,
+  type DiscoverTip,
   type DiscoveryIntent,
 } from '@/lib/discover';
 import { formatDistance, type Coords, type NearbyPlace } from '@/lib/places';
@@ -44,6 +45,18 @@ interface Props {
   area: string | null;
   /** True when the user said "nearby"/"near me" — search around live GPS. */
   nearby: boolean;
+  /**
+   * True when the orchestrator flagged the line a question/problem to solve —
+   * routes the initial search to the web-researched concierge.
+   */
+  openEnded?: boolean;
+  /**
+   * The user's ORIGINAL line ("where can I take a quick cheap government photo
+   * near me?"). Passed verbatim to the concierge so qualities like "cheap"/"fast"
+   * steer the answer instead of the stripped category. Falls back to the
+   * composed phrase when absent.
+   */
+  phrase?: string;
   /** Where to search when not nearby and no area resolves (usually home). */
   fallbackCenter: Coords | null;
   /** The errand's date (from the orchestrator) — scopes which day's stops we
@@ -93,10 +106,16 @@ function anchorIcon(kind: DayAnchor['kind']): keyof typeof Ionicons.glyphMap {
  * the prefilled confirm form. Every place the user picks becomes an errand —
  * this step is really just a place pre-step in front of the normal form.
  */
+/** The live search shape plus the original phrase + open-ended flag that drive
+ *  whether the fetch goes to the web concierge and what it's asked. */
+type ActiveSearch = DiscoveryIntent & { phrase?: string };
+
 export function ErrandDiscoverStep({
   query,
   area,
   nearby,
+  openEnded,
+  phrase,
   fallbackCenter,
   anchorDate,
   anchorTime,
@@ -116,7 +135,15 @@ export function ErrandDiscoverStep({
   // Both are seeded ONCE from the parent (empty for the form's "Discover", or the
   // line the user already typed in the home composer) and from then on belong to
   // the user — we never auto-fill or auto-update the box from the errand title.
-  const [search, setSearch] = useState<DiscoveryIntent>({ query, area, nearby });
+  const [search, setSearch] = useState<ActiveSearch>(() => ({
+    query,
+    area,
+    nearby,
+    openEnded,
+    // The concierge sees the user's full original line when we have it; the
+    // composed phrase is the fallback (and what the editable bar shows).
+    phrase: (phrase ?? '').trim() || composePhrase(query, area, nearby),
+  }));
   const [text, setText] = useState(() => composePhrase(query, area, nearby));
 
   // The day's other located errands — the "stops" each candidate's closeness is
@@ -160,6 +187,10 @@ export function ErrandDiscoverStep({
       center: anchor?.coords ?? null,
       centerLabel: anchor?.label ?? null,
       fallbackCenter,
+      // Route question/problem requests to the web concierge and feed it the
+      // user's original words so "cheap"/"fast" steer the answer.
+      phrase: search.phrase,
+      openEnded: search.openEnded,
     })
       .then((res) => {
         if (!cancelled && id === reqRef.current) setResult(res);
@@ -179,6 +210,8 @@ export function ErrandDiscoverStep({
     search.query,
     search.area,
     search.nearby,
+    search.openEnded,
+    search.phrase,
     anchor?.id,
     anchor?.coords.latitude,
     anchor?.coords.longitude,
@@ -196,13 +229,35 @@ export function ErrandDiscoverStep({
     Haptics.selectionAsync().catch(() => undefined);
     const next: DiscoveryIntent =
       detectDiscovery(raw) ?? { query: normalizeDiscoveryQuery(raw), area: null, nearby: false };
-    setSearch(next);
+    // Carry the typed line as the phrase so the concierge routing decision sees
+    // the user's full words (detectDiscovery already infers openEnded from them).
+    setSearch({ ...next, phrase: raw });
+  };
+
+  // A tip isn't a mapped pin. If it carries a concrete map search ("fotoautomat",
+  // "dm drogerie") tapping it runs that as a plain nearby search — so the user
+  // gets tappable cards for the nearest one; otherwise it seeds manual entry.
+  const onTipPress = (tip: DiscoverTip) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    const q = tip.searchQuery?.trim();
+    if (q) {
+      setText(q);
+      setSearch({ query: normalizeDiscoveryQuery(q), area: null, nearby: search.nearby, openEnded: false, phrase: q });
+    } else {
+      onManual(tip.title);
+    }
   };
 
   const where = anchor
     ? `Near ${anchor.label}`
     : whereLabel({ result, nearby: search.nearby, area: search.area });
   const places = result?.places ?? [];
+  // Curated extras: the concierge's flowing answer + non-venue tips. These can
+  // be present even with zero grounded cards, so they keep an open-ended search
+  // useful instead of dead-ending on "nothing found".
+  const answer = result?.answer ?? null;
+  const tips = result?.suggestions ?? [];
+  const hasAnyContent = places.length > 0 || !!answer || tips.length > 0;
 
   return (
     <>
@@ -353,7 +408,7 @@ export function ErrandDiscoverStep({
               Type a place to find above — like “lunch around Karlín” or “pharmacy nearby”.
             </Text>
           </View>
-        ) : places.length === 0 ? (
+        ) : !hasAnyContent ? (
           <View style={styles.state}>
             <Ionicons name="compass-outline" size={28} color={t.colors.textTertiary} />
             <Text variant="body" weight="semibold" tone="secondary" style={styles.stateText}>
@@ -374,20 +429,38 @@ export function ErrandDiscoverStep({
             </Pressable>
           </View>
         ) : (
-          places.map((p, i) => (
-            <DiscoverCard
-              key={p.id}
-              place={p}
-              index={i}
-              dayStops={dayStops}
-              anchorDate={anchorDate}
-              anchorTime={anchorTime}
-              onPress={() => {
-                Haptics.selectionAsync().catch(() => undefined);
-                onPick(p, search.query);
-              }}
-            />
-          ))
+          <>
+            {answer ? <ConciergeAnswer text={answer} /> : null}
+            {places.map((p, i) => (
+              <DiscoverCard
+                key={p.id}
+                place={p}
+                index={answer ? i + 1 : i}
+                dayStops={dayStops}
+                anchorDate={anchorDate}
+                anchorTime={anchorTime}
+                onPress={() => {
+                  Haptics.selectionAsync().catch(() => undefined);
+                  onPick(p, search.query);
+                }}
+              />
+            ))}
+            {tips.length > 0 ? (
+              <View style={styles.tipsBlock}>
+                <Text variant="caption" weight="bold" style={styles.tipsHeader}>
+                  ALSO WORTH KNOWING
+                </Text>
+                {tips.map((tip, i) => (
+                  <TipRow
+                    key={`${tip.title}-${i}`}
+                    tip={tip}
+                    index={(answer ? 1 : 0) + places.length + i}
+                    onPress={() => onTipPress(tip)}
+                  />
+                ))}
+              </View>
+            ) : null}
+          </>
         )}
       </BottomSheetScrollView>
 
@@ -567,6 +640,61 @@ function DiscoverCard({
   );
 }
 
+/** The concierge's flowing answer — a short, friendly "here's how to get what
+ *  you need" message rendered above the cards on the same dark glass. */
+function ConciergeAnswer({ text }: { text: string }) {
+  return (
+    <Animated.View entering={ENTER(0)} exiting={EXIT(0)} style={styles.answerCard}>
+      <BlurView tint="dark" intensity={48} style={StyleSheet.absoluteFill} />
+      <View style={[StyleSheet.absoluteFill, { backgroundColor: GLASS_TINT }]} />
+      <View style={styles.answerContent}>
+        <Ionicons name="sparkles" size={15} color={ACCENT_ON_GLASS} style={styles.answerIcon} />
+        <Text variant="body" style={styles.answerText}>
+          {text}
+        </Text>
+      </View>
+    </Animated.View>
+  );
+}
+
+/** A non-venue suggestion (a self-service method, a chain, a tip). Rendered as a
+ *  lighter, secondary row; tapping one with a search runs it on the map. */
+function TipRow({
+  tip,
+  index,
+  onPress,
+}: {
+  tip: DiscoverTip;
+  index: number;
+  onPress: () => void;
+}) {
+  return (
+    <Animated.View entering={ENTER(index + 1)} exiting={EXIT(index + 1)}>
+      <Pressable
+        onPress={onPress}
+        style={({ pressed }) => [styles.tipRow, pressed && { opacity: 0.85 }]}
+        accessibilityRole="button"
+        accessibilityLabel={tip.searchQuery ? `Search for ${tip.title}` : tip.title}
+      >
+        <View style={styles.tipIcon}>
+          <Ionicons name="bulb-outline" size={15} color={ACCENT_ON_GLASS} />
+        </View>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text variant="bodySm" weight="semibold" style={{ color: ON }}>
+            {tip.title}
+          </Text>
+          {tip.detail ? (
+            <Text variant="caption" style={{ color: ON_DIM }}>
+              {tip.detail}
+            </Text>
+          ) : null}
+        </View>
+        {tip.searchQuery ? <Ionicons name="search" size={15} color={ON_FAINT} /> : null}
+      </Pressable>
+    </Animated.View>
+  );
+}
+
 function whereLabel({
   result,
   nearby,
@@ -683,6 +811,53 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
     paddingVertical: 6,
+  },
+  answerCard: {
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: GLASS_BORDER,
+    overflow: 'hidden',
+  },
+  answerContent: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 9,
+    padding: 14,
+  },
+  answerIcon: {
+    marginTop: 2,
+  },
+  answerText: {
+    flex: 1,
+    color: ON_SOFT,
+    lineHeight: 21,
+  },
+  tipsBlock: {
+    gap: 8,
+    marginTop: 2,
+  },
+  tipsHeader: {
+    color: ON_FAINT,
+    letterSpacing: 0.4,
+    marginBottom: 2,
+  },
+  tipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 11,
+    padding: 12,
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: GLASS_BORDER,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+  },
+  tipIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.10)',
   },
   card: {
     borderRadius: 18,

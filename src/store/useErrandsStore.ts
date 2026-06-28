@@ -97,6 +97,14 @@ export interface Errand {
    * find / prune occurrences. Absent on ordinary user errands.
    */
   recurringId?: string;
+  /**
+   * IN-MEMORY ONLY — never created, persisted, or synced. When set, this
+   * "errand" is a READ-ONLY projection of an item from the day's active saved
+   * plan (see `src/lib/calendar/planProjection.ts`), surfaced so the plan shows
+   * on the calendar alongside real errands. The day editor treats it as a
+   * locked context block (no drag/resize/delete); tapping it opens the plan.
+   */
+  planRef?: { planId: string; itemId: string };
   /** The raw text the user typed, kept so we can re-parse / show provenance. */
   rawText: string;
   /**

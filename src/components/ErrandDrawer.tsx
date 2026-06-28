@@ -26,6 +26,8 @@ export interface DiscoverySeed {
   query: string;
   area?: string | null;
   nearby?: boolean;
+  /** True when the line is a question/problem — routes to the web concierge. */
+  openEnded?: boolean;
 }
 
 interface Props {
@@ -200,6 +202,8 @@ export function ErrandDrawer({
             query={discoverSeedQuery}
             area={activeDiscovery?.area ?? null}
             nearby={activeDiscovery?.nearby ?? false}
+            openEnded={activeDiscovery?.openEnded ?? false}
+            phrase={rawText}
             fallbackCenter={discoverCenter}
             anchorDate={discoverBase.date ?? null}
             anchorTime={discoverBase.startTime ?? null}

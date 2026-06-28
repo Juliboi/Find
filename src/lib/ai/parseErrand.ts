@@ -10,7 +10,7 @@
  */
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { todayISO } from '@/utils/time';
-import { detectDiscovery, type DiscoveryIntent } from '@/lib/discover';
+import { detectDiscovery, isSmartDiscovery, type DiscoveryIntent } from '@/lib/discover';
 import { logTokenUsage, shapeUsage, type LlmTokenUsage } from '@/lib/usage';
 import {
   personAliases,
@@ -286,10 +286,15 @@ function shapeDiscovery(raw: unknown, rawText: string): DiscoveryIntent | null {
   const d = raw as Record<string, unknown>;
   const query = typeof d.query === 'string' && d.query.trim() ? d.query.trim() : '';
   if (!query) return null;
+  const area = typeof d.area === 'string' && d.area.trim() ? d.area.trim() : null;
   return {
     query: preserveBrandQuery(query, rawText),
-    area: typeof d.area === 'string' && d.area.trim() ? d.area.trim() : null,
+    area,
     nearby: d.nearby === true,
+    // Trust the orchestrator's flag; fall back to local phrasing detection when
+    // an older deploy didn't return it, so question/problem lines still route to
+    // the web concierge.
+    openEnded: d.openEnded === true || isSmartDiscovery(rawText, area),
   };
 }
 

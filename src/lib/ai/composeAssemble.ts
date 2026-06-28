@@ -165,6 +165,8 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       /** Overrides the block's own flexibility (e.g. forcing 'window'). */
       flexibility?: ComposedBlock['flexibility'];
       place?: ItineraryPlace;
+      /** The source errand id this stop IS, so the calendar can dedupe it. */
+      errandId?: string | null;
     },
   ) => {
     // Surface wind-down / calm / leftover-buffer blocks as elastic gaps (unless
@@ -181,6 +183,7 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       windowStart: opts.windowStart ?? undefined,
       windowEnd: opts.windowEnd ?? undefined,
       place: opts.place,
+      errandId: opts.errandId ?? undefined,
       description: b.description ?? undefined,
       __section: (b.section || b.period || 'Your day').toString(),
       __period: b.period ?? null,
@@ -269,6 +272,12 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
     // Every other placement (find / venue / home / unresolved) is place-less —
     // the user pins a real location on the errand if they want one.
 
+    // The errand this block IS (so the calendar can dedupe it against the real
+    // errand). An 'anchor' block is its located errand; a task block is its
+    // unplaced errand. A 'colocate' block only borrows a venue — it isn't that
+    // errand — so it carries no link.
+    const errandId = b.placement === 'anchor' ? b.anchorId ?? null : b.taskId ?? null;
+
     pushItem(b, {
       startTime: pinnedStart,
       endTime: pinnedEnd,
@@ -277,6 +286,7 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
       windowEnd,
       flexibility: flexOverride,
       place,
+      errandId,
     });
   }
 
@@ -304,12 +314,14 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
             windowStart: a.startTime ?? null,
             windowEnd: a.endTime ?? null,
             place: { ...a.place, userNamed: true },
+            errandId: id,
           }
         : {
             startTime: a.startTime ?? null,
             endTime: a.endTime ?? null,
             durationMin: a.durationMin ?? null,
             place: { ...a.place, userNamed: true },
+            errandId: id,
           },
     );
   }
@@ -331,11 +343,13 @@ export async function assembleComposedDay(args: AssembleArgs): Promise<AssembleR
             durationMin: t.durationMin ?? null,
             windowStart: t.startTime ?? null,
             windowEnd: t.endTime ?? null,
+            errandId: id,
           }
         : {
             startTime: t.startTime ?? null,
             endTime: t.endTime ?? null,
             durationMin: t.durationMin ?? null,
+            errandId: id,
           },
     );
   }

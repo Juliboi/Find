@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Image,
   LayoutChangeEvent,
   Pressable,
@@ -42,6 +43,8 @@ import {
   type PendingPlacements,
 } from '@/lib/calendar/dragSchedule';
 import { formatDuration, formatTime } from '@/utils/time';
+import { moveOrReorderFromDrag, type EditOp } from '@/lib/itinerary/edits';
+import type { Itinerary } from '@/types/itinerary';
 
 interface Props {
   date: string;
@@ -58,6 +61,36 @@ interface Props {
   onRequestEdit?: () => void;
   /** Tap a block in `view` to open it (the host's edit drawer). */
   onPressEvent?: (errand: Errand) => void;
+  /** The active plan's title, for the plan-group label / accessibility. */
+  planTitle?: string;
+  /** Open the plan in the planner (the explicit "edit this plan" affordance). */
+  onOpenPlan?: () => void;
+
+  // ----- Plan focus mode (inline plan editing on the grid) -----
+  /**
+   * The id of the plan currently in FOCUS, or null. While set, that plan's
+   * blocks become live-editable on the grid (drag to retime/reorder, stretch,
+   * tap to delete) and everything else dims + locks. Entering focus is a tap on
+   * a plan block; the heavier planner stays one tap away on the Day-plan card.
+   */
+  focusPlanId?: string | null;
+  /** The focused plan's itinerary — needed to turn a drag into a move-vs-reorder op. */
+  focusPlanItinerary?: Itinerary | null;
+  /** Tapping a plan block asks the host to focus that plan (enter/switch focus). */
+  onFocusPlan?: (planId: string) => void;
+  /** A staged plan edit from the grid — the host applies it to a working copy. */
+  onPlanEdit?: (ops: EditOp[]) => void;
+  /** Commit the staged plan edits (persist) and leave focus. */
+  onConfirmPlan?: () => void;
+  /** Discard the staged plan edits (the permanent revert) and leave focus. */
+  onCancelPlan?: () => void;
+  /** Open the host's "add a stop" composer for the focused plan. */
+  onAddPlanStop?: () => void;
+  /** True while the focused plan is re-routing in the background. */
+  planBusy?: boolean;
+  /** True once the staged plan diverges from its saved version (enables Confirm). */
+  planDirty?: boolean;
+
   /** Leave edit mode. The editor has already persisted on Confirm / discarded on Cancel. */
   onClose: () => void;
 }
@@ -95,11 +128,18 @@ function errandToInput(e: Errand): ErrandInput {
   };
 }
 
-const HOUR_HEIGHT = 64;
+const HOUR_HEIGHT = 80;
 const PXPM = HOUR_HEIGHT / 60;
 const GUTTER_W = 56;
 const BLOCK_GAP = 4;
 const MIN_BLOCK_H = 44;
+/** Floor for a STATIC block's drawn height — small enough that a 15-min stop
+ *  reads as short (and doesn't overlap the next), big enough to stay tappable.
+ *  The larger {@link MIN_BLOCK_H} is only the floor while a block is dragged. */
+const MIN_DRAW_H = 20;
+/** Below this drawn height a block can't fit a second line cleanly — show title
+ *  only (its short height already conveys a brief stop; tap opens the details). */
+const META_MIN_H = 36;
 const BOTTOM_PAD = 140;
 /** Distance from a viewport edge where a held drag starts auto-scrolling. */
 const EDGE = 84;
@@ -110,6 +150,8 @@ const SNAP_STEP = SNAP_MIN;
 const MIN_WORK = SNAP_MIN;
 /** Height of the bottom grab strip that turns a block drag into a resize. */
 const RESIZE_ZONE = 22;
+/** Soft purple fill for read-only plan blocks (theme-agnostic; reads on both). */
+const PLAN_TINT = 'rgba(175, 82, 222, 0.16)';
 
 /** 0 = nothing held, 1 = a block being moved, 2 = a tray chip flying in, 3 = a block being stretched. */
 const KIND_NONE = 0;
@@ -161,6 +203,8 @@ interface DragSV {
   autoDir: SharedValue<number>;
   /** True while the canvas is read-only — a block long-press then requests edit mode. */
   isView: SharedValue<boolean>;
+  /** True while a plan is in focus — focused plan blocks drag/resize even from `view`. */
+  isFocus: SharedValue<boolean>;
 }
 
 /** Live JS mirror of the in-flight drag, for the bits worklets can't draw (text, commute). */
@@ -185,6 +229,8 @@ interface EditorCallbacks {
   requestEdit: () => void;
   /** A `view`-mode tap opens the block in the host's drawer. */
   openEvent: (id: string) => void;
+  /** A tap on a plan block enters/switches focus for that plan. */
+  focusPlan: (planId: string) => void;
 }
 
 /**
@@ -203,14 +249,39 @@ export function DayEditor({
   nowMin = null,
   onRequestEdit,
   onPressEvent,
+  planTitle,
+  onOpenPlan,
+  focusPlanId = null,
+  focusPlanItinerary = null,
+  onFocusPlan,
+  onPlanEdit,
+  onConfirmPlan,
+  onCancelPlan,
+  onAddPlanStop,
+  planBusy = false,
+  planDirty = false,
   onClose,
 }: Props) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   const isEdit = mode === 'edit';
+  // Focus mode: a specific plan's blocks are live-editable on the grid. It is
+  // orthogonal to errand edit mode (it can be entered straight from `view`).
+  const focusActive = focusPlanId != null;
   const addErrand = useErrandsStore((s) => s.add);
   const updateErrand = useErrandsStore((s) => s.update);
   const removeErrand = useErrandsStore((s) => s.remove);
+
+  // Stable mirrors so the gesture callbacks (kept dep-free to avoid stale
+  // worklet closures) can read the latest focus props at drop time.
+  const focusPlanIdRef = useRef(focusPlanId);
+  focusPlanIdRef.current = focusPlanId;
+  const focusPlanItinRef = useRef(focusPlanItinerary);
+  focusPlanItinRef.current = focusPlanItinerary;
+  const onPlanEditRef = useRef(onPlanEdit);
+  onPlanEditRef.current = onPlanEdit;
+  const onFocusPlanRef = useRef(onFocusPlan);
+  onFocusPlanRef.current = onFocusPlan;
 
   const [pending, setPending] = useState<PendingPlacements>({});
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -241,6 +312,20 @@ export function DayEditor({
     () => buildDayDraft(allErrands, date, pending),
     [allErrands, date, pending],
   );
+
+  // The vertical extent of the active plan's blocks, so we can draw ONE
+  // continuous rail behind them — a plan reads as a single object, not a scatter
+  // of separate purple blocks. Null when the day has no plan blocks.
+  const planSpan = useMemo(() => {
+    let topMin = Infinity;
+    let bottomMin = -Infinity;
+    for (const ev of draft.events) {
+      if (ev.errand.planRef == null) continue;
+      topMin = Math.min(topMin, ev.startMin);
+      bottomMin = Math.max(bottomMin, ev.endMin);
+    }
+    return bottomMin > topMin ? { topMin, bottomMin } : null;
+  }, [draft.events]);
 
   // A comfortable, stable canvas: fit the events but never tighter than 6 AM–11 PM
   // so there's always room to drag earlier or later.
@@ -303,6 +388,7 @@ export function DayEditor({
     rootY: useSharedValue(0),
     autoDir: useSharedValue(0),
     isView: useSharedValue(mode === 'view'),
+    isFocus: useSharedValue(focusPlanId != null),
   };
 
   useEffect(() => {
@@ -316,6 +402,11 @@ export function DayEditor({
     sv.isView.value = mode === 'view';
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
+
+  useEffect(() => {
+    sv.isFocus.value = focusActive;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusActive]);
 
   // ----- JS bridges the worklets call -----
   const lift = useCallback(
@@ -338,10 +429,30 @@ export function DayEditor({
   }, []);
 
   const place = useCallback((errandId: string, startMin: number) => {
+    const e = errandsByIdRef.current.get(errandId);
+    // Focused-plan block: a drag is a STAGED plan edit (move, or reorder when it
+    // crosses other stops) — dispatch to the working copy and bail. It's the
+    // host's Confirm, not this gesture, that persists it.
+    if (
+      e?.planRef &&
+      e.planRef.planId === focusPlanIdRef.current &&
+      focusPlanItinRef.current &&
+      onPlanEditRef.current
+    ) {
+      // A hold-and-release in place is not a move — don't pin/re-route the stop.
+      if (baseStartMin(e) === startMin) {
+        setDrag(null);
+        return;
+      }
+      const ops = moveOrReorderFromDrag(focusPlanItinRef.current, e.planRef.itemId, startMin);
+      Haptics.selectionAsync().catch(() => undefined);
+      onPlanEditRef.current(ops);
+      setDrag(null);
+      return;
+    }
     Haptics.selectionAsync().catch(() => undefined);
     setPending((p) => {
       const cur = p[errandId];
-      const e = errandsByIdRef.current.get(errandId);
       // Holding a card to enter edit (no real move) shouldn't stage a phantom change.
       if (e && startMin === baseStartMin(e) && cur?.durationMin == null && !cur?.deleted) {
         if (!cur) return p;
@@ -354,10 +465,26 @@ export function DayEditor({
   }, []);
 
   const commitResize = useCallback((errandId: string, durationMin: number) => {
+    const e = errandsByIdRef.current.get(errandId);
+    // Focused-plan block: stretching is a staged setDuration on the plan stop.
+    if (
+      e?.planRef &&
+      e.planRef.planId === focusPlanIdRef.current &&
+      onPlanEditRef.current
+    ) {
+      // Released at the same length → not a stretch; skip the edit + re-route.
+      if (durationMin === workMinutes(e)) {
+        setDrag(null);
+        return;
+      }
+      Haptics.selectionAsync().catch(() => undefined);
+      onPlanEditRef.current([{ type: 'setDuration', id: e.planRef.itemId, minutes: durationMin }]);
+      setDrag(null);
+      return;
+    }
     Haptics.selectionAsync().catch(() => undefined);
     setPending((p) => {
       const cur = p[errandId];
-      const e = errandsByIdRef.current.get(errandId);
       if (e && durationMin === workMinutes(e) && cur?.startMin == null && !cur?.deleted) {
         if (!cur) return p;
         const { [errandId]: _drop, ...rest } = p;
@@ -387,12 +514,26 @@ export function DayEditor({
     if (e) onPressEvent?.(e);
   }, [onPressEvent]);
 
+  // A tap on a plan block enters (or switches) focus for that plan.
+  const focusPlan = useCallback((planId: string) => {
+    Haptics.selectionAsync().catch(() => undefined);
+    setSelectedId(null);
+    onFocusPlanRef.current?.(planId);
+  }, []);
+
   // Trash the selected block — a session-only deletion (Cancel restores it). A
   // brand-new errand is simply dropped; a stored one is flagged for removal.
   const deleteSelected = useCallback(() => {
     const id = selectedId;
     if (!id) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid).catch(() => undefined);
+    const sel = errandsById.get(id);
+    // Focused-plan block: removing it is a live plan edit (the day re-cascades).
+    if (sel?.planRef && sel.planRef.planId === focusPlanId && onPlanEdit) {
+      onPlanEdit([{ type: 'remove', id: sel.planRef.itemId }]);
+      setSelectedId(null);
+      return;
+    }
     if (addedIds.has(id)) {
       setAdded((a) => a.filter((e) => e.id !== id));
       setPending((p) => {
@@ -404,7 +545,7 @@ export function DayEditor({
       setPending((p) => ({ ...p, [id]: { ...p[id], deleted: true } }));
     }
     setSelectedId(null);
-  }, [selectedId, addedIds]);
+  }, [selectedId, addedIds, errandsById, focusPlanId, onPlanEdit]);
 
   const openAdd = useCallback(() => {
     Haptics.selectionAsync().catch(() => undefined);
@@ -444,6 +585,7 @@ export function DayEditor({
 
   const confirm = () => {
     for (const e of allErrands) {
+      if (e.planRef) continue; // read-only plan projection — never persisted
       const edit = pending[e.id];
       const isAdded = addedIds.has(e.id);
       if (edit?.deleted) {
@@ -534,8 +676,9 @@ export function DayEditor({
       select,
       requestEdit,
       openEvent,
+      focusPlan,
     }),
-    [lift, preview, previewResize, place, commitResize, cancelDrag, select, requestEdit, openEvent],
+    [lift, preview, previewResize, place, commitResize, cancelDrag, select, requestEdit, openEvent, focusPlan],
   );
 
   const firstHour = Math.ceil(win.startMin / 60);
@@ -580,6 +723,18 @@ export function DayEditor({
             );
           })}
 
+          {/* Plan rail — groups the day's plan blocks into one object, with an
+              explicit tap-to-edit-in-the-planner cap. */}
+          {planSpan ? (
+            <PlanSpine
+              winStart={win.startMin}
+              topMin={planSpan.topMin}
+              bottomMin={planSpan.bottomMin}
+              title={planTitle}
+              onOpen={onOpenPlan}
+            />
+          ) : null}
+
           {/* Now line */}
           {nowMin != null && nowMin >= win.startMin && nowMin <= win.endMin ? (
             <>
@@ -615,8 +770,8 @@ export function DayEditor({
               )
             : null}
 
-          {/* Commute connectors between consecutive located stops (edit only) */}
-          {isEdit && laneW > 0
+          {/* Commute connectors between consecutive located stops (edit + focus) */}
+          {(isEdit || focusActive) && laneW > 0
             ? segments.map((seg) => (
                 <CommuteConnector key={seg.key} seg={seg} winStart={win.startMin} />
               ))
@@ -644,6 +799,7 @@ export function DayEditor({
                   cb={cb}
                   selected={selectedId === ev.id}
                   editing={isEdit}
+                  focusPlanId={focusPlanId}
                 />
               ))
             : null}
@@ -660,54 +816,36 @@ export function DayEditor({
         </View>
       </Animated.ScrollView>
 
-      {/* Editing chrome (contextual delete, tray, confirm/cancel) — edit mode only */}
-      {isEdit ? (
-        <>
-      {/* Contextual actions for the tapped block — delete lives here, off the canvas */}
-      {selected ? (
-        <View
-          style={[
-            styles.selBar,
-            { borderTopColor: t.colors.separator, backgroundColor: t.colors.surface1 },
-          ]}
-        >
-          <Pressable
-            onPress={() => setSelectedId(null)}
-            hitSlop={8}
-            style={[styles.selClose, { backgroundColor: t.colors.fill1 }]}
-            accessibilityLabel="Done editing this block"
-          >
-            <Ionicons name="close" size={15} color={t.colors.textSecondary} />
-          </Pressable>
-          <View style={styles.selInfo}>
-            <Text variant="caption" weight="bold" numberOfLines={1}>
-              {selected.title}
-            </Text>
-            <Text variant="micro" tone="tertiary" numberOfLines={1}>
-              {selectedEvent
-                ? `${formatTime(minutesToHHMM(selectedEvent.startMin))} · ${formatDuration(selectedEvent.workMin)} · drag edge to stretch`
-                : 'drag onto the timeline to schedule'}
-            </Text>
-          </View>
-          <Pressable
-            onPress={deleteSelected}
-            hitSlop={6}
-            style={({ pressed }) => [
-              styles.selDelete,
-              { backgroundColor: t.colors.dangerSoft },
-              pressed && { opacity: 0.7 },
-            ]}
-            accessibilityRole="button"
-            accessibilityLabel={`Delete ${selected.title}`}
-          >
-            <Ionicons name="trash-outline" size={15} color={t.colors.danger} />
-            <Text variant="micro" weight="bold" style={{ color: t.colors.danger }}>
-              Delete
-            </Text>
-          </Pressable>
-        </View>
+      {/* Contextual delete for the tapped (editable) block — shared by errand
+          edit and plan focus, since both can select a block to remove it. */}
+      {(isEdit || focusActive) && selected ? (
+        <SelectedBar
+          title={selected.title}
+          subtitle={
+            selectedEvent
+              ? `${formatTime(minutesToHHMM(selectedEvent.startMin))} · ${formatDuration(selectedEvent.workMin)} · drag edge to stretch`
+              : 'drag onto the timeline to schedule'
+          }
+          accent={!!selected.planRef}
+          onClose={() => setSelectedId(null)}
+          onDelete={deleteSelected}
+        />
       ) : null}
 
+      {/* Plan focus chrome (live edits, no Confirm) takes over the bottom bar
+          while a plan is focused; otherwise the errand edit chrome shows. */}
+      {focusActive ? (
+        <FocusBar
+          title={planTitle}
+          busy={planBusy}
+          dirty={planDirty}
+          onAddStop={onAddPlanStop}
+          onConfirm={onConfirmPlan}
+          onCancel={onCancelPlan}
+          bottomInset={insets.bottom}
+        />
+      ) : isEdit ? (
+        <>
       {/* Unscheduled tray — drag a chip up onto the timeline to schedule it */}
       <View style={[styles.tray, { borderTopColor: t.colors.separator, backgroundColor: t.colors.background }]}>
         <View style={styles.trayHead}>
@@ -983,6 +1121,7 @@ function DraftBlock({
   cb,
   selected,
   editing,
+  focusPlanId,
 }: {
   event: DraftEvent;
   winStart: number;
@@ -992,15 +1131,32 @@ function DraftBlock({
   cb: EditorCallbacks;
   selected: boolean;
   editing: boolean;
+  focusPlanId?: string | null;
 }) {
   const t = useTheme();
   const { errand } = event;
-  // `drawnWork` is the legible drawn span; `realWork` is the true length we
-  // stretch from and commit, so grabbing the grip never jumps the height.
-  const drawnWork = event.endMin - event.startMin;
+  // A projected plan stop. Normally read-only (a tap focuses the plan), but the
+  // FOCUSED plan's stops become live-editable on the grid. Tinted purple to read
+  // as "your plan", distinct from errands.
+  const isPlan = errand.planRef != null;
+  const planId = errand.planRef?.planId ?? null;
+  const focusActive = focusPlanId != null;
+  // This block IS part of the plan currently in focus → drag/resize/delete it.
+  const isFocusBlock = focusActive && planId === focusPlanId;
+  // Interactive (pan attached): a focused-plan block in focus mode, or any errand
+  // when not focusing (errands pan in both view — to enter edit — and edit).
+  const editableHere = focusActive ? isFocusBlock : !isPlan;
+  // Resizable: a focused-plan block, or an errand in edit mode (never in view).
+  const resizable = focusActive ? isFocusBlock : editing && !isPlan;
+  // Everything that isn't the focused plan dims + locks while focusing.
+  const dim = focusActive && !isFocusBlock;
   const realWork = event.workMin;
   const baseTop = (event.startMin - winStart) * PXPM;
-  const height = Math.max(MIN_BLOCK_H, drawnWork * PXPM) - BLOCK_GAP;
+  // Draw to the TRUE duration (with a small floor), so a 15-min stop is a short
+  // block sitting flush before the next — never padded into a fake overlap.
+  const height = Math.max(MIN_DRAW_H, realWork * PXPM) - BLOCK_GAP;
+  // Too short for the start–end line? Then show the title alone (compact).
+  const showMeta = height >= META_MIN_H;
   const colW = laneW / event.cols;
   const left = GUTTER_W + event.col * colW + BLOCK_GAP;
   const blockW = colW - BLOCK_GAP * 2;
@@ -1017,18 +1173,21 @@ function DraftBlock({
             sv.originY.value = m.pageY;
             sv.viewportH.value = m.height;
           }
-          // Holding a card in read-only view flips the host to edit mode; this
-          // same gesture keeps going because the block view never unmounts.
-          if (sv.isView.value) runOnJS(cb.requestEdit)();
+          // Holding an ERRAND in read-only view flips the host to edit mode; this
+          // same gesture keeps going because the block view never unmounts. A
+          // focused-plan block edits in place, so it never requests errand edit.
+          if (sv.isView.value && !sv.isFocus.value) runOnJS(cb.requestEdit)();
           sv.dragId.value = event.id;
           sv.blockStartTop.value = baseTop;
           sv.blockStartScroll.value = sv.scrollY.value;
           sv.lastTransY.value = 0;
           sv.previewMin.value = event.startMin;
           // A press starting in the bottom grip strip stretches instead of moves —
-          // but a hold from read-only always moves (the grip isn't shown there yet).
+          // but a hold from read-only errand always moves (the grip isn't shown
+          // there yet), and a block too short to show a grip (compact) only moves.
+          // Focus blocks always allow resize (they show a grip even from `view`).
           const grip = Math.min(RESIZE_ZONE, height * 0.45);
-          if (!sv.isView.value && e.y >= height - grip) {
+          if ((!sv.isView.value || sv.isFocus.value) && showMeta && e.y >= height - grip) {
             sv.dragKind.value = KIND_RESIZE;
             sv.previewDur.value = realWork;
             runOnJS(cb.lift)(event.id, 'resize', event.startMin, realWork);
@@ -1082,15 +1241,34 @@ function DraftBlock({
         .maxDuration(220)
         .onEnd((_e, ok) => {
           if (!ok) return;
-          // Read-only: open the block. Editing: select it for its actions.
+          if (focusActive) {
+            // In focus: tap the focused plan's stop to select (then delete);
+            // tap ANOTHER plan to switch focus to it; errands are locked.
+            if (isFocusBlock) runOnJS(cb.select)(event.id);
+            else if (isPlan && planId != null) runOnJS(cb.focusPlan)(planId);
+            return;
+          }
+          if (isPlan && planId != null) {
+            // From view, a plan tap enters inline focus; mid errand-edit it opens
+            // the planner instead, so staged errand changes aren't dropped.
+            if (editing) runOnJS(cb.openEvent)(event.id);
+            else runOnJS(cb.focusPlan)(planId);
+            return;
+          }
+          // Read-only errand opens; an errand in edit selects.
           if (sv.isView.value) runOnJS(cb.openEvent)(event.id);
           else runOnJS(cb.select)(event.id);
         }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [event.id],
+    [event.id, isPlan, planId, focusActive, isFocusBlock, editing],
   );
 
-  const gesture = useMemo(() => Gesture.Exclusive(pan, tap), [pan, tap]);
+  // Interactive blocks get drag+tap; locked ones (errands while focusing, plan
+  // blocks while not focusing) get only a tap (focus/open/switch).
+  const gesture = useMemo(
+    () => (editableHere ? Gesture.Exclusive(pan, tap) : tap),
+    [editableHere, pan, tap],
+  );
 
   const animStyle = useAnimatedStyle(() => {
     const active = sv.dragId.value === event.id;
@@ -1131,39 +1309,92 @@ function DraftBlock({
           left,
           width: blockW,
           height,
-          backgroundColor: event.flexible && !selected ? t.colors.surface1 : t.colors.accentSoft,
-          borderColor: t.colors.accent,
-          borderStyle: event.flexible && !selected ? 'dashed' : 'solid',
-          borderWidth: selected ? 2 : event.flexible ? StyleSheet.hairlineWidth : 0,
+          backgroundColor: isPlan
+            ? PLAN_TINT
+            : event.flexible && !selected
+            ? t.colors.surface1
+            : t.colors.accentSoft,
+          borderColor: isPlan ? t.colors.highlightPurple : t.colors.accent,
+          borderStyle: !isPlan && event.flexible && !selected ? 'dashed' : 'solid',
+          borderWidth: isFocusBlock
+            ? selected
+              ? 2
+              : 1.5
+            : isPlan
+            ? StyleSheet.hairlineWidth
+            : selected
+            ? 2
+            : event.flexible
+            ? StyleSheet.hairlineWidth
+            : 0,
           shadowColor: t.colors.shadow,
         },
         animStyle,
+        // Non-focused blocks fade back while a plan is being edited.
+        dim ? styles.dimmed : null,
       ]}
     >
       <GestureDetector gesture={gesture}>
         <View style={styles.blockInner}>
-          <View style={[styles.blockBar, { backgroundColor: t.colors.accent }]} />
+          <View
+            style={[
+              styles.blockBar,
+              { backgroundColor: isPlan ? t.colors.highlightPurple : t.colors.accent },
+            ]}
+          />
           <View style={styles.blockBody}>
             <View style={styles.blockTitleRow}>
               <Text
                 variant="caption"
                 weight="bold"
                 numberOfLines={1}
-                style={[styles.blockTitle, { color: t.colors.accentText }]}
+                style={[
+                  styles.blockTitle,
+                  { color: isPlan ? t.colors.textPrimary : t.colors.accentText },
+                ]}
               >
                 {errand.title}
               </Text>
-              {event.recurring ? (
+              {isPlan ? (
+                <Ionicons
+                  name={event.recurring ? 'repeat' : 'map'}
+                  size={11}
+                  color={t.colors.highlightPurple}
+                />
+              ) : event.recurring ? (
                 <Ionicons name="repeat" size={11} color={t.colors.accentText} />
               ) : located ? (
                 <Ionicons name="location" size={11} color={t.colors.accentText} />
               ) : null}
             </View>
-            <Text variant="micro" numberOfLines={1} style={{ color: t.colors.accentText, opacity: 0.85 }}>
-              {`${formatTime(minutesToHHMM(event.startMin))} – ${formatTime(minutesToHHMM(event.endMin))}`}
-            </Text>
+            {showMeta ? (
+              <Text
+                variant="micro"
+                numberOfLines={1}
+                style={{
+                  color: isPlan ? t.colors.textSecondary : t.colors.accentText,
+                  opacity: isPlan ? 1 : 0.85,
+                }}
+              >
+                {`${formatTime(minutesToHHMM(event.startMin))} – ${formatTime(minutesToHHMM(event.startMin + realWork))}`}
+              </Text>
+            ) : null}
           </View>
-          {editing ? (
+          {!showMeta ? null : isFocusBlock ? (
+            <Ionicons
+              name={selected ? 'ellipsis-horizontal' : 'reorder-two'}
+              size={16}
+              color={t.colors.highlightPurple}
+              style={{ opacity: 0.75 }}
+            />
+          ) : isPlan ? (
+            <Ionicons
+              name="chevron-forward"
+              size={14}
+              color={t.colors.highlightPurple}
+              style={{ opacity: 0.8 }}
+            />
+          ) : editing ? (
             <Ionicons
               name={selected ? 'ellipsis-horizontal' : 'reorder-two'}
               size={16}
@@ -1173,10 +1404,16 @@ function DraftBlock({
           ) : null}
         </View>
       </GestureDetector>
-      {/* Stretch grip — the bottom strip resizes the block's duration (edit only) */}
-      {editing ? (
+      {/* Stretch grip — the bottom strip resizes the block's duration (editable
+          blocks tall enough to grab: errands in edit, or a focused plan stop) */}
+      {resizable && showMeta ? (
         <View pointerEvents="none" style={styles.grip}>
-          <View style={[styles.gripBar, { backgroundColor: t.colors.accent }]} />
+          <View
+            style={[
+              styles.gripBar,
+              { backgroundColor: isFocusBlock ? t.colors.highlightPurple : t.colors.accent },
+            ]}
+          />
         </View>
       ) : null}
     </Animated.View>
@@ -1305,6 +1542,58 @@ function TrayChip({
   );
 }
 
+/**
+ * A continuous rail down the left of the plan's blocks that ties them into one
+ * object (so a plan reads as a single thing, not a scatter of purple blocks),
+ * capped by a tappable badge that opens the plan in the planner — the explicit
+ * "this is your plan; edit it there" affordance. The rail itself is inert; only
+ * the cap takes a tap, and it sits in the gutter so it never blocks a drag.
+ */
+function PlanSpine({
+  winStart,
+  topMin,
+  bottomMin,
+  title,
+  onOpen,
+}: {
+  winStart: number;
+  topMin: number;
+  bottomMin: number;
+  title?: string;
+  onOpen?: () => void;
+}) {
+  const t = useTheme();
+  const top = (topMin - winStart) * PXPM;
+  const height = Math.max(2, (bottomMin - topMin) * PXPM);
+  return (
+    <>
+      <View
+        pointerEvents="none"
+        style={[
+          styles.planSpine,
+          { top, height, backgroundColor: t.colors.highlightPurple },
+        ]}
+      />
+      <Pressable
+        onPress={onOpen}
+        disabled={!onOpen}
+        hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel={
+          title ? `Edit plan ${title} in the planner` : 'Edit the plan in the planner'
+        }
+        style={({ pressed }) => [
+          styles.planCap,
+          { top: Math.max(0, top - 7), backgroundColor: t.colors.highlightPurple },
+          pressed && { opacity: 0.7 },
+        ]}
+      >
+        <Ionicons name="sparkles" size={9} color={t.colors.textOnAccent} />
+      </Pressable>
+    </>
+  );
+}
+
 /** The card that rides under the finger while a tray chip is being dragged up. */
 function ChipGhost({ sv, title }: { sv: DragSV; title: string }) {
   const t = useTheme();
@@ -1328,6 +1617,195 @@ function ChipGhost({ sv, title }: { sv: DragSV; title: string }) {
         {title}
       </Text>
     </Animated.View>
+  );
+}
+
+/**
+ * The contextual action bar for a tapped, editable block — its identity + time
+ * and a Delete. Shared by errand edit and plan focus; `accent` flags a plan stop
+ * so it reads as "your plan" rather than a loose errand.
+ */
+function SelectedBar({
+  title,
+  subtitle,
+  accent,
+  onClose,
+  onDelete,
+}: {
+  title: string;
+  subtitle: string;
+  accent?: boolean;
+  onClose: () => void;
+  onDelete: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <View
+      style={[
+        styles.selBar,
+        { borderTopColor: t.colors.separator, backgroundColor: t.colors.surface1 },
+      ]}
+    >
+      <Pressable
+        onPress={onClose}
+        hitSlop={8}
+        style={[styles.selClose, { backgroundColor: t.colors.fill1 }]}
+        accessibilityLabel="Done editing this block"
+      >
+        <Ionicons name="close" size={15} color={t.colors.textSecondary} />
+      </Pressable>
+      <View style={styles.selInfo}>
+        <View style={styles.selTitleRow}>
+          {accent ? (
+            <Ionicons name="sparkles" size={11} color={t.colors.highlightPurple} />
+          ) : null}
+          <Text variant="caption" weight="bold" numberOfLines={1} style={styles.selTitle}>
+            {title}
+          </Text>
+        </View>
+        <Text variant="micro" tone="tertiary" numberOfLines={1}>
+          {subtitle}
+        </Text>
+      </View>
+      <Pressable
+        onPress={onDelete}
+        hitSlop={6}
+        style={({ pressed }) => [
+          styles.selDelete,
+          { backgroundColor: t.colors.dangerSoft },
+          pressed && { opacity: 0.7 },
+        ]}
+        accessibilityRole="button"
+        accessibilityLabel={`Delete ${title}`}
+      >
+        <Ionicons name="trash-outline" size={15} color={t.colors.danger} />
+        <Text variant="micro" weight="bold" style={{ color: t.colors.danger }}>
+          Delete
+        </Text>
+      </Pressable>
+    </View>
+  );
+}
+
+/**
+ * The bottom chrome while a plan is in focus. Edits are STAGED, so this mirrors
+ * the errand-edit bar: a routing spinner + "Add stop", then a persistent
+ * Cancel (the permanent revert — discards every staged change) and Confirm (the
+ * only thing that writes the plan). Confirm enables once something's changed.
+ */
+function FocusBar({
+  title,
+  busy,
+  dirty,
+  onAddStop,
+  onConfirm,
+  onCancel,
+  bottomInset,
+}: {
+  title?: string;
+  busy?: boolean;
+  dirty?: boolean;
+  onAddStop?: () => void;
+  onConfirm?: () => void;
+  onCancel?: () => void;
+  bottomInset: number;
+}) {
+  const t = useTheme();
+  return (
+    <>
+      <View
+        style={[
+          styles.focusHead,
+          { backgroundColor: t.colors.surface1, borderTopColor: t.colors.separator },
+        ]}
+      >
+        <View style={styles.focusInfo}>
+          {busy ? (
+            <ActivityIndicator size="small" color={t.colors.highlightPurple} />
+          ) : (
+            <Ionicons name="sparkles" size={15} color={t.colors.highlightPurple} />
+          )}
+          <View style={styles.focusInfoText}>
+            <Text variant="micro" uppercase weight="bold" tone="tertiary" style={styles.focusKicker}>
+              {busy ? 'Re-routing…' : 'Editing plan'}
+            </Text>
+            {title ? (
+              <Text variant="caption" weight="bold" numberOfLines={1}>
+                {title}
+              </Text>
+            ) : null}
+          </View>
+        </View>
+        <Pressable
+          onPress={onAddStop}
+          disabled={!onAddStop}
+          hitSlop={6}
+          style={({ pressed }) => [
+            styles.addBtn,
+            { backgroundColor: t.colors.accentSoft },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Add a stop to the plan"
+        >
+          <Ionicons name="add" size={15} color={t.colors.accentText} />
+          <Text variant="micro" weight="bold" style={{ color: t.colors.accentText }}>
+            Add stop
+          </Text>
+        </Pressable>
+      </View>
+      <View
+        style={[
+          styles.bar,
+          {
+            borderTopColor: t.colors.separator,
+            backgroundColor: t.colors.background,
+            paddingBottom: Math.max(10, bottomInset),
+          },
+        ]}
+      >
+        <Pressable
+          onPress={onCancel}
+          style={({ pressed }) => [
+            styles.barBtn,
+            { backgroundColor: t.colors.fill1 },
+            pressed && { opacity: 0.7 },
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Discard plan changes"
+        >
+          <Text variant="bodySm" weight="semibold">
+            {dirty ? 'Revert' : 'Cancel'}
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={onConfirm}
+          disabled={!dirty}
+          style={({ pressed }) => [
+            styles.barBtn,
+            styles.barConfirm,
+            { backgroundColor: dirty ? t.colors.accent : t.colors.fill1 },
+            pressed && { opacity: 0.85 },
+          ]}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: !dirty }}
+          accessibilityLabel="Confirm plan changes"
+        >
+          <Ionicons
+            name="checkmark"
+            size={17}
+            color={dirty ? t.colors.textOnAccent : t.colors.textTertiary}
+          />
+          <Text
+            variant="bodySm"
+            weight="bold"
+            style={{ color: dirty ? t.colors.textOnAccent : t.colors.textTertiary }}
+          >
+            Confirm
+          </Text>
+        </Pressable>
+      </View>
+    </>
   );
 }
 
@@ -1405,6 +1883,9 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 6 },
     shadowRadius: 12,
     shadowOpacity: 0,
+  },
+  dimmed: {
+    opacity: 0.4,
   },
   blockInner: {
     flex: 1,
@@ -1529,6 +2010,24 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     paddingBottom: 2,
   },
+  planSpine: {
+    position: 'absolute',
+    left: GUTTER_W - 11,
+    width: 3,
+    borderRadius: 2,
+    opacity: 0.45,
+    zIndex: 2,
+  },
+  planCap: {
+    position: 'absolute',
+    left: GUTTER_W - 16,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 3,
+  },
   gripBar: {
     width: 24,
     height: 3,
@@ -1587,6 +2086,14 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: 1,
   },
+  selTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  selTitle: {
+    flexShrink: 1,
+  },
   selDelete: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1594,5 +2101,26 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     height: 32,
     borderRadius: 16,
+  },
+  focusHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  focusInfo: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  focusInfoText: {
+    flexShrink: 1,
+    gap: 1,
+  },
+  focusKicker: {
+    letterSpacing: 1,
   },
 });

@@ -19,7 +19,7 @@ import {
   travelIconName,
   type TravelMode,
 } from '@/lib/travel';
-import { MIN_EVENT_MIN, type TimeWindow } from './dayCalendar';
+import { type TimeWindow } from './dayCalendar';
 
 /** Minutes a dragged block snaps to — quarter-hours read as a tidy calendar. */
 export const SNAP_MIN = 15;
@@ -195,12 +195,15 @@ export function buildDayDraft(
       continue;
     }
     const workMin = edit?.durationMin != null ? edit.durationMin : workMinutes(e);
-    const drawn = Math.max(MIN_EVENT_MIN, workMin);
     events.push({
       id: e.id,
       errand: e,
       startMin: start,
-      endMin: Math.min(DAY_MIN, start + drawn),
+      // Real end — overlap-packing and the block's time label must reflect the
+      // true duration (a 15-min stop is 15 min, not padded to 30). A legible
+      // MINIMUM draw HEIGHT is a render concern, handled in DayEditor, so it
+      // never inflates the logical span into false clashes.
+      endMin: Math.min(DAY_MIN, start + workMin),
       workMin,
       located: e.latitude != null && e.longitude != null,
       recurring: Boolean(e.recurringId),

@@ -37,6 +37,14 @@ function newGapId(): string {
   return `gap-${Date.now().toString(36)}-${gapCounter}`;
 }
 
+/** Monotonic local id for a brand-new stop the user adds on the grid. The
+ *  `item-` prefix keeps it distinct from server/planner ids and gap ids. */
+let itemCounter = 0;
+function newItemId(): string {
+  itemCounter += 1;
+  return `item-${Date.now().toString(36)}-${itemCounter}`;
+}
+
 /** Title used for an unnamed gap. Merges prefer a real (user/AI) name over this. */
 const DEFAULT_GAP_TITLE = 'Free time';
 
@@ -591,6 +599,10 @@ export function applyRoutedLegs(base: Itinerary, routed: Itinerary): Itinerary {
         if (!b) return it; // server-introduced block (e.g. "Back home")
         return {
           ...it,
+          // The errand link is client-side identity (the server doesn't echo it),
+          // so restore it by id — else a re-route un-links the stop and the
+          // calendar redraws the errand it folded in as a loose block.
+          errandId: b.errandId ?? it.errandId,
           flexibility: b.flexibility,
           startTime: b.startTime ?? it.startTime,
           durationMinutes: b.durationMinutes,
@@ -938,6 +950,122 @@ export function classifyReorder(base: Itinerary, orderedIds: string[]): ReorderI
   return venuesChanged ? 'reroute' : 'free';
 }
 
+/** A stop the user can see + drag on the calendar grid (not a gap/travel block). */
+function isVisibleStop(item: ItineraryItem): boolean {
+  return item.kind !== 'gap' && item.kind !== 'travel';
+}
+
+/**
+ * The full day order (all item ids) with `draggedId` repositioned to the slot
+ * its DROPPED start time implies among the OTHER visible stops — i.e. how many
+ * visible stops start before it. Gaps/travel keep their relative spots and are
+ * compacted by {@link reorderItems}. Used to turn a vertical grid drag that
+ * crosses other stops into a real resequence.
+ */
+export function reorderFromDrag(
+  itin: Itinerary,
+  draggedId: string,
+  newStartMin: number,
+): string[] {
+  const flat = flatten(itin);
+  if (!flat.some((it) => it.id === draggedId)) return flat.map((it) => it.id);
+
+  // How many OTHER visible stops begin before the drop → the dragged stop's new
+  // index in the visible sequence.
+  let newVisIdx = 0;
+  for (const it of flat) {
+    if (it.id === draggedId || !isVisibleStop(it)) continue;
+    const s = minutesOfDay(it.startTime);
+    if (s != null && s < newStartMin) newVisIdx += 1;
+  }
+
+  const result: string[] = [];
+  let visSeen = 0;
+  let inserted = false;
+  for (const it of flat) {
+    if (it.id === draggedId) continue;
+    if (isVisibleStop(it)) {
+      if (visSeen === newVisIdx && !inserted) {
+        result.push(draggedId);
+        inserted = true;
+      }
+      visSeen += 1;
+    }
+    result.push(it.id);
+  }
+  if (!inserted) result.push(draggedId);
+  return result;
+}
+
+/**
+ * Nudges a drop time so the dragged stop never lands ON TOP of a FIXED anchor:
+ * if its dropped interval overlaps a fixed stop, it snaps to that block's nearer
+ * free edge (just above if dropped on the top half, just below otherwise), then
+ * re-checks in case it now overlaps the next fixed block. Fixed anchors stay put
+ * (the user asked to keep them pinned); the moved stop flows around them.
+ */
+function snapClearOfFixedAnchors(
+  flat: ItineraryItem[],
+  draggedId: string,
+  startMin: number,
+  dur: number,
+): number {
+  let s = startMin;
+  for (let guard = 0; guard < 6; guard++) {
+    let bumped = false;
+    for (const it of flat) {
+      if (it.id === draggedId || !isVisibleStop(it) || it.flexibility !== 'fixed') continue;
+      const fs = minutesOfDay(it.startTime);
+      if (fs == null) continue;
+      const fe = fs + itemDuration(it);
+      if (s < fe && s + dur > fs) {
+        const dropMid = s + dur / 2;
+        const blockMid = (fs + fe) / 2;
+        s = dropMid < blockMid ? Math.max(0, fs - dur) : fe;
+        bumped = true;
+        break;
+      }
+    }
+    if (!bumped) break;
+  }
+  return s;
+}
+
+/**
+ * Turns a grid drag (a stop dropped at `newStartMin`) into the op(s) to apply.
+ *
+ *   - Order unchanged → a single `moveTime` pin at the dropped minute.
+ *   - Order changed   → a `reorder` for the new SEQUENCE, THEN a `moveTime` that
+ *     re-pins the dragged stop at the dropped minute. Without that second op the
+ *     resequence COMPACTS the day and the stop snaps to a packed slot — which on
+ *     a dense plan felt like it could only move in big (~hour) jumps. Pinning it
+ *     makes the block land exactly where the finger let go while the rest of the
+ *     day still reflows around the new order.
+ *
+ * A FLEXIBLE stop is first snapped clear of any FIXED anchor (see
+ * {@link snapClearOfFixedAnchors}) so it can't be dropped on top of one — it
+ * bumps to just above/below instead. Dragging a fixed stop is "moving that one
+ * specifically", so it pins at the drop untouched.
+ */
+export function moveOrReorderFromDrag(
+  itin: Itinerary,
+  id: string,
+  newStartMin: number,
+): EditOp[] {
+  const flat = flatten(itin);
+  const dragged = flat.find((it) => it.id === id);
+  const dropMin =
+    dragged && dragged.flexibility !== 'fixed'
+      ? snapClearOfFixedAnchors(flat, id, newStartMin, itemDuration(dragged))
+      : newStartMin;
+  const order = reorderFromDrag(itin, id, dropMin);
+  const current = flat.map((it) => it.id);
+  const changed =
+    order.length !== current.length || order.some((x, i) => x !== current[i]);
+  const pin: EditOp = { type: 'moveTime', id, hhmm: fmtHHMM(dropMin) };
+  return changed ? [{ type: 'reorder', orderedIds: order }, pin] : [pin];
+}
+
 /**
  * Inserts a new free-time gap block, anchored either AFTER `afterId` or BEFORE
  * `beforeId` (exactly one should be set; `afterId` wins if both are). The gap
@@ -1011,6 +1139,82 @@ export function insertGap(
   return cascadeTimes({ ...itin, sections: withGap });
 }
 
+/** The editable fields a freshly-added stop carries in (everything else is
+ *  derived). A timed add pins `fixed`; a timeless one flows flexibly. */
+export interface NewItemInput {
+  title: string;
+  kind?: ItineraryItem['kind'];
+  startTime?: string | null;
+  durationMinutes?: number | null;
+  place?: ItineraryPlace | null;
+  flexibility?: ItineraryItem['flexibility'];
+  /** Links the new stop back to an errand, when the user added one. */
+  errandId?: string | null;
+}
+
+/**
+ * Inserts a brand-new stop into the day (the grid's "Add stop"), anchored AFTER
+ * `afterId` or BEFORE `beforeId` (afterId wins; else appended), then reflows.
+ * A stop given a start time is pinned `fixed` so it lands where the user put it;
+ * a timeless one is `flexible` and the cascade places it. Splices into the
+ * anchor's section exactly like {@link insertGap}.
+ */
+export function insertItem(
+  itin: Itinerary,
+  opts: { item: NewItemInput; afterId?: string | null; beforeId?: string | null },
+): CascadeResult {
+  const src = opts.item;
+  const dur =
+    src.durationMinutes != null && src.durationMinutes > 0
+      ? Math.round(src.durationMinutes)
+      : 60;
+  const newItem: ItineraryItem = {
+    id: newItemId(),
+    title: src.title?.trim() || 'New stop',
+    kind: src.kind ?? 'activity',
+    flexibility: src.flexibility ?? (src.startTime ? 'fixed' : 'flexible'),
+    startTime: src.startTime ?? undefined,
+    durationMinutes: dur,
+    place: src.place ?? undefined,
+    errandId: src.errandId ?? undefined,
+    gapBeforeMin: 0,
+    orderIndex: 0,
+  };
+
+  const flat = flatten(itin);
+  let insertFlatIdx = flat.length;
+  if (opts.afterId != null) {
+    const i = flat.findIndex((it) => it.id === opts.afterId);
+    if (i !== -1) insertFlatIdx = i + 1;
+  } else if (opts.beforeId != null) {
+    const i = flat.findIndex((it) => it.id === opts.beforeId);
+    if (i !== -1) insertFlatIdx = i;
+  }
+
+  let cursor = 0;
+  let placed = false;
+  const sections = itin.sections.map((s) => {
+    if (placed) return s;
+    const start = cursor;
+    const end = cursor + s.items.length;
+    cursor = end;
+    if (insertFlatIdx <= end) {
+      const localIdx = Math.max(0, Math.min(s.items.length, insertFlatIdx - start));
+      const items = [...s.items];
+      items.splice(localIdx, 0, newItem);
+      placed = true;
+      return { ...s, items };
+    }
+    return s;
+  });
+  if (!placed && sections.length > 0) {
+    const last = sections[sections.length - 1];
+    sections[sections.length - 1] = { ...last, items: [...last.items, newItem] };
+  }
+
+  return cascadeTimes({ ...itin, sections });
+}
+
 /**
  * Splits a gap into two adjacent gaps. `firstMinutes` is how long the leading
  * piece keeps (defaults to half); the remainder becomes a new gap right after
@@ -1073,6 +1277,12 @@ export type EditOp =
       minutes: number;
       title?: string;
     }
+  | {
+      type: 'insertItem';
+      item: NewItemInput;
+      afterId?: string | null;
+      beforeId?: string | null;
+    }
   | { type: 'splitGap'; id: string; firstMinutes?: number }
   | { type: 'renameItem'; id: string; title: string }
   | { type: 'replaceItinerary'; itinerary: Itinerary };
@@ -1102,6 +1312,12 @@ export function applyOp(itin: Itinerary, op: EditOp): CascadeResult {
         beforeId: op.beforeId,
         minutes: op.minutes,
         title: op.title,
+      });
+    case 'insertItem':
+      return insertItem(itin, {
+        item: op.item,
+        afterId: op.afterId,
+        beforeId: op.beforeId,
       });
     case 'splitGap':
       return splitGap(itin, op.id, op.firstMinutes);
@@ -1139,6 +1355,7 @@ export function opNeedsRoute(op: EditOp): boolean {
     op.type === 'adjustDuration' ||
     op.type === 'moveTime' ||
     op.type === 'insertGap' ||
+    op.type === 'insertItem' ||
     op.type === 'splitGap'
   );
 }
@@ -1165,6 +1382,8 @@ export function describeOp(itin: Itinerary, op: EditOp): string {
       return 'Reordered your day';
     case 'insertGap':
       return `Added ${op.title?.trim() || 'free time'}`;
+    case 'insertItem':
+      return `Added ${op.item.title?.trim() || 'stop'}`;
     case 'splitGap':
       return 'Split free time';
     case 'renameItem':

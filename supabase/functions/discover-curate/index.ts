@@ -14,20 +14,25 @@
 // match nothing useful or surface random places. So we run TWO stages:
 //
 //   1. CURATE (Gemini + Google Search grounding): a search-grounded model reads
-//      the request and names up to N SPECIFIC, real, currently-operating venues
-//      that genuinely fit it, best-first, each with a one-line "why". This is the
-//      world knowledge / web step the bare Places API lacks.
+//      the request and thinks like a knowledgeable local friend. It returns
+//      THREE things: a flowing conversational `answer`, a best-first list of
+//      specific `venues` (each with a "why"), and `tips` — options that aren't a
+//      single mappable venue but still solve the need (a self-service booth, a
+//      chain/category, a method). This is the world-knowledge / web step the bare
+//      Places API lacks, and it is free to reason UNRESTRICTIVELY about the need.
 //
-//   2. GROUND (Google Places Text Search): every named venue is resolved to a
+//   2. GROUND (Google Places Text Search): every named `venue` is resolved to a
 //      real place — coordinates, rating, price, photo, opening hours — so it
 //      renders as a normal discovery card and slots into the day like any other
 //      pick. Names the model invents or that no longer exist simply drop out.
+//      Grounding is NON-gating: the `answer` and `tips` are returned regardless,
+//      so a useful non-business answer is never lost just because nothing mapped.
 //
-// The response shape is the SAME `{ provider, query, places: [...] }` that
-// `find-places` returns, so the client treats curated and ordinary discovery
-// identically. On any failure (no key, model error, nothing found) we return an
-// empty list with a `reason` and the caller transparently falls back to the
-// plain `find-places` path.
+// The response is the `find-places` shape `{ provider, query, places: [...] }`
+// plus two curated extras — `answer` (the flowing summary) and `tips` (non-venue
+// options) — which the client renders above/around the cards. On any failure (no
+// key, model error, nothing found) we return an empty list with a `reason` and
+// the caller transparently falls back to the plain `find-places` path.
 //
 // Env:
 //   GEMINI_API_KEY          — Google AI Studio key (shared with parse-errand).
@@ -127,16 +132,28 @@ function extractJsonObject(text: string): any | null {
 
 // ------------------------------------------------------------- stage 1: curate
 //
-// A search-grounded Gemini call that turns the request into a ranked list of
-// named venues. Grounding (the google_search tool) is what lets it answer
-// "michelin near Olomouc" or "most popular clubs in Prague" with real, current
-// places — but grounding is INCOMPATIBLE with responseSchema, so we ask for
-// JSON in the prompt and parse it out of the (possibly prose-wrapped) answer.
+// A search-grounded Gemini call that thinks about the user's NEED like a
+// knowledgeable local friend and returns three things: a flowing `answer`, a
+// best-first list of mappable `venues` (each with a "why"), and `tips` — options
+// that aren't a single mappable venue but still solve the need. Grounding (the
+// google_search tool) is what lets it reason about current, real-world options
+// ("there's a fotoautomat in most metro stations", "any dm drogerie does this")
+// — but grounding is INCOMPATIBLE with responseSchema, so we ask for JSON in the
+// prompt and parse it out of the (possibly prose-wrapped) answer.
 
 interface CuratedVenue {
   name: string;
   locality: string | null;
   why: string | null;
+}
+
+/** A non-venue option: a self-service method, a chain/category, or a tip. Not a
+ *  single mappable place, so it renders as an info row rather than a pin. */
+interface CuratedTip {
+  title: string;
+  detail: string | null;
+  /** An optional map search the app can run to find the nearest instance. */
+  searchQuery: string | null;
 }
 
 function buildCuratePrompt(args: {
@@ -156,32 +173,57 @@ function buildCuratePrompt(args: {
     ? `${center.latitude.toFixed(4)}, ${center.longitude.toFixed(4)}`
     : 'unknown';
   return [
-    `You are Diem's local discovery concierge. You turn a vague or knowledge-heavy`,
-    `request into a short, CURATED list of specific real venues, using current web`,
-    `knowledge (you have Google Search).`,
+    `You are Diem's local discovery concierge — a knowledgeable, resourceful local`,
+    `friend with live web access (Google Search). The user wants help finding a`,
+    `place or solving a "where do I…" need. Think about what they ACTUALLY need —`,
+    `not just the literal words — and answer the way a sharp friend would: warm,`,
+    `specific, and genuinely useful.`,
     ``,
     `Request: "${phrase}"`,
     `Area / city: ${areaLine}`,
     `User is near (lat,lng): ${coordLine}`,
     ``,
-    `Name up to ${want} SPECIFIC, real, currently-operating venues that best`,
-    `satisfy the request, BEST FIRST. Rules:`,
-    `- Use real, current knowledge — search the web. Prefer places that are`,
-    `  genuinely notable, popular, or acclaimed for THIS kind of request, not a`,
-    `  generic category dump.`,
-    `- Stay in or very near the named area/city. If no area is named, use the city`,
-    `  the coordinates fall in.`,
-    `- Honour explicit distinctions literally: "Michelin" → only Michelin-listed`,
-    `  venues; "rooftop" → only rooftop venues; "club" → nightclubs, not bars.`,
-    `- Each pick is ONE venue a person can walk into — never a neighbourhood, a`,
-    `  street, or "various spots".`,
-    `- If you genuinely can't find good matches, return an empty list rather than`,
-    `  padding with weak guesses.`,
+    `Return THREE things:`,
+    ``,
+    `1. "answer": 2-4 FLOWING sentences that actually help. Lead with the best way`,
+    `   to get what they need, note the trade-offs they care about (cheap / fast /`,
+    `   quality), and volunteer the useful specifics a friend would know — rough`,
+    `   price, typical hours, "take the metro one stop", "any dm drogerie does this".`,
+    `   Conversational prose, not a list.`,
+    ``,
+    `2. "venues": up to ${want} SPECIFIC, real, currently-operating places the user`,
+    `   can go to, BEST FIRST. These render as tappable cards they can add to their`,
+    `   day, so each MUST be a single real, mappable place (a studio, shop, station,`,
+    `   mall, kiosk — anything Google Maps knows). For each: exact "name", "locality"`,
+    `   (city/neighbourhood), and a "why" of 1-2 sentences with the useful specifics`,
+    `   (what it's best for, price/speed, what to expect). Returning FEW — even zero`,
+    `   — is fine when specific venues aren't the best answer.`,
+    ``,
+    `3. "tips": options that are NOT a single mappable venue but still solve the`,
+    `   need — a self-service option ("photo booth / fotoautomat in most metro`,
+    `   stations"), a chain or category ("any dm or Rossmann drogerie"), or a method`,
+    `   ("most pharmacies print passport photos in ~10 min"). Each: a short "title",`,
+    `   a "detail" of 1-2 sentences, and an optional "searchQuery" the app can run on`,
+    `   a map to find the nearest one ("fotoautomat", "dm drogerie"). Omit when none.`,
+    ``,
+    `Rules:`,
+    `- Reason about the NEED. If the literal category isn't the cheapest/fastest`,
+    `  answer, say so and offer the better option (a self-service booth or a`,
+    `  drugstore over a pro studio for a cheap passport photo).`,
+    `- Honour explicit qualities literally: "cheap"/"fast"/"quick" → prioritise the`,
+    `  cheap/fast options; "Michelin" → only Michelin venues; "rooftop" → only`,
+    `  rooftop venues; "club" → nightclubs, not bars.`,
+    `- Stay in or very near the named area/city. If none is named, use the city the`,
+    `  coordinates fall in.`,
+    `- Real and current only — never invent a venue. If you are not sure a specific`,
+    `  place exists, put it in "tips" as a category/method instead of "venues".`,
+    `- At least ONE of "answer", "venues", or "tips" must be non-empty.`,
     ``,
     `Return ONLY this JSON object — no prose, no markdown fences:`,
-    `{"venues":[{"name":"<exact venue name, no city suffix>","locality":"<city or`,
-    `neighbourhood>","why":"<= 16 words on why it fits>"}],"note":"<= 12 word`,
-    `summary, optional"}`,
+    `{"answer":"<2-4 sentences>","venues":[{"name":"<exact venue name, no city`,
+    `suffix>","locality":"<city or neighbourhood>","why":"<1-2 sentences>"}],`,
+    `"tips":[{"title":"<short label>","detail":"<1-2 sentences>","searchQuery":`,
+    `"<optional map search, or omit>"}]}`,
   ].join('\n');
 }
 
@@ -190,7 +232,13 @@ async function curateVenues(args: {
   apiKey: string;
   model: string;
 }): Promise<
-  | { ok: true; venues: CuratedVenue[]; note: string | null; usage: TokenUsage }
+  | {
+      ok: true;
+      venues: CuratedVenue[];
+      tips: CuratedTip[];
+      answer: string | null;
+      usage: TokenUsage;
+    }
   | { ok: false; status: number; detail: string }
 > {
   const body = {
@@ -198,7 +246,9 @@ async function curateVenues(args: {
     // Google Search grounding — the world-knowledge / "web" step. Cannot be
     // combined with responseSchema, so the prompt asks for JSON instead.
     tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0.3 },
+    // A touch warmer than the slot-filler: the concierge writes prose + reasons
+    // about the need, so a little creative range helps without losing accuracy.
+    generationConfig: { temperature: 0.4 },
   };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${args.model}:generateContent?key=${args.apiKey}`;
 
@@ -236,17 +286,37 @@ async function curateVenues(args: {
         typeof v?.locality === 'string' && v.locality.trim()
           ? v.locality.trim().slice(0, 80)
           : null,
+      // Allow 1-2 sentences now (was a 16-word fragment) so the card blurb can
+      // carry the useful specifics the user actually wanted.
       why:
         typeof v?.why === 'string' && v.why.trim()
-          ? v.why.trim().slice(0, 200)
+          ? v.why.trim().slice(0, 320)
           : null,
     });
   }
-  const note =
-    typeof parsed?.note === 'string' && parsed.note.trim()
-      ? parsed.note.trim().slice(0, 160)
+  const rawTips = Array.isArray(parsed?.tips) ? parsed.tips : [];
+  const tips: CuratedTip[] = [];
+  for (const tp of rawTips) {
+    const title = typeof tp?.title === 'string' ? tp.title.trim() : '';
+    if (!title) continue;
+    tips.push({
+      title: title.slice(0, 120),
+      detail:
+        typeof tp?.detail === 'string' && tp.detail.trim()
+          ? tp.detail.trim().slice(0, 320)
+          : null,
+      searchQuery:
+        typeof tp?.searchQuery === 'string' && tp.searchQuery.trim()
+          ? tp.searchQuery.trim().slice(0, 80)
+          : null,
+    });
+    if (tips.length >= 5) break;
+  }
+  const answer =
+    typeof parsed?.answer === 'string' && parsed.answer.trim()
+      ? parsed.answer.trim().slice(0, 700)
       : null;
-  return { ok: true, venues, note, usage: geminiUsage(data?.usageMetadata) };
+  return { ok: true, venues, tips, answer, usage: geminiUsage(data?.usageMetadata) };
 }
 
 // ------------------------------------------------------------- stage 2: ground
@@ -421,53 +491,49 @@ Deno.serve(async (req: Request) => {
   logTokenUsage({ fn: 'discover-curate', step: 'curate', model: DISCOVER_MODEL, usage: curated.usage });
   const usage = { model: DISCOVER_MODEL, ...curated.usage };
 
-  if (curated.venues.length === 0) {
+  // The concierge produced nothing usable at all — bail so the caller falls back
+  // to the plain category search.
+  if (curated.venues.length === 0 && curated.tips.length === 0 && !curated.answer) {
     return jsonResponse({
       provider: 'none',
       query: phrase,
       places: [],
       reason: 'no_results',
-      note: curated.note ?? undefined,
       usage,
     });
   }
 
-  if (!center) {
-    // Without a center we can't ground/bias or compute distances. Bail to the
-    // fallback — the curated names alone aren't a card list.
-    return jsonResponse({
-      provider: 'none',
-      query: phrase,
-      places: [],
-      reason: 'no_location',
-      note: curated.note ?? undefined,
-      usage,
-    });
-  }
-
-  // Stage 2 — ground every named venue in parallel. Bias generously to the
-  // city so a venue just outside the requested radius still resolves correctly,
-  // but keep the ranking exactly as the concierge ordered it.
-  const biasRadiusM = Math.min(50000, Math.max(payload.radiusM ?? 8000, 15000));
-  const grounded = await Promise.all(
-    curated.venues.map((v) => groundVenue(v, center, biasRadiusM, placesKey)),
-  );
-
-  const seen = new Set<string>();
+  // Stage 2 — ground every named venue in parallel. Bias generously to the city
+  // so a venue just outside the requested radius still resolves correctly, but
+  // keep the ranking exactly as the concierge ordered it. Grounding is
+  // NON-gating: a venue that won't resolve to a Maps place simply doesn't become
+  // a card — the `answer` and `tips` still carry the useful information. Without
+  // a center we skip grounding entirely but still return answer + tips.
   const places: UnifiedPlace[] = [];
-  for (const place of grounded) {
-    if (!place || seen.has(place.id)) continue;
-    seen.add(place.id);
-    places.push(place);
-    if (places.length >= limit) break;
+  if (center && curated.venues.length > 0) {
+    const biasRadiusM = Math.min(50000, Math.max(payload.radiusM ?? 8000, 15000));
+    const grounded = await Promise.all(
+      curated.venues.map((v) => groundVenue(v, center, biasRadiusM, placesKey)),
+    );
+    const seen = new Set<string>();
+    for (const place of grounded) {
+      if (!place || seen.has(place.id)) continue;
+      seen.add(place.id);
+      places.push(place);
+      if (places.length >= limit) break;
+    }
   }
 
+  const hasContent = places.length > 0 || curated.tips.length > 0 || !!curated.answer;
   return jsonResponse({
-    provider: places.length > 0 ? 'google' : 'none',
+    // 'google' signals a usable curated response (cards, tips, or a written
+    // answer) so the client keeps it instead of falling back to plain search.
+    provider: hasContent ? 'google' : 'none',
     query: phrase,
     places,
-    reason: places.length === 0 ? 'no_results' : undefined,
-    note: curated.note ?? undefined,
+    answer: curated.answer ?? undefined,
+    tips: curated.tips,
+    reason: hasContent ? undefined : 'no_results',
     curated: true,
     usage,
   });

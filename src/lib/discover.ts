@@ -23,12 +23,15 @@ import {
   findPlaces,
   getCurrentCoords,
   type Coords,
+  type DiscoverTip,
   type NearbyPlace,
   type PlacesProvider,
 } from '@/lib/places';
 import { autocompletePlaces, resolvePlace, reverseGeocodeCity } from '@/lib/geocoding';
 import { expandPlaceQuery } from '@/lib/placeQueryExpand';
 import type { LlmTokenUsage } from '@/lib/usage';
+
+export type { DiscoverTip } from '@/lib/places';
 
 /**
  * Where the candidate search was centered, and how we got there.
@@ -71,6 +74,20 @@ export interface DiscoverParams {
    * heuristic when it knows better.
    */
   smart?: boolean;
+  /**
+   * The user's ORIGINAL natural-language request ("where can I take a quick
+   * cheap government photo near me?"). When present for a curated search it is
+   * sent to the concierge verbatim, so qualities like "cheap"/"fast" survive and
+   * steer the answer (rather than the stripped-down category). Also used to
+   * route question/problem phrasings to the concierge.
+   */
+  phrase?: string;
+  /**
+   * Set by the orchestrator (parse-errand) when the line is a question/problem
+   * to solve rather than a tidy category — forces the curated concierge path
+   * even when no superlative/occasion keyword is present.
+   */
+  openEnded?: boolean;
 }
 
 export interface DiscoverResult {
@@ -92,6 +109,17 @@ export interface DiscoverResult {
    * plain category Text Search. Lets the UI label them as hand-picked.
    */
   curated?: boolean;
+  /**
+   * Curated path only: the concierge's short, flowing conversational answer
+   * (the "here's the best way to get what you need" summary). Rendered above the
+   * cards. Absent on the plain category path.
+   */
+  answer?: string;
+  /**
+   * Curated path only: non-venue options/tips (a self-service method, a chain/
+   * category) to show alongside the cards. See {@link DiscoverTip}.
+   */
+  suggestions?: DiscoverTip[];
   reason?: 'no_supabase' | 'no_location' | 'no_results' | 'error';
   detail?: string;
   /** Token spend the venue re-rank reported for this call; null when none ran. */
@@ -141,6 +169,13 @@ export interface DiscoveryIntent {
   area: string | null;
   /** True for "near me" / "nearby" / "closest" — search around live GPS. */
   nearby: boolean;
+  /**
+   * True when the line is a question/problem to solve rather than a tidy
+   * category ("where can I take a cheap passport photo?"). Routes the search to
+   * the web-researched concierge. Set by the orchestrator (parse-errand); the
+   * on-device {@link detectDiscovery} also infers it from question phrasing.
+   */
+  openEnded?: boolean;
 }
 
 // "near me", "nearby", "closest", … — proximity to the user, not a named area.
@@ -206,7 +241,10 @@ export function detectDiscovery(text: string): DiscoveryIntent | null {
   if (query.length < 2) query = normalizeDiscoveryQuery(raw);
   if (query.length < 2) return null;
 
-  return { query, area, nearby };
+  // Flag question/problem-solving (and curation) phrasing so the search routes
+  // to the web-researched concierge. Tested on the RAW line because the cue
+  // ("where can I…", "best") is usually stripped out of the cleaned `query`.
+  return { query, area, nearby, openEnded: isSmartDiscovery(raw, area) };
 }
 
 function dedupe(items: string[]): string[] {
@@ -393,6 +431,14 @@ const OCCASION_RE =
 const OPEN_INTENT_RE =
   /\b(?:where\s+(?:to|can\s+i|should\s+i)\s+(?:take|go|eat|drink|bring|have)|what\s+to\s+do|things\s+to\s+do|somewhere\s+(?:to|nice|special|romantic|fun|cool)|ideas?\s+for|suggestions?\s+for)\b/i;
 
+// Question / problem-solving phrasing: "where can I…", "how do I…", "I need
+// somewhere to…", "is there anywhere…", "can I … here". These are requests
+// where the obvious category may NOT be the best answer (a cheap passport
+// photo, where to print something, where to charge a car), so they deserve the
+// web-researched concierge rather than a literal category search.
+const OPEN_ENDED_RE =
+  /\b(?:where\s+(?:can|could|do|should)\s+(?:i|we|you)|how\s+(?:can|could|do|should|to)\s+(?:i|we|you)|i\s+need\s+(?:to|a|an|some|somewhere)|need\s+somewhere\s+to|somewhere\s+(?:i\s+can|to\s+\w)|is\s+there\s+(?:a|an|any|anywhere|somewhere)|can\s+i\s+(?:find|get|buy|do|take|grab))\b/i;
+
 /**
  * True when a discovery request reads as knowledge/curation-heavy and should go
  * through the web-grounded `discover-curate` path rather than a plain category
@@ -403,7 +449,12 @@ const OPEN_INTENT_RE =
 export function isSmartDiscovery(query: string, area?: string | null): boolean {
   const text = `${query ?? ''} ${area ?? ''}`.trim();
   if (text.length < 3) return false;
-  return CURATION_RE.test(text) || OCCASION_RE.test(text) || OPEN_INTENT_RE.test(text);
+  return (
+    CURATION_RE.test(text) ||
+    OCCASION_RE.test(text) ||
+    OPEN_INTENT_RE.test(text) ||
+    OPEN_ENDED_RE.test(text)
+  );
 }
 
 /**
@@ -477,7 +528,14 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
   // first. On any miss (not configured, model error, nothing grounded) we fall
   // straight through to the plain category search below — curated discovery is
   // strictly an upgrade, never a dead end.
-  const smart = params.smart ?? isSmartDiscovery(baseQuery, params.area ?? null);
+  // The concierge runs when the orchestrator flagged the line open-ended, when
+  // the caller forced it, or when the phrasing itself reads as curation/problem-
+  // solving. The decision is tested against the user's ORIGINAL phrase when we
+  // have it (so "where can I…" survives the category strip), else the category.
+  const decisionText = (params.phrase ?? '').trim() || baseQuery;
+  const smart =
+    params.smart ??
+    (params.openEnded === true || isSmartDiscovery(decisionText, params.area ?? null));
   if (smart) {
     // Anchor on a real city name. A named area already is one; otherwise turn the
     // bare GPS/home center into a locality ("Current location" tells the model
@@ -491,15 +549,28 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
       ).catch(() => null);
       if (city) nearLabel = city;
     }
-    const phrase = curatePhrase(baseQuery, params.area ?? null, !!params.nearby, nearLabel);
+    // For an open-ended/problem request, send the user's ORIGINAL words so the
+    // concierge sees "quick, fast, cheap" and can prefer a booth over a studio.
+    // For a superlative/occasion request with no raw phrase, build the tidy
+    // "<what> in <where>" phrase as before.
+    const conciergeQuery =
+      (params.phrase ?? '').trim() ||
+      curatePhrase(baseQuery, params.area ?? null, !!params.nearby, nearLabel);
     const curated = await curateDiscoveryPlaces({
-      query: phrase,
+      query: conciergeQuery,
       area: params.area ?? null,
       nearLabel,
       center: resolved.center,
       radiusM: params.radiusM,
     });
-    if (curated.places.length > 0) {
+    // Keep the curated result when it has ANY content — grounded cards, a written
+    // answer, or tips — so a useful non-business answer is never discarded just
+    // because nothing grounded to a Maps pin.
+    const hasCuratedContent =
+      curated.places.length > 0 ||
+      !!curated.answer ||
+      (curated.suggestions?.length ?? 0) > 0;
+    if (hasCuratedContent) {
       return {
         places: curated.places,
         center: resolved.center,
@@ -509,6 +580,8 @@ export async function discoverPlaces(params: DiscoverParams): Promise<DiscoverRe
         queries,
         provider: curated.provider,
         curated: true,
+        answer: curated.answer ?? undefined,
+        suggestions: curated.suggestions,
         usage: curated.usage ?? null,
         debug: curated.debug,
       };

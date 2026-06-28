@@ -12,9 +12,6 @@
 import type { Errand } from '@/store/useErrandsStore';
 import { errandTimeMode, minutesOfDay } from '@/utils/time';
 
-/** Shortest block we ever draw, so a 0–15 min errand stays readable/tappable. */
-export const MIN_EVENT_MIN = 30;
-
 /** Default visible window when the day has no early/late outliers (07:00–22:00). */
 const DEFAULT_START_HOUR = 7;
 const DEFAULT_END_HOUR = 22;
@@ -55,8 +52,9 @@ export interface DayCalendar {
 /**
  * Turn one errand into a positioned event, or null when it has no start time
  * (those flow to the unscheduled tray instead). Duration falls back through
- * end time → duration estimate → a sensible 60-minute default, and is clamped
- * to at least {@link MIN_EVENT_MIN} so the block is never a sliver.
+ * end time → duration estimate → a sensible 60-minute default. The span stays
+ * true to the real duration; each view floors the block's PIXEL height (not its
+ * minutes) so a short stop reads accurately without faking a longer slot.
  */
 export function errandToCalEvent(errand: Errand): CalEvent | null {
   const startMin = minutesOfDay(errand.startTime);
@@ -72,7 +70,11 @@ export function errandToCalEvent(errand: Errand): CalEvent | null {
   } else {
     endMin = startMin + 60;
   }
-  endMin = Math.min(DAY_MIN, Math.max(endMin, startMin + MIN_EVENT_MIN));
+  // Keep the REAL span so overlap-packing and labels reflect the true duration
+  // (a 15-min stop must not read as 30 and falsely clash with the next block).
+  // A legible minimum is a render concern: each view floors the block's PIXEL
+  // height, never the minutes here.
+  endMin = Math.min(DAY_MIN, Math.max(endMin, startMin + 1));
 
   return {
     id: errand.id,

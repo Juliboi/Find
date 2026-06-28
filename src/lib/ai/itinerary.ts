@@ -395,6 +395,7 @@ function sanitizeItem(raw: any, index: number): ItineraryItem | null {
     kind === 'gap' ? 'flexible' : sanitizeFlexibility(raw.flexibility);
   return {
     id: asString(raw.id) ?? uid('item'),
+    errandId: asString(raw.errandId),
     title,
     kind,
     flexibility,

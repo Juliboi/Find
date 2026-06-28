@@ -56,6 +56,9 @@ export default function DiscoverSandboxScreen() {
         fallbackCenter: home
           ? { latitude: home.latitude, longitude: home.longitude }
           : null,
+        // Feed the typed line to the concierge verbatim so question/problem
+        // phrasing ("where can I…") routes correctly and "cheap/fast" survives.
+        phrase: query,
         // On → force the web-grounded curated path; off → auto-detect from text.
         ...(forceSmart ? { smart: true } : {}),
       });
@@ -217,13 +220,52 @@ export default function DiscoverSandboxScreen() {
               {result.detail ? <StatRow label="Note" value={result.detail} /> : null}
             </Card>
 
-            {result.places.length === 0 ? (
+            {result.answer ? (
+              <Card padded style={styles.answerCard}>
+                <View style={styles.answerHead}>
+                  <Ionicons name="sparkles" size={14} color={t.colors.accent} />
+                  <Text variant="caption" tone="secondary" weight="semibold" uppercase>
+                    Answer
+                  </Text>
+                </View>
+                <Text variant="body">{result.answer}</Text>
+              </Card>
+            ) : null}
+
+            {result.places.map((p) => <PlaceResultCard key={p.id} place={p} />)}
+
+            {result.suggestions && result.suggestions.length > 0 ? (
+              <Card padded style={styles.tipsCard}>
+                <Text variant="caption" tone="secondary" weight="semibold" uppercase>
+                  Tips ({result.suggestions.length})
+                </Text>
+                {result.suggestions.map((tip, i) => (
+                  <View key={`${tip.title}-${i}`} style={styles.tipItem}>
+                    <Text variant="bodySm" weight="semibold">
+                      {tip.title}
+                    </Text>
+                    {tip.detail ? (
+                      <Text variant="caption" tone="secondary">
+                        {tip.detail}
+                      </Text>
+                    ) : null}
+                    {tip.searchQuery ? (
+                      <Text variant="caption" tone="tertiary">
+                        search: “{tip.searchQuery}”
+                      </Text>
+                    ) : null}
+                  </View>
+                ))}
+              </Card>
+            ) : null}
+
+            {result.places.length === 0 &&
+            !result.answer &&
+            (!result.suggestions || result.suggestions.length === 0) ? (
               <Text variant="body" tone="secondary" style={styles.empty}>
-                No places came back. Reason: {result.reason ?? 'unknown'}.
+                Nothing came back. Reason: {result.reason ?? 'unknown'}.
               </Text>
-            ) : (
-              result.places.map((p) => <PlaceResultCard key={p.id} place={p} />)
-            )}
+            ) : null}
           </>
         ) : null}
       </ScrollView>
@@ -341,6 +383,20 @@ const styles = StyleSheet.create({
   empty: {
     textAlign: 'center',
     paddingVertical: 16,
+  },
+  answerCard: {
+    gap: 8,
+  },
+  answerHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  tipsCard: {
+    gap: 10,
+  },
+  tipItem: {
+    gap: 2,
   },
   placeCard: {
     gap: 10,

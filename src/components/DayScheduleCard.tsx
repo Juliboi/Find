@@ -11,6 +11,7 @@ import {
   contentWindow,
   type CalEvent,
 } from '@/lib/calendar/dayCalendar';
+import { dayErrandsWithPlan } from '@/lib/calendar/planProjection';
 import { currentHHMM, formatTime, minutesOfDay } from '@/utils/time';
 import { describeDay } from '@/utils/days';
 
@@ -40,8 +41,8 @@ export function DayScheduleCard({ date, today, onPress, style }: Props) {
   const savedTrips = useSavedItineraries((s) => s.items);
 
   const { timed, untimed } = useMemo(
-    () => buildDayCalendar(errands, date),
-    [errands, date],
+    () => buildDayCalendar(dayErrandsWithPlan(savedTrips, date, errands), date),
+    [errands, savedTrips, date],
   );
   const plan = useMemo(
     () => activePlanForDate(savedTrips, date),
@@ -204,21 +205,36 @@ function MiniTimeline({
               <View
                 style={[
                   styles.miniBlockInner,
-                  {
-                    backgroundColor: ev.flexible ? 'transparent' : t.colors.accentSoft,
-                    borderColor: t.colors.accent,
-                    borderWidth: ev.flexible ? StyleSheet.hairlineWidth : 0,
-                    borderStyle: ev.flexible ? 'dashed' : 'solid',
-                  },
+                  ev.errand.planRef
+                    ? {
+                        backgroundColor: 'rgba(175, 82, 222, 0.16)',
+                        borderColor: t.colors.highlightPurple,
+                        borderWidth: StyleSheet.hairlineWidth,
+                        borderStyle: 'solid',
+                      }
+                    : {
+                        backgroundColor: ev.flexible ? 'transparent' : t.colors.accentSoft,
+                        borderColor: t.colors.accent,
+                        borderWidth: ev.flexible ? StyleSheet.hairlineWidth : 0,
+                        borderStyle: ev.flexible ? 'dashed' : 'solid',
+                      },
                 ]}
               >
-                <View style={[styles.miniBlockBar, { backgroundColor: t.colors.accent }]} />
+                <View
+                  style={[
+                    styles.miniBlockBar,
+                    { backgroundColor: ev.errand.planRef ? t.colors.highlightPurple : t.colors.accent },
+                  ]}
+                />
                 {h >= 16 ? (
                   <Text
                     variant="micro"
                     weight="semibold"
                     numberOfLines={1}
-                    style={[styles.miniBlockText, { color: t.colors.accentText }]}
+                    style={[
+                      styles.miniBlockText,
+                      { color: ev.errand.planRef ? t.colors.textPrimary : t.colors.accentText },
+                    ]}
                   >
                     {ev.errand.title}
                   </Text>

@@ -233,6 +233,15 @@ export interface ItineraryPlace {
 export interface ItineraryItem {
   /** Stable id — survives reordering and edits. */
   id: string;
+  /**
+   * The id of the user errand this stop WAS built from, when any. Set at
+   * assembly time from the planner's `ref` / `anchorId` / `taskId` link and
+   * preserved across edits + persistence. Lets surfaces that show both errands
+   * and plans (the calendar) know a plan stop IS a given errand — so the same
+   * activity is never drawn twice. Absent for blocks the brain generated (wake,
+   * meals, gaps, sleep) and for older plans saved before this field existed.
+   */
+  errandId?: string;
   /** Short action title, e.g. "High-focus deep work". */
   title: string;
   kind: ItineraryItemKind;
